@@ -1,0 +1,14 @@
+model_id: Qwen/Qwen3.5-27B
+dataset_name: iamtarun/python_code_instructions_18k_alpaca
+dataset_config: null
+split: train
+dataset_end: 3000
+source: alpaca_code
+format_name: alpaca
+generation_max_new_tokens: 256
+generation_batch_size: 48
+hidden_batch_size: 16
+storage_dtype: float16
+dtype: float16
+device: cuda:0
+output_dir: teacher_states/stage1-q3527b-alpaca-code

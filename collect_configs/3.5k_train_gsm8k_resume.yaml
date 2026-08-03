@@ -1,0 +1,11 @@
+model_id: Qwen/Qwen3.5-0.8B
+answer_dataset_path: sghosts/_tmp_cf_gsm8k_3.5k_train
+answer_dataset_split: train
+batch_size: 8
+hidden_batch_size: 8
+storage_dtype: float16
+dtype: float16
+local_files_only: false
+push_to_hub: sghosts/cf_gsm8k_3.5k_train_v1
+private: false
+device: cuda

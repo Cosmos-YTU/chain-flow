@@ -1,0 +1,31 @@
+dataset_path: sghosts/cf_gsm8k_6.5k_train
+dataset_split: train
+output_dir: out/vae/ckpts/hidden-vae-lr4e3
+
+vae_type: residual_mlp
+hidden_size: 1024
+latent_size: 256
+intermediate_size: 512
+device: cuda
+
+tokens_per_epoch: # debug only.
+token_seed: 0
+response_only: true
+validation_fraction: 0.1
+split_seed: 0
+
+lambda_mse: 1.0
+lambda_cos: 0.2
+lambda_norm: 0.0001
+beta: 0.001
+free_bits: 0.0
+
+per_device_train_batch_size: 64000
+per_device_eval_batch_size: 64000
+num_train_epochs: 50 # overfit
+eval_strategy: epoch
+save_strategy: epoch
+save_total_limit: 50
+report_to: none
+logging_steps: 1
+learning_rate: 0.004

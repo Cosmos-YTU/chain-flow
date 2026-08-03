@@ -1,0 +1,61 @@
+model_id: Qwen/Qwen3.5-0.8B
+local_files_only: false
+device: cuda
+
+# V9 tree-flow at K=8. Same architecture + recipe as the K=4 tree, extended to 8 draft positions.
+# chunk_size=4 (two block-causal chunks) rather than a fully-parallel 8: the deep positions are the
+# stage3 K=8 collapse risk, and letting chunk-1 (pos 4-7) condition on chunk-0's hiddens stabilises
+# the marginal flow there. The path head (order 8) + tree branching carry the per-branch conditioning.
+architecture: tree_flow
+context_size: 8
+draft_length: 8
+chunk_size: 4
+expert_dim: 1024
+num_heads: 8
+ffn_multiplier: 6
+num_drafter_layers: 8
+num_flow_steps: 2
+markov_rank: 256
+init_mode: delta
+detach_previous_chunks: true
+drafter_dropout: 0.0
+noise_scale: 1.0
+
+path_order: 8            # full parent-path conditioning for K=8
+path_ffn_multiplier: 2
+lambda_cov: 0.3
+cov_b: 8
+cov_margin: 1.0
+tree_top_b: 8
+tree_max_nodes: 64       # a touch larger budget for the deeper (8-level) tree
+
+lambda_flow: 0.2
+lambda_hidden: 0.25
+lambda_ce: 0.3
+lambda_accept: 0.15
+gamma: 0.8
+eps: 0.00000001
+
+dataset_path: data/flow_cache/stage4_mix6_55k_k4
+dataset_split: train
+window_seed: 0
+materialize_rows: true
+output_dir: out/flow/ckpts/tree-hiddenkv-k8-l8-ffn6-rank256-o8-cov8
+
+# K=8 builds 2x the full-vocab (248k) logit rows of K=4 per sample; 3072 windows matches K=4's
+# 24576 logit rows (fits), and grad-accum 2 keeps the effective batch at K=4's 6144 for a comparable
+# optimization recipe.
+per_device_train_batch_size: 2048
+per_device_eval_batch_size: 2048
+gradient_accumulation_steps: 3
+
+num_train_epochs: 12
+learning_rate: 0.001
+lr_scheduler_type: constant
+logging_strategy: steps
+logging_steps: 100
+eval_strategy: "no"
+save_strategy: steps
+save_steps: 1500
+save_total_limit: 4
+report_to: none

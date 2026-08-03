@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Hidden-State Speculative Drafter Architectures</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#171a21; --ink:#e8eaed; --muted:#9aa0aa; --line:#3a3f4b;
+    --frozen:#3b4252; --frozen-b:#5a6378;
+    --ctx:#1f6f8b;   --ctx-b:#34a0c4;
+    --draft:#c8742a; --draft-b:#e8913e;   /* trainable drafter */
+    --tok:#2e8b57;   --tok-b:#46c07a;      /* token feedback */
+    --pred:#7c5cbf;  --pred-b:#a07fe0;     /* predicted hidden */
+    --out:#b5485d;   --out-b:#e06a82;      /* draft tokens out */
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  header{padding:28px 32px 8px;}
+  h1{margin:0 0 4px;font-size:22px;font-weight:650;}
+  header p{margin:2px 0;color:var(--muted);font-size:13px;max-width:1000px;line-height:1.5;}
+  .legend{display:flex;flex-wrap:wrap;gap:16px;padding:14px 32px 6px;align-items:center;}
+  .legend span{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);}
+  .sw{width:14px;height:14px;border-radius:3px;border:1px solid rgba(255,255,255,.25);display:inline-block;}
+  .grid{display:grid;grid-template-columns:repeat(2,minmax(420px,1fr));gap:18px;padding:18px 32px 8px;}
+  @media(max-width:980px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden;}
+  .card h2{margin:0;padding:14px 18px 4px;font-size:16px;}
+  .card .tag{padding:0 18px;font-size:12px;color:var(--muted);min-height:34px;line-height:1.45;}
+  .card .verdict{padding:8px 18px 14px;font-size:12px;}
+  .pill{display:inline-block;padding:2px 9px;border-radius:20px;font-size:11px;font-weight:600;margin-right:6px;}
+  .win{background:rgba(70,192,122,.16);color:#7fe0a4;border:1px solid rgba(70,192,122,.4);}
+  .mid{background:rgba(232,145,62,.16);color:#f0a55e;border:1px solid rgba(232,145,62,.4);}
+  .lose{background:rgba(224,106,130,.16);color:#f08aa0;border:1px solid rgba(224,106,130,.4);}
+  svg{display:block;width:100%;height:auto;background:#12151c;}
+  table{border-collapse:collapse;margin:8px 32px 40px;font-size:12.5px;min-width:680px;}
+  caption{caption-side:top;text-align:left;color:var(--muted);font-size:12px;padding:18px 0 8px;}
+  th,td{border:1px solid var(--line);padding:7px 12px;text-align:left;}
+  th{background:#1c2029;font-weight:600;}
+  td.num{text-align:right;font-variant-numeric:tabular-nums;}
+  .small{color:var(--muted);font-size:11px;}
+  text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
+</style>
+</head>
+<body>
+<header>
+  <h1>Hidden-State Speculative Drafters — Architecture Comparison</h1>
+  <p>Four ways to draft K future tokens from a frozen transformer's hidden states. The frozen backbone runs once on the prompt and exposes context hidden states; a small trainable drafter proposes K tokens; the backbone then verifies them. <b>The differentiator is how each draft position gets its information</b> — context only, causal token feedback, or iterative joint refinement.</p>
+</header>
+
+<div class="legend">
+  <span><i class="sw" style="background:var(--frozen)"></i>Frozen backbone</span>
+  <span><i class="sw" style="background:var(--ctx)"></i>Context hidden / KV</span>
+  <span><i class="sw" style="background:var(--draft)"></i>Trainable drafter block</span>
+  <span><i class="sw" style="background:var(--pred)"></i>Predicted hidden</span>
+  <span><i class="sw" style="background:var(--tok)"></i>Token-embedding feedback</span>
+  <span><i class="sw" style="background:var(--out)"></i>Draft token out</span>
+</div>
+
+<div class="grid">
+
+<!-- ============================ OLD FLOW ============================ -->
+<div class="card">
+  <h2>① Old flow matcher <span class="small">(chunked / hidden-KV, stage 1–4)</span></h2>
+  <div class="tag">All K hiddens predicted <b>in parallel</b> from context only, by integrating a flow velocity field (1–2 Euler steps from a delta init). Bidirectional self-attention, but <b>no token feedback</b>.</div>
+  <svg viewBox="0 0 460 360" role="img" aria-label="Old flow matcher diagram">
+    <defs>
+      <marker id="a1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#9aa0aa"/></marker>
+      <marker id="a1c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#34a0c4"/></marker>
+    </defs>
+    <!-- context -->
+    <rect x="20" y="22" width="420" height="40" rx="8" fill="var(--frozen)" stroke="var(--frozen-b)"/>
+    <text x="230" y="40" fill="#c7ccd6" font-size="12" text-anchor="middle">frozen backbone — context hidden states  h₁…h_t</text>
+    <rect x="300" y="30" width="130" height="24" rx="6" fill="var(--ctx)" stroke="var(--ctx-b)"/>
+    <text x="365" y="46" fill="#dff1f7" font-size="11" text-anchor="middle">last m as context</text>
+    <!-- delta init -->
+    <text x="230" y="84" fill="var(--muted)" font-size="11" text-anchor="middle">delta-init block  z₀ = extrapolate(context)   ·   z₀ ≈ target ⇒ tiny velocity</text>
+    <!-- drafter bidirectional block -->
+    <rect x="60" y="100" width="340" height="48" rx="8" fill="var(--draft)" stroke="var(--draft-b)"/>
+    <text x="230" y="122" fill="#fff" font-size="12" text-anchor="middle" font-weight="600">flow velocity net — bidirectional self-attn over K + cross-attn to context</text>
+    <text x="230" y="138" fill="#ffe9d3" font-size="10.5" text-anchor="middle">integrate 1–2 Euler steps  (steps shown inert in 2×2 ablation)</text>
+    <!-- context arrow into drafter -->
+    <path d="M365,54 C365,80 230,80 230,100" stroke="#34a0c4" stroke-width="1.6" fill="none" marker-end="url(#a1c)"/>
+    <!-- 4 parallel predicted hiddens -->
+    <g>
+      <rect x="60"  y="186" width="74" height="34" rx="6" fill="var(--pred)" stroke="var(--pred-b)"/>
+      <rect x="148" y="186" width="74" height="34" rx="6" fill="var(--pred)" stroke="var(--pred-b)"/>
+      <rect x="236" y="186" width="74" height="34" rx="6" fill="var(--pred)" stroke="var(--pred-b)"/>
+      <rect x="324" y="186" width="74" height="34" rx="6" fill="var(--pred)" stroke="var(--pred-b)"/>
+      <text x="97"  y="207" fill="#fff" font-size="12" text-anchor="middle">ĥ₁</text>
+      <text x="185" y="207" fill="#fff" font-size="12" text-anchor="middle">ĥ₂</text>
+      <text x="273" y="207" fill="#fff" font-size="12" text-anchor="middle">ĥ₃</text>
+      <text x="361" y="207" fill="#fff" font-size="12" text-anchor="middle">ĥ₄</text>
+    </g>
+    <path d="M230,148 L230,170 M97,170 L97,186 M185,170 L185,186 M273,170 L273,186 M361,170 L361,186" stroke="#9aa0aa" stroke-width="1.4" fill="none"/>
+    <path d="M97,170 L361,170" stroke="#9aa0aa" stroke-width="1.4" fill="none" marker-end="url(#a1)" marker-start="url(#a1)"/>
+    <!-- lm_head + tokens -->
+    <rect x="60" y="246" width="338" height="26" rx="6" fill="var(--frozen)" stroke="var(--frozen-b)"/>
+    <text x="229" y="263" fill="#c7ccd6" font-size="11" text-anchor="middle">frozen lm_head  →  argmax</text>
+    <path d="M97,220 L97,246 M185,220 L185,246 M273,220 L273,246 M361,220 L361,246" stroke="#9aa0aa" stroke-width="1.3" fill="none" marker-end="url(#a1)"/>
+    <g>
+      <rect x="70"  y="300" width="54" height="28" rx="14" fill="var(--out)" stroke="var(--out-b)"/>
+      <rect x="158" y="300" width="54" height="28" rx="14" fill="var(--out)" stroke="var(--out-b)"/>
+      <rect x="246" y="300" width="54" height="28" rx="14" fill="var(--out)" stroke="var(--out-b)"/>
+      <rect x="334" y="300" width="54" height="28" rx="14" fill="var(--out)" stroke="var(--out-b)"/>
+      <text x="97"  y="319" fill="#fff" font-size="12" text-anchor="middle">tok₁</text>
+      <text x="185" y="319" fill="#fff" font-size="12" text-anchor="middle">tok₂</text>
+      <text x="273" y="319" fill="#fff" font-size="12" text-anchor="middle">tok₃</text>
+      <text x="361" y="319" fill="#fff" font-size="12" text-anchor="middle">tok₄</text>
+    </g>
+    <path d="M97,272 L97,300 M185,272 L185,300 M273,272 L273,300 M361,272 L361,300" stroke="#9aa0aa" stroke-width="1.3" fill="none" marker-end="url(#a1)"/>
+    <text x="230" y="350" fill="var(--muted)" font-size="10.5" text-anchor="middle">✗ no token feedback — ĥ₄ predicted blind to tok₁₋₃ → deep-position accuracy collapses</text>
+  </svg>
+  <div class="verdict"><span class="pill mid">acc@4 ≈ 0.45 (ceiling)</span><span class="small">live ≈ 0.96×. Capacity/data could not break it.</span></div>
+</div>
+
+<!-- ============================ EAGLE ============================ -->
+<div class="card">
+  <h2>② EAGLE-style <span class="small">(causal token feedback)</span></h2>
+  <div class="tag">One shared drafter block, applied <b>autoregressively</b>. Each step consumes the previous predicted hidden <b>and the embedding of the token it decoded</b>, then predicts the next hidden. Strictly causal — K sequential passes.</div>
+  <svg viewBox="0 0 460 360" role="img" aria-label="EAGLE diagram">
+    <defs>
+      <marker id="a2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#9aa0aa"/></marker>
+      <marker id="a2t" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#46c07a"/></marker>
+      <marker id="a2c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#34a0c4"/></marker>
+    </defs>
+    <rect x="20" y="22" width="420" height="34" rx="8" fill="var(--frozen)" stroke="var(--frozen-b)"/>
+    <text x="230" y="43" fill="#c7ccd6" font-size="12" text-anchor="middle">frozen backbone — context KV (cross-attended by every step)</text>
+    <!-- positions -->
+    <g font-size="11.5">
+      <!-- anchor -->
+      <rect x="22" y="92" width="60" height="30" rx="6" fill="var(--ctx)" stroke="var(--ctx-b)"/>
+      <text x="52" y="111" fill="#dff1f7" text-anchor="middle">hₜ (real)</text>
+      <!-- drafter steps -->
+      <rect x="118" y="92" width="46" height="30" rx="6" fill="var(--draft)" stroke="var(--draft-b)"/><text x="141" y="111" fill="#fff" text-anchor="middle">D</text>
+      <rect x="222" y="92" width="46" height="30" rx="6" fill="var(--draft)" stroke="var(--draft-b)"/><text x="245" y="111" fill="#fff" text-anchor="middle">D</text>
+      <rect x="326" y="92" width="46" height="30" rx="6" fill="var(--draft)" stroke="var(--draft-b)"/><text x="349" y="111" fill="#fff" text-anchor="middle">D</text>
+      <!-- predicted hiddens -->
+      <rect x="170" y="92" width="46" height="30" rx="6" fill="var(--pred)" stroke="var(--pred-b)"/><text x="193" y="111" fill="#fff" text-anchor="middle">ĥ₁</text>
+      <rect x="274" y="92" width="46" height="30" rx="6" fill="var(--pred)" stroke="var(--pred-b)"/><text x="297" y="111" fill="#fff" text-anchor="middle">ĥ₂</text>
+      <rect x="378" y="92" width="46" height="30" rx="6" fill="var(--pred)" stroke="var(--pred-b)"/><text x="401" y="111" fill="#fff" text-anchor="middle">ĥ₃</text>
+    </g>
+    <!-- horizontal flow arrows -->
+    <path d="M82,107 L118,107 M164,107 L170,107 M216,107 L222,107 M268,107 L274,107 M320,107 L326,107 M372,107 L378,107" stroke="#9aa0aa" stroke-width="1.4" fill="none" marker-end="url(#a2)"/>
+    <!-- tokens row -->
+    <g font-size="11.5">
+      <rect x="30"  y="176" width="44" height="26" rx="13" fill="var(--out)" stroke="var(--out-b)"/><text x="52"  y="194" fill="#fff" text-anchor="middle">tok₀</text>
+      <rect x="171" y="176" width="44" height="26" rx="13" fill="var(--out)" stroke="var(--out-b)"/><text x="193" y="194" fill="#fff" text-anchor="middle">tok₁</text>
+      <rect x="275" y="176" width="44" height="26" rx="13" fill="var(--out)" stroke="var(--out-b)"/><text x="297" y="194" fill="#fff" text-anchor="middle">tok₂</text>
+      <rect x="379" y="176" width="44" height="26" rx="13" fill="var(--out)" stroke="var(--out-b)"/><text x="401" y="194" fill="#fff" text-anchor="middle">tok₃</text>
+    </g>
+    <!-- decode arrows down -->
+    <path d="M52,122 L52,176 M193,122 L193,176 M297,122 L297,176 M401,122 L401,176" stroke="#9aa0aa" stroke-width="1.2" fill="none" marker-end="url(#a2)"/>
+    <!-- token feedback arrows: tok_{i} embed -> next drafter step input (diagonal, green) -->
+    <path d="M74,189 C120,189 100,128 141,124" stroke="#46c07a" stroke-width="1.7" fill="none" marker-end="url(#a2t)"/>
+    <path d="M215,189 C250,189 224,128 245,124" stroke="#46c07a" stroke-width="1.7" fill="none" marker-end="url(#a2t)"/>
+    <path d="M319,189 C354,189 328,128 349,124" stroke="#46c07a" stroke-width="1.7" fill="none" marker-end="url(#a2t)"/>
+    <text x="230" y="232" fill="var(--tok-b)" font-size="11" text-anchor="middle">✓ token feedback: emb(tokᵢ) feeds the next step  →  deep positions sharpen</text>
+    <!-- caption boxes -->
+    <rect x="60" y="252" width="340" height="40" rx="8" fill="#1c2029" stroke="var(--line)"/>
+    <text x="230" y="270" fill="#c7ccd6" font-size="11" text-anchor="middle">causal · 1 pass / position · shared weights</text>
+    <text x="230" y="285" fill="var(--muted)" font-size="10.5" text-anchor="middle">limitation: position 1 can never be revised after seeing position 4</text>
+  </svg>
+  <div class="verdict"><span class="pill win">acc@4 0.52–0.80 · live 1.02× (first &gt;1×)</span></div>
+</div>
+
+<!-- ============================ V3 REFINE FLOW ============================ -->
+<div class="card">
+  <h2>③ V3 flow matcher <span class="small">(token-conditioned bidirectional refiner)</span></h2>
+  <div class="tag">Flow-matching velocity field over the whole K-block, refined for N iterative steps. <b>Each step re-decodes the block, embeds the tokens, and re-conditions</b> the next velocity prediction — and all K positions self-attend (bidirectional), so any position can be revised.</div>
+  <svg viewBox="0 0 460 360" role="img" aria-label="V3 refine flow diagram">
+    <defs>
+      <marker id="a3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#9aa0aa"/></marker>
+      <marker id="a3t" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#46c07a"/></marker>
+      <marker id="a3c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#34a0c4"/></marker>
+    </defs>
+    <rect x="20" y="20" width="420" height="32" rx="8" fill="var(--frozen)" stroke="var(--frozen-b)"/>
+    <text x="230" y="40" fill="#c7ccd6" font-size="12" text-anchor="middle">frozen backbone — context hidden / KV</text>
+    <!-- block z (all K) -->
+    <rect x="150" y="74" width="160" height="30" rx="6" fill="var(--pred)" stroke="var(--pred-b)"/>
+    <text x="230" y="93" fill="#fff" font-size="11.5" text-anchor="middle">block z  =  [ẑ₁ ẑ₂ ẑ₃ ẑ₄]</text>
+    <text x="230" y="68" fill="var(--muted)" font-size="10.5" text-anchor="middle">init (delta / noise)</text>
+    <!-- refine loop -->
+    <rect x="96" y="128" width="268" height="62" rx="10" fill="var(--draft)" stroke="var(--draft-b)"/>
+    <text x="230" y="150" fill="#fff" font-size="12" text-anchor="middle" font-weight="600">bidirectional velocity net</text>
+    <text x="230" y="166" fill="#ffe9d3" font-size="10.5" text-anchor="middle">self-attn over K  +  cross-attn context  +  token cond.</text>
+    <text x="230" y="180" fill="#ffe9d3" font-size="10.5" text-anchor="middle">Euler step:  z ← z + Δt·v</text>
+    <path d="M230,104 L230,128" stroke="#9aa0aa" stroke-width="1.4" fill="none" marker-end="url(#a3)"/>
+    <!-- context into net -->
+    <path d="M120,52 C120,128 110,150 96,158" stroke="#34a0c4" stroke-width="1.5" fill="none" marker-end="url(#a3c)"/>
+    <!-- decode + re-condition loop (the key) -->
+    <rect x="150" y="214" width="160" height="26" rx="6" fill="var(--frozen)" stroke="var(--frozen-b)"/>
+    <text x="230" y="231" fill="#c7ccd6" font-size="11" text-anchor="middle">lm_head → tokens (this step)</text>
+    <path d="M230,190 L230,214" stroke="#9aa0aa" stroke-width="1.4" fill="none" marker-end="url(#a3)"/>
+    <!-- green feedback loop back up to net -->
+    <path d="M310,227 C400,227 400,150 364,150" stroke="#46c07a" stroke-width="2" fill="none" marker-end="url(#a3t)"/>
+    <text x="408" y="190" fill="var(--tok-b)" font-size="10.5" text-anchor="middle" transform="rotate(90 408 190)">emb(tokens) re-condition</text>
+    <!-- loop label -->
+    <text x="150" y="207" fill="var(--muted)" font-size="10" text-anchor="middle">×N refine steps</text>
+    <!-- final out -->
+    <g font-size="11.5">
+      <rect x="70"  y="296" width="50" height="26" rx="13" fill="var(--out)" stroke="var(--out-b)"/><text x="95"  y="314" fill="#fff" text-anchor="middle">tok₁</text>
+      <rect x="158" y="296" width="50" height="26" rx="13" fill="var(--out)" stroke="var(--out-b)"/><text x="183" y="314" fill="#fff" text-anchor="middle">tok₂</text>
+      <rect x="246" y="296" width="50" height="26" rx="13" fill="var(--out)" stroke="var(--out-b)"/><text x="271" y="314" fill="#fff" text-anchor="middle">tok₃</text>
+      <rect x="334" y="296" width="50" height="26" rx="13" fill="var(--out)" stroke="var(--out-b)"/><text x="359" y="314" fill="#fff" text-anchor="middle">tok₄</text>
+    </g>
+    <path d="M210,240 C210,270 150,270 110,296 M250,240 C250,270 220,285 188,296 M255,250 C260,275 270,285 276,296 M260,243 C300,272 330,282 356,296" stroke="#9aa0aa" stroke-width="1.2" fill="none" marker-end="url(#a3)"/>
+    <text x="230" y="346" fill="var(--muted)" font-size="10.5" text-anchor="middle">bidirectional + iterative + token feedback — flow machinery on top of feedback</text>
+  </svg>
+  <div class="verdict"><span class="pill mid">accept &gt; old flow (every domain)</span><span class="pill lose">but &lt; EAGLE · slower</span></div>
+</div>
+
+<!-- ============================ DFLASH ============================ -->
+<div class="card">
+  <h2>④ DFlash-style <span class="small">(block diffusion in token-embedding space)</span></h2>
+  <div class="tag">Diffuse over <b>masked token embeddings</b> (absorbing-state), not raw hiddens. Conditioned on <b>multiple</b> target layers (concat + project) and the target's KV directly. Big blocks (16) + <b>tree</b> verification.</div>
+  <svg viewBox="0 0 460 360" role="img" aria-label="DFlash diagram">
+    <defs>
+      <marker id="a4" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#9aa0aa"/></marker>
+      <marker id="a4c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#34a0c4"/></marker>
+    </defs>
+    <!-- multi-layer target conditioning -->
+    <rect x="20" y="20" width="420" height="56" rx="8" fill="var(--frozen)" stroke="var(--frozen-b)"/>
+    <text x="230" y="38" fill="#c7ccd6" font-size="12" text-anchor="middle">frozen backbone</text>
+    <g font-size="10">
+      <rect x="40"  y="46" width="70" height="20" rx="4" fill="var(--ctx)" stroke="var(--ctx-b)"/><text x="75"  y="60" fill="#dff1f7" text-anchor="middle">layer ℓ₁</text>
+      <rect x="150" y="46" width="70" height="20" rx="4" fill="var(--ctx)" stroke="var(--ctx-b)"/><text x="185" y="60" fill="#dff1f7" text-anchor="middle">layer ℓ₂</text>
+      <rect x="260" y="46" width="70" height="20" rx="4" fill="var(--ctx)" stroke="var(--ctx-b)"/><text x="295" y="60" fill="#dff1f7" text-anchor="middle">layer ℓ₃</text>
+      <rect x="360" y="46" width="60" height="20" rx="4" fill="var(--ctx)" stroke="var(--ctx-b)"/><text x="390" y="60" fill="#dff1f7" text-anchor="middle">+ KV</text>
+    </g>
+    <!-- concat+fc -->
+    <rect x="150" y="92" width="160" height="24" rx="6" fill="#1c2029" stroke="var(--line)"/>
+    <text x="230" y="108" fill="#c7ccd6" font-size="10.5" text-anchor="middle">concat → fc project (condition)</text>
+    <path d="M75,66 C75,92 200,92 215,92 M185,66 L195,92 M295,66 C295,92 250,92 245,92" stroke="#34a0c4" stroke-width="1.3" fill="none" marker-end="url(#a4c)"/>
+    <!-- masked token block -->
+    <g font-size="11">
+      <rect x="60"  y="138" width="54" height="28" rx="6" fill="#2a2f3a" stroke="#566"/>
+      <rect x="128" y="138" width="54" height="28" rx="6" fill="#2a2f3a" stroke="#566"/>
+      <rect x="196" y="138" width="54" height="28" rx="6" fill="#2a2f3a" stroke="#566"/>
+      <rect x="264" y="138" width="54" height="28" rx="6" fill="#2a2f3a" stroke="#566"/>
+      <rect x="332" y="138" width="68" height="28" rx="6" fill="#2a2f3a" stroke="#566"/>
+      <text x="87"  y="156" fill="#9aa0aa" text-anchor="middle">[M]</text>
+      <text x="155" y="156" fill="#9aa0aa" text-anchor="middle">[M]</text>
+      <text x="223" y="156" fill="#9aa0aa" text-anchor="middle">[M]</text>
+      <text x="291" y="156" fill="#9aa0aa" text-anchor="middle">[M]</text>
+      <text x="366" y="156" fill="#9aa0aa" text-anchor="middle">…[M]</text>
+    </g>
+    <text x="230" y="132" fill="var(--muted)" font-size="10.5" text-anchor="middle">masked token-embedding block  (size 16)</text>
+    <path d="M230,116 L230,138" stroke="#9aa0aa" stroke-width="1.3" fill="none" marker-end="url(#a4)"/>
+    <!-- diffusion denoiser -->
+    <rect x="60" y="188" width="340" height="40" rx="8" fill="var(--draft)" stroke="var(--draft-b)"/>
+    <text x="230" y="205" fill="#fff" font-size="12" text-anchor="middle" font-weight="600">block-diffusion denoiser (transformer)</text>
+    <text x="230" y="220" fill="#ffe9d3" font-size="10.5" text-anchor="middle">denoise masked → real tokens · operates in embedding space</text>
+    <path d="M87,166 L87,188 M155,166 L155,188 M223,166 L223,188 M291,166 L291,188 M366,166 L366,188" stroke="#9aa0aa" stroke-width="1.2" fill="none" marker-end="url(#a4)"/>
+    <!-- tree verification -->
+    <g font-size="11">
+      <rect x="120" y="262" width="60" height="26" rx="13" fill="var(--out)" stroke="var(--out-b)"/><text x="150" y="280" fill="#fff" text-anchor="middle">tok</text>
+      <rect x="200" y="262" width="60" height="26" rx="13" fill="var(--out)" stroke="var(--out-b)"/><text x="230" y="280" fill="#fff" text-anchor="middle">tok</text>
+      <rect x="280" y="262" width="60" height="26" rx="13" fill="var(--out)" stroke="var(--out-b)"/><text x="310" y="280" fill="#fff" text-anchor="middle">tok</text>
+      <!-- branches (tree) -->
+      <rect x="280" y="300" width="60" height="24" rx="12" fill="#7a2f3f" stroke="var(--out-b)" opacity="0.8"/><text x="310" y="317" fill="#f0c2cc" text-anchor="middle">alt</text>
+      <rect x="356" y="262" width="60" height="26" rx="13" fill="var(--out)" stroke="var(--out-b)"/><text x="386" y="280" fill="#fff" text-anchor="middle">tok</text>
+    </g>
+    <path d="M150,228 L150,262 M230,228 L230,262 M310,228 L310,262 M386,232 L386,262" stroke="#9aa0aa" stroke-width="1.2" fill="none" marker-end="url(#a4)"/>
+    <path d="M310,288 L310,300" stroke="#9aa0aa" stroke-width="1.1" fill="none" marker-end="url(#a4)"/>
+    <text x="230" y="346" fill="var(--muted)" font-size="10.5" text-anchor="middle">big block + tree verify (multiple candidate paths) → high accepted-tokens/step</text>
+  </svg>
+  <div class="verdict"><span class="pill win">production: real speedups (vLLM/SGLang)</span><span class="small"> — the SOTA of this family</span></div>
+</div>
+
+</div>
+
+<table>
+  <caption>What differs, at a glance — and the leak-free result on our Qwen3.5-0.8B hybrid backbone (K=4 unless noted).</caption>
+  <tr>
+    <th>Approach</th><th>Draft target space</th><th>Inter-position info</th><th>Direction</th><th>Passes</th><th>Token feedback</th><th class="num">acc@4</th><th class="num">live speedup</th>
+  </tr>
+  <tr><td>① Old flow (stage 1–4)</td><td>hidden states</td><td>self-attn, context only</td><td>bidirectional</td><td>1–2 (inert)</td><td>✗ none</td><td class="num">~0.45</td><td class="num">0.96×</td></tr>
+  <tr><td>② EAGLE</td><td>hidden states</td><td>previous token + hidden</td><td>causal</td><td>K (1/pos)</td><td>✓ causal</td><td class="num">0.52–0.80</td><td class="num"><b>1.02×</b></td></tr>
+  <tr><td>③ V3 refine-flow</td><td>hidden states</td><td>decoded tokens, re-cond.</td><td>bidirectional</td><td>N steps</td><td>✓ per step</td><td class="num">(leak-free live)</td><td class="num">0.72–0.89×</td></tr>
+  <tr><td>④ DFlash-style</td><td><b>token embeddings</b> (masked)</td><td>multi-layer KV + tree</td><td>bidirectional (block diffusion)</td><td>few</td><td>✓ (mask→token)</td><td class="num">—</td><td class="num">(SOTA family)</td></tr>
+</table>
+
+<p class="small" style="padding:0 32px 40px;max-width:1000px;line-height:1.6;">
+Key takeaways from our experiments: <b>token feedback is the lever</b> (EAGLE broke the ceiling and crossed 1× live; flow iteration <i>without</i> feedback was inert in a controlled 2×2 ablation). V3 added feedback to a bidirectional iterative flow and beat the <i>old</i> flow matcher on acceptance, but did not beat causal EAGLE and was slower. DFlash suggests the unexplored levers for the flow/diffusion family: diffuse in <b>token-embedding space with absorbing masks</b> (not raw hidden space), condition on <b>multiple target layers</b>, and use <b>large blocks + tree verification</b>. Note: live speedup on this backbone is additionally capped by the hybrid linear-attention verify+commit double-forward, independent of the drafter.
+</p>
+
+</body>
+</html>

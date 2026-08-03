@@ -1,0 +1,44 @@
+model_id: Qwen/Qwen3.5-0.8B
+local_files_only: false
+device: cuda
+
+# V3: token-conditioned bidirectional flow refiner, K=4
+architecture: refine_flow
+context_size: 8
+draft_length: 4
+expert_dim: 1024
+num_heads: 8
+ffn_multiplier: 6
+num_drafter_layers: 8
+num_refine_steps: 4
+init_mode: delta
+noise_scale: 1.0
+self_cond_prob: 0.5
+
+# flow-matching MSE + decode-weighted CE/accept on the integrated block
+lambda_flow: 0.2
+lambda_hidden: 0.25
+lambda_cos: 0.05
+lambda_ce: 0.3
+lambda_accept: 0.15
+gamma: 0.8
+eps: 0.00000001
+
+dataset_path: data/flow_cache/stage4_mix6_55k_k4
+dataset_split: train
+window_seed: 0
+materialize_rows: true
+output_dir: out/flow/ckpts/refine-mix6-55k-k4-l8-ffn6-steps4
+
+per_device_train_batch_size: 4096
+per_device_eval_batch_size: 4096
+
+num_train_epochs: 12
+learning_rate: 0.001
+lr_scheduler_type: constant
+logging_strategy: epoch
+logging_steps: 10
+eval_strategy: epoch
+save_strategy: epoch
+save_total_limit: 5
+report_to: none

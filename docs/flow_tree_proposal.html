@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Flow Draft Trees — Proposal (V6 base)</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#171a21; --ink:#e8eaed; --muted:#9aa0aa; --line:#3a3f4b;
+    --frozen:#3b4252; --frozen-b:#5a6378;
+    --ctx:#1f6f8b;   --ctx-b:#34a0c4;
+    --flow:#c8742a;  --flow-b:#e8913e;
+    --pred:#7c5cbf;  --pred-b:#a07fe0;
+    --tok:#2e8b57;   --tok-b:#46c07a;
+    --mark:#b5485d;  --mark-b:#e06a82;
+    --node:#2f6f4f;  --node-b:#46c07a;
+    --alt:#7a3f4d;   --alt-b:#c98394;
+    --acc:#7c5cbf;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  header{padding:26px 32px 6px;}
+  h1{margin:0 0 4px;font-size:22px;font-weight:650;}
+  header p{margin:2px 0;color:var(--muted);font-size:13px;max-width:1080px;line-height:1.55;}
+  h2.sec{margin:22px 32px 4px;font-size:16px;}
+  .legend{display:flex;flex-wrap:wrap;gap:15px;padding:10px 32px 4px;align-items:center;}
+  .legend span{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);}
+  .sw{width:13px;height:13px;border-radius:3px;border:1px solid rgba(255,255,255,.25);display:inline-block;}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:18px;padding:12px 32px 8px;}
+  @media(max-width:1000px){.row{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden;}
+  .card.hl{border:1px solid rgba(70,192,122,.5);}
+  .card h3{margin:0;padding:13px 18px 2px;font-size:14.5px;}
+  .card .tag{padding:0 18px 12px;font-size:12px;color:var(--muted);line-height:1.5;}
+  svg{display:block;width:100%;height:auto;background:#12151c;}
+  table{border-collapse:collapse;margin:8px 32px 8px;font-size:12.5px;}
+  caption{caption-side:top;text-align:left;color:var(--muted);font-size:12px;padding:10px 0 8px;}
+  th,td{border:1px solid var(--line);padding:6px 11px;text-align:left;}
+  th{background:#1c2029;font-weight:600;}
+  td.num{text-align:right;font-variant-numeric:tabular-nums;}
+  .hl{color:#7fe0a4;font-weight:600;}
+  .pj{color:#c9b3f5;}
+  p.note,ol.note{color:var(--muted);font-size:11.5px;padding:0 32px;max-width:1080px;line-height:1.65;}
+  ol.note li{margin:5px 0;}
+  code{background:#1c2029;padding:1px 5px;border-radius:4px;font-size:11px;}
+  .box{margin:6px 32px 18px;padding:12px 16px;border:1px solid var(--line);border-radius:10px;background:#141821;max-width:1080px;}
+</style>
+</head>
+<body>
+<header>
+  <h1>Flow Draft Trees — where a flow matcher structurally beats EAGLE</h1>
+  <p>Our flow drafters plateau at ~2.9 accepted tokens because a <b>single chain</b> commits to one token per position, and deep positions are uncertain. But a flow matcher outputs <b>the full per-position distribution for all K positions in ONE parallel pass</b> — exactly the input a draft <i>tree</i> needs. EAGLE must run K sequential passes to grow a tree; a flow gets it free. This is the one axis where flow's parallelism is an advantage, not a liability (cf. DDTree, which builds trees from one block-diffusion pass and lifts DFlash 5.5×→7.5×).</p>
+</header>
+
+<div class="legend">
+  <span><i class="sw" style="background:var(--flow)"></i>Flow (V6, frozen — no retrain)</span>
+  <span><i class="sw" style="background:var(--node)"></i>Top-1 (chain) node</span>
+  <span><i class="sw" style="background:var(--alt)"></i>Alt candidate (top-b sibling)</span>
+  <span><i class="sw" style="background:var(--acc)"></i>Accepted path after verify</span>
+</div>
+
+<h2 class="sec">The idea, in one figure</h2>
+<div class="row">
+  <div class="card">
+    <h3>Today — V6 chain</h3>
+    <div class="tag">One parallel flow pass → per-position distributions → take the argmax at each position → a single length-4 chain → verify. A wrong token anywhere truncates the rest.</div>
+    <svg viewBox="0 0 460 250" role="img" aria-label="chain">
+      <defs><marker id="c1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#9aa0aa"/></marker></defs>
+      <rect x="20" y="16" width="420" height="28" rx="8" fill="var(--flow)" stroke="var(--flow-b)"/>
+      <text x="230" y="35" fill="#fff" font-size="11.5" text-anchor="middle" font-weight="600">V6 parallel flow — one pass → per-position distributions</text>
+      <g font-size="11">
+        <rect x="40" y="96" width="60" height="30" rx="15" fill="var(--node)" stroke="var(--node-b)"/><text x="70" y="115" fill="#fff" text-anchor="middle">t₁</text>
+        <rect x="150" y="96" width="60" height="30" rx="15" fill="var(--node)" stroke="var(--node-b)"/><text x="180" y="115" fill="#fff" text-anchor="middle">t₂</text>
+        <rect x="260" y="96" width="60" height="30" rx="15" fill="var(--node)" stroke="var(--node-b)"/><text x="290" y="115" fill="#fff" text-anchor="middle">t₃</text>
+        <rect x="370" y="96" width="60" height="30" rx="15" fill="var(--node)" stroke="var(--node-b)"/><text x="400" y="115" fill="#fff" text-anchor="middle">t₄</text>
+      </g>
+      <path d="M100,111 L150,111 M210,111 L260,111 M320,111 L370,111" stroke="#9aa0aa" stroke-width="1.6" fill="none" marker-end="url(#c1)"/>
+      <path d="M70,44 L70,96 M180,44 L180,96 M290,44 L290,96 M400,44 L400,96" stroke="#9aa0aa" stroke-width="1.2" fill="none" marker-end="url(#c1)"/>
+      <text x="230" y="168" fill="var(--muted)" font-size="11" text-anchor="middle">1 verify pass · accept longest correct PREFIX</text>
+      <text x="230" y="196" fill="#f0a55e" font-size="11" text-anchor="middle">if t₃ wrong → positions 3,4 lost (chain truncates)</text>
+      <text x="230" y="224" fill="var(--muted)" font-size="10.5" text-anchor="middle">measured accepted-len: gsm8k 2.64 · stem 3.00 · code 2.39</text>
+    </svg>
+  </div>
+
+  <div class="card hl">
+    <h3>Proposed — V6 flow tree</h3>
+    <div class="tag">SAME frozen V6 pass. At each position, keep the top-<i>b</i> candidates (they're already in the distribution), expand a small tree, verify the whole tree in ONE backbone pass with a tree mask, accept the longest correct <i>path</i>. A wrong argmax is recovered by a sibling.</div>
+    <svg viewBox="0 0 460 250" role="img" aria-label="tree">
+      <defs><marker id="t1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#9aa0aa"/></marker>
+      <marker id="t1a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#c98394"/></marker></defs>
+      <rect x="20" y="16" width="420" height="28" rx="8" fill="var(--flow)" stroke="var(--flow-b)"/>
+      <text x="230" y="35" fill="#fff" font-size="11.5" text-anchor="middle" font-weight="600">SAME V6 pass — top-b candidates per position (no retrain)</text>
+      <!-- depth 1 -->
+      <rect x="30" y="70" width="46" height="24" rx="12" fill="var(--node)" stroke="var(--node-b)"/><text x="53" y="87" fill="#fff" font-size="10" text-anchor="middle">t₁</text>
+      <!-- depth 2: 2 branches -->
+      <rect x="120" y="52" width="46" height="22" rx="11" fill="var(--node)" stroke="var(--node-b)"/><text x="143" y="68" fill="#fff" font-size="10" text-anchor="middle">t₂ᵃ</text>
+      <rect x="120" y="88" width="46" height="22" rx="11" fill="var(--alt)" stroke="var(--alt-b)"/><text x="143" y="104" fill="#f0c2cc" font-size="10" text-anchor="middle">t₂ᵇ</text>
+      <!-- depth 3: branches -->
+      <rect x="210" y="40" width="46" height="20" rx="10" fill="var(--node)" stroke="var(--node-b)"/><text x="233" y="55" fill="#fff" font-size="9.5" text-anchor="middle">t₃ᵃ</text>
+      <rect x="210" y="66" width="46" height="20" rx="10" fill="var(--alt)" stroke="var(--alt-b)"/><text x="233" y="81" fill="#f0c2cc" font-size="9.5" text-anchor="middle">t₃ᵇ</text>
+      <rect x="210" y="98" width="46" height="20" rx="10" fill="var(--alt)" stroke="var(--alt-b)"/><text x="233" y="113" fill="#f0c2cc" font-size="9.5" text-anchor="middle">t₃ᶜ</text>
+      <!-- depth 4 -->
+      <rect x="300" y="34" width="46" height="18" rx="9" fill="var(--node)" stroke="var(--node-b)"/><text x="323" y="47" fill="#fff" font-size="9" text-anchor="middle">t₄ᵃ</text>
+      <rect x="300" y="58" width="46" height="18" rx="9" fill="var(--alt)" stroke="var(--alt-b)"/><text x="323" y="71" fill="#f0c2cc" font-size="9" text-anchor="middle">t₄ᵇ</text>
+      <!-- edges -->
+      <path d="M76,82 L120,63 M76,82 L120,99" stroke="#9aa0aa" stroke-width="1.3" fill="none" marker-end="url(#t1)"/>
+      <path d="M166,63 L210,50 M166,63 L210,76 M166,99 L210,108" stroke="#9aa0aa" stroke-width="1.2" fill="none" marker-end="url(#t1)"/>
+      <path d="M256,50 L300,43 M256,50 L300,67" stroke="#9aa0aa" stroke-width="1.1" fill="none" marker-end="url(#t1)"/>
+      <path d="M53,44 L53,70" stroke="#9aa0aa" stroke-width="1.2" fill="none" marker-end="url(#t1)"/>
+      <!-- accepted path highlight -->
+      <path d="M53,82 L143,63 L233,50 L323,43" stroke="var(--acc)" stroke-width="2.4" fill="none" opacity="0.85"/>
+      <text x="230" y="150" fill="var(--muted)" font-size="11" text-anchor="middle">1 verify pass (tree attention mask) · accept longest correct PATH</text>
+      <text x="230" y="178" fill="#7fe0a4" font-size="11" text-anchor="middle">wrong argmax at t₃ → sibling t₃ᵇ survives → path continues</text>
+      <text x="230" y="212" fill="#c9b3f5" font-size="10.5" text-anchor="middle">tree ceiling (top-5, from V6's OWN measured distributions):</text>
+      <text x="230" y="230" fill="#c9b3f5" font-size="11" text-anchor="middle" font-weight="600">gsm8k 3.30 · stem 3.45 · code 3.14  (vs EAGLE chain 3.21)</text>
+    </svg>
+  </div>
+</div>
+
+<h2 class="sec">Why this is grounded, not a guess</h2>
+<div class="box">
+  <p style="margin:0 0 8px;color:var(--ink);font-size:12.5px;">The tree's acceptance ceiling is directly computable from metrics V6's eval <b>already logged</b> — "is the true token in the drafter's top-b?" (<code>token.top{b}_contains@i</code>). If the true token is in the top-b at each position, a tree of that width covers it. Cumulative accepted-length = Σᵢ ∏<sub>j≤i</sub> P(true∈top-b at j):</p>
+</div>
+<table>
+  <caption>Measured V6 top-b coverage → tree accepted-length ceiling (no retraining; these are V6's own eval numbers).</caption>
+  <tr><th>domain</th><th class="num">chain (top-1)</th><th class="num">tree b=5</th><th class="num">tree b=10</th><th class="num">EAGLE chain (ref)</th></tr>
+  <tr><td>gsm8k</td><td class="num">2.64</td><td class="num hl">3.30</td><td class="num hl">3.43</td><td class="num">3.21</td></tr>
+  <tr><td>stem</td><td class="num">3.00</td><td class="num hl">3.45</td><td class="num hl">3.53</td><td class="num">—</td></tr>
+  <tr><td>code</td><td class="num">2.39</td><td class="num hl">3.14</td><td class="num hl">3.29</td><td class="num">—</td></tr>
+</table>
+<p class="note">The gain is <b>largest on code (+0.9)</b> — exactly the domain V6's chain was worst on, because the tree branches over precisely the uncertain deep positions where the chain truncates. A modest b=5 tree over V6's existing distributions <b>exceeds EAGLE's chain</b> on gsm8k, at no training cost. (These are upper bounds under greedy accept — real tree accept sits below the ceiling but well above the chain; this is the standard tree-vs-chain gap.)</p>
+
+<h2 class="sec">The research question &amp; plan</h2>
+<ol class="note">
+  <li><b>Q:</b> Does a flow matcher — which emits all K per-position distributions in one parallel pass — make a better/cheaper tree drafter than autoregressive EAGLE, which needs K sequential passes to grow the same tree?</li>
+  <li><b>Build (inference-only, no retrain):</b> a tree constructor that expands V6's top-b per position into a fixed-node-budget tree (DDTree-style: allocate nodes to high-probability paths), plus a tree-verification harness (tree attention mask over the draft nodes) that returns the longest correct path.</li>
+  <li><b>Metric:</b> report <b>accepted-tokens/step</b> (tree) vs V6 chain vs EAGLE chain, across gsm8k/stem/code/benchmark domains, sweeping node budget b∈{2,4,8,16} and tree depth.</li>
+  <li><b>Systems note:</b> tree <i>attention</i> masking is native on the 6 full-attention layers but needs recompute/state-fork on the 18 linear-attention layers — so live wall-clock on our hybrid backbone is gated by the deferred systems work (and by vLLM). <b>Accepted-length is fully measurable now</b>; it is the standard research metric and the honest deliverable.</li>
+  <li><b>Optional lift:</b> V6 was trained deterministic; a light retrain with noised init (like V8's) makes the flow a <i>sampler</i>, giving even more diverse tree candidates than top-b of a single distribution.</li>
+</ol>
+<p class="note" style="padding-bottom:36px;">
+<b>Why V6 is the right base:</b> it is our best flow drafter (gsm8k 2.93 chain, first flow &gt;1× live) and its Markov head sharpens exactly the per-position distributions a tree expands. The tree is a strict, orthogonal add-on: it multiplies acceptance by branching, on top of whatever the chain already achieves — and it is the single direction where a flow matcher has a structural edge over EAGLE, backed here by V6's own measured top-b coverage.
+</p>
+
+</body>
+</html>

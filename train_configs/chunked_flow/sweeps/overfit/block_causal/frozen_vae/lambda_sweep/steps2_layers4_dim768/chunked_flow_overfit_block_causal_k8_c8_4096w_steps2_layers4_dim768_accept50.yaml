@@ -1,0 +1,47 @@
+model_id: Qwen/Qwen3.5-0.8B
+local_files_only: false
+device: cuda
+
+vae_dir: out/vae/ckpts/transformer-hidden-seq8-wider-kl-beta3e5-full
+context_size: 8
+draft_length: 8
+chunk_size: 8
+expert_dim: 768
+num_heads: 4
+ffn_multiplier: 6
+num_flow_steps: 2
+noise_scale: 1.0
+train_vae: false
+vae_learning_rate_multiplier: 0.1
+architecture: block_causal_experts
+num_drafter_layers: 4
+drafter_dropout: 0.0
+detach_previous_chunks: true
+
+lambda_flow: 0.1
+lambda_latent: 0.05
+lambda_hidden: 0.1
+lambda_cos: 0.05
+lambda_ce: 0.2
+lambda_accept: 0.5
+gamma: 0.8
+eps: 0.00000001
+
+dataset_path: data/flow_cache/gsm8k_6.5k_train
+dataset_split: train
+windows_per_epoch: 4096
+window_seed: 0
+materialize_rows: true
+output_dir: out/flow/ckpts/overfit-block-causal-k8-c8-frozen-beta3e5-full-vae-gsm8k-4096w-steps2_layers4_dim768-accept50
+
+per_device_train_batch_size: 256
+per_device_eval_batch_size: 256
+num_train_epochs: 100
+learning_rate: 0.0015
+logging_strategy: epoch
+logging_steps: 10
+eval_strategy: epoch
+save_strategy: steps
+save_steps: 20
+save_total_limit: 5
+report_to: none

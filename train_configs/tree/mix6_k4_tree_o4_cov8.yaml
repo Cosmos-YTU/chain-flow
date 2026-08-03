@@ -1,0 +1,57 @@
+model_id: Qwen/Qwen3.5-0.8B
+local_files_only: false
+device: cuda
+
+# V9 tree-flow: V6 (markov) backbone + path-conditioning head + top-b coverage loss, trained FOR trees.
+# Flow/backbone hyperparameters and schedule are IDENTICAL to V6 (mix6_k4_markov_rank256) so the tree
+# gains are attributable to the new components, not a different recipe.
+architecture: tree_flow
+context_size: 8
+draft_length: 4
+chunk_size: 4
+expert_dim: 1024
+num_heads: 8
+ffn_multiplier: 6
+num_drafter_layers: 8
+num_flow_steps: 2
+markov_rank: 256
+init_mode: delta
+detach_previous_chunks: true
+drafter_dropout: 0.0
+noise_scale: 1.0
+
+# --- V9 additions ---
+path_order: 4            # full parent-path conditioning for K=4 (token->hidden residual)
+path_ffn_multiplier: 2
+lambda_cov: 0.3          # top-b coverage loss weight (matches lambda_ce)
+cov_b: 8                 # optimise the true token into the top-8 the tree branches over
+cov_margin: 1.0
+tree_top_b: 8            # default tree branch factor (eval/build_tree)
+tree_max_nodes: 48       # global node budget (DDTree-style prune)
+
+lambda_flow: 0.2
+lambda_hidden: 0.25
+lambda_ce: 0.3
+lambda_accept: 0.15
+gamma: 0.8
+eps: 0.00000001
+
+dataset_path: data/flow_cache/stage4_mix6_55k_k4
+dataset_split: train
+window_seed: 0
+materialize_rows: true
+output_dir: out/flow/ckpts/tree-hiddenkv-k4-l8-ffn6-rank256-o4-cov8
+
+per_device_train_batch_size: 6144
+per_device_eval_batch_size: 6144
+
+num_train_epochs: 12
+learning_rate: 0.001
+lr_scheduler_type: constant
+logging_strategy: steps
+logging_steps: 100
+eval_strategy: "no"
+save_strategy: steps
+save_steps: 1500
+save_total_limit: 4
+report_to: none

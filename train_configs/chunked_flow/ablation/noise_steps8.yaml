@@ -1,0 +1,47 @@
+model_id: Qwen/Qwen3.5-0.8B
+local_files_only: false
+device: cuda
+
+architecture: hidden_kv_flow
+vae_dir: null
+train_vae: false
+context_size: 8
+draft_length: 4
+chunk_size: 4
+expert_dim: 1024
+num_heads: 8
+ffn_multiplier: 6
+num_drafter_layers: 8
+num_flow_steps: 8
+init_mode: noise
+detach_previous_chunks: true
+drafter_dropout: 0.0
+noise_scale: 1.0
+
+lambda_flow: 0.2
+lambda_latent: 0.15
+lambda_hidden: 0.25
+lambda_cos: 0.05
+lambda_ce: 0.2
+lambda_accept: 0.15
+gamma: 0.8
+eps: 0.00000001
+
+dataset_path: data/flow_cache/stage4_mix6_55k_k4
+dataset_split: train
+windows_per_epoch: 200000
+window_seed: 0
+materialize_rows: true
+output_dir: out/flow/ckpts/ablation-noise-steps8-k4-l8-ffn6
+
+per_device_train_batch_size: 4096
+per_device_eval_batch_size: 4096
+num_train_epochs: 6
+learning_rate: 0.001
+lr_scheduler_type: constant
+logging_strategy: epoch
+logging_steps: 10
+eval_strategy: "no"
+save_strategy: epoch
+save_total_limit: 1
+report_to: none

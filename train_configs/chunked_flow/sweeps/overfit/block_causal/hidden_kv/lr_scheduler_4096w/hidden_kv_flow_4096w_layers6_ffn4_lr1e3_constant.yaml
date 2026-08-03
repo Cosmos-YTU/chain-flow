@@ -1,0 +1,48 @@
+model_id: Qwen/Qwen3.5-0.8B
+local_files_only: false
+device: cuda
+
+context_size: 8
+draft_length: 8
+chunk_size: 8
+expert_dim: 1024
+num_heads: 8
+ffn_multiplier: 4
+num_flow_steps: 2
+noise_scale: 1.0
+init_mode: delta
+train_vae: false
+architecture: hidden_kv_flow
+num_drafter_layers: 6
+drafter_dropout: 0.0
+detach_previous_chunks: true
+
+lambda_flow: 0.2
+lambda_latent: 0.15
+lambda_hidden: 0.25
+lambda_cos: 0.05
+lambda_ce: 0.2
+lambda_accept: 0.15
+gamma: 0.8
+eps: 0.00000001
+
+dataset_path: data/flow_cache/gsm8k_6.5k_train
+dataset_split: train
+windows_per_epoch: 4096
+window_seed: 0
+materialize_rows: true
+output_dir: out/flow/ckpts/hidden-kv-flow-k8-c8-gsm8k-4096w-delta-layers6-ffn4-lr1e3_constant
+
+per_device_train_batch_size: 128
+per_device_eval_batch_size: 128
+num_train_epochs: 100
+learning_rate: 0.001
+lr_scheduler_type: constant
+warmup_ratio: 0.0
+logging_strategy: epoch
+logging_steps: 10
+eval_strategy: epoch
+save_strategy: steps
+save_steps: 20
+save_total_limit: 5
+report_to: none

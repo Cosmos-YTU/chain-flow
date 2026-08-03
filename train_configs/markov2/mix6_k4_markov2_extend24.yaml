@@ -1,0 +1,49 @@
+model_id: Qwen/Qwen3.5-0.8B
+local_files_only: false
+device: cuda
+
+# no-VAE hidden-KV drafter, K=4, BIGGER capacity (layers 8 / ffn 6 vs stage2's 6 / 4)
+architecture: markov2_flow
+context_size: 8
+draft_length: 4
+chunk_size: 4
+expert_dim: 1024
+num_heads: 8
+ffn_multiplier: 6
+num_drafter_layers: 8
+num_flow_steps: 2
+markov_rank: 512
+markov_order: 2
+markov_hidden_gate: true
+init_mode: delta
+detach_previous_chunks: true
+drafter_dropout: 0.0
+noise_scale: 1.0
+
+lambda_flow: 0.2
+lambda_hidden: 0.25
+lambda_ce: 0.3
+lambda_accept: 0.15
+gamma: 0.8
+eps: 0.00000001
+
+dataset_path: data/flow_cache/stage4_mix6_55k_k4
+dataset_split: train
+window_seed: 0
+materialize_rows: true
+output_dir: out/flow/ckpts/markov2-hiddenkv-k4-l8-ffn6-rank512-o2-gated
+
+per_device_train_batch_size: 6144
+per_device_eval_batch_size: 6144
+
+num_train_epochs: 24
+resume_from_checkpoint: out/flow/ckpts/markov2-hiddenkv-k4-l8-ffn6-rank512-o2-gated/checkpoint-25908
+learning_rate: 0.001
+lr_scheduler_type: constant
+logging_strategy: steps
+logging_steps: 100
+eval_strategy: "no"
+save_strategy: steps
+save_steps: 1500
+save_total_limit: 4
+report_to: none

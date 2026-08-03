@@ -1,0 +1,39 @@
+model_id: Qwen/Qwen3.5-0.8B
+local_files_only: false
+device: cuda
+
+# V4: DFlash-style masked-token-embedding block diffusion. Single-layer cache (context_feature_dim=1024).
+architecture: dflash_flow
+context_size: 8
+draft_length: 4
+expert_dim: 1024
+context_feature_dim: 1024
+num_heads: 8
+ffn_multiplier: 6
+num_drafter_layers: 8
+mask_min: 0.3
+mask_max: 1.0
+
+lambda_ce: 0.3
+lambda_accept: 0.15
+gamma: 0.8
+eps: 0.00000001
+
+dataset_path: data/flow_cache/stage4_mix6_55k_k4
+dataset_split: train
+window_seed: 0
+materialize_rows: true
+output_dir: out/flow/ckpts/dflash-mix6-55k-k4-l8-ffn6-singlelayer
+
+per_device_train_batch_size: 6144
+per_device_eval_batch_size: 6144
+
+num_train_epochs: 12
+learning_rate: 0.001
+lr_scheduler_type: constant
+logging_strategy: epoch
+logging_steps: 10
+eval_strategy: epoch
+save_strategy: epoch
+save_total_limit: 5
+report_to: none

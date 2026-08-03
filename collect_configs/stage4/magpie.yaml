@@ -1,0 +1,16 @@
+model_id: Qwen/Qwen3.5-0.8B
+dataset_name: Magpie-Align/Magpie-Llama-3.1-Pro-300K-Filtered
+dataset_config: null
+split: train
+streaming: true
+stream_take: 30000
+dataset_end: 30000
+source: magpie_instruct
+format_name: alpaca
+generation_max_new_tokens: 256
+generation_batch_size: 64
+hidden_batch_size: 16
+storage_dtype: float16
+dtype: float16
+device: cuda:0
+output_dir: teacher_states/stage4-magpie

@@ -1,0 +1,15 @@
+model_id: Qwen/Qwen3.5-4B
+dataset_name: abisee/cnn_dailymail
+dataset_config: 3.0.0
+split: train
+streaming: true
+stream_take: 4000
+source: summarization
+format_name: summarize_article
+generation_max_new_tokens: 256
+generation_batch_size: 48
+hidden_batch_size: 16
+storage_dtype: float16
+dtype: float16
+device: cuda:0
+output_dir: teacher_states/stage1-4bx-summarization

@@ -1,0 +1,19 @@
+model_id: Qwen/Qwen3.5-0.8B
+dataset_name: openai/gsm8k
+dataset_config: main
+split: train
+source: gsm8k
+format_name: qwen_chat_qa
+limit: 10
+generation_max_new_tokens: 4096
+batch_size: 1
+storage_dtype: float16
+local_files_only: true
+device:
+dtype: float16
+seed: 0
+output_dir: teacher_states/gsm8k-qwen35-08b-smoke
+tmp_output_dir: teacher_states/_tmp_gsm8k-qwen35-08b-smoke
+push_to_hub:
+tmp_push_to_hub:
+private: false

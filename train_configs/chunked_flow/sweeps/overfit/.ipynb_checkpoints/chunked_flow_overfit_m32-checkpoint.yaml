@@ -1,0 +1,37 @@
+model_id: Qwen/Qwen3.5-0.8B
+local_files_only: true
+device: cuda
+
+vae_dir: out/vae/ckpts/hidden-vae-lr3e3/checkpoint-1880
+context_size: 8
+draft_length: 4
+chunk_size: 4
+expert_dim: 64
+num_heads: 2
+ffn_multiplier: 2
+num_flow_steps: 1
+noise_scale: 1.0
+
+dataset_path: teacher_states/gsm8k-qwen35-08b-smoke
+dataset_split: train
+windows_per_epoch: 32
+window_seed: 0
+materialize_rows: true
+output_dir: out/flow/ckpts/smoke-chunked-flow-k2
+
+lambda_flow: 1.0
+lambda_latent: 0.5
+lambda_hidden: 0.5
+lambda_cos: 0.1
+lambda_ce: 0.2
+lambda_accept: 0.1
+gamma: 0.8
+eps: 0.00000001
+
+per_device_train_batch_size: 8
+num_train_epochs: 1
+learning_rate: 0.0003
+logging_steps: 1
+save_steps: 100
+save_total_limit: 2
+report_to: none

@@ -1,0 +1,25 @@
+# ---- large artefacts: regenerable or huge ----
+.venv/
+vllm/.venv/
+out/                    # trained checkpoints (published on HF)
+data/                   # preprocessed flow caches
+teacher_states/         # collected teacher hidden states
+bench_data/*.arrow
+
+# ---- logs: keep the pipeline .sh, drop the multi-MB run logs ----
+logs/*.log
+scripts/viz/*.log
+vllm/*.log
+*.out
+
+# ---- misc bulk ----
+scripts/viz/media/      # rendered animation frames (34M)
+newback.zip
+newback/
+session_*_events.json
+tmp/
+__pycache__/
+*.pyc
+*.pt
+*.safetensors
+.ipynb_checkpoints/

@@ -1,0 +1,14 @@
+model_id: Qwen/Qwen3.5-9B
+dataset_name: nvidia/Nemotron-Post-Training-Dataset-v1
+dataset_config: default
+split: stem
+dataset_end: 4000
+source: nemotron_stem
+format_name: nemotron_messages
+generation_max_new_tokens: 256
+generation_batch_size: 128
+hidden_batch_size: 48
+storage_dtype: float16
+dtype: float16
+device: cuda:0
+output_dir: teacher_states/stage1-9bx-nemotron_stem

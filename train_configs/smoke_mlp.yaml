@@ -1,0 +1,23 @@
+dataset_path: teacher_states/gsm8k-qwen35-08b-smoke
+output_dir: checkpoints/hidden-mlp-smoke
+model_id: Qwen/Qwen3.5-0.8B
+local_files_only: true
+device:
+
+context_size: 4
+draft_length: 4
+hidden_multiplier: 2
+vae_dir:
+windows_per_epoch: 32
+window_seed: 0
+
+lambda_latent_mse: 0.0
+lambda_latent_cos: 0.0
+
+per_device_train_batch_size: 8
+num_train_epochs: 1
+learning_rate: 0.0001
+logging_steps: 10
+save_steps: 100
+save_total_limit: 2
+report_to: none
