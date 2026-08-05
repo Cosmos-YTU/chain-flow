@@ -135,6 +135,27 @@ Two guards make the bypass safe rather than merely fast:
 | 9B  | 103.9 | **110.4** (+6.3%)  | | (+5.5%, docs) |
 | 27B |  45.5 | **46.6** (+2.4%)   | | (+1.6%, docs) |
 
+**The 9B row is a `Flow-Drafter-9B` (v1) number and the default is no longer v1.** 4B and 27B
+moved to their `-v2` drafters when those were trained; the 9B line in `vllm/bench_cf.sh` was
+never updated, so *every* 9B figure in this document predates 2026-08-05 and is a v1 figure.
+Re-measured on 2026-08-05 (GPU 4, same protocol, 2 repeats, output-diffed against base):
+
+| 9B, 8×5 tree | pooled accept | pooled tok/s | vs base async-off (78.6 fork / 78.5 pristine) |
+|---|---|---|---|
+| tree, v1 | 2.165 | 110.1 | 1.40x |
+| **tree, v2** | **2.302** | **117.3** | **1.49x** |
+| chain, v1 | 1.716 | 96.3 | 1.23x |
+| **chain, v2** | **1.819** | **102.3** | **1.30x** |
+
+v2 is +6.5% (tree) / +6.2% (chain) pooled over all 7 domains, and +7.8% / +6.0% over the
+output-comparable 6 (tree drops `math_reasoning`, chain drops `writing` — see the token-diff
+rule below). The accept gain is entirely on the free-form domains (`qa` +0.21, `summarization`
++0.30, `writing` +0.32 on the tree arm) with code/math flat-to-slightly-down, which is the
+same shape as the offline `+0.09` that motivated the v2 retrain — this time the offline delta
+*under*-stated the in-engine one. `bench_cf.sh` now defaults 9B to
+`selimaktas/Flow-Drafter-9B-v2`; the numbers above the line are not restated because doing so
+would silently mix drafters inside one table.
+
 Run-to-run spread on the 4B sync arm across four measurements of the same code was
 170.3–172.1 (~±0.5%), so treat anything under 1% here as noise. The sync arm's accept is
 byte-identical to the pre-change reference on all 7 domains

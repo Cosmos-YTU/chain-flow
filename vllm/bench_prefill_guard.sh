@@ -20,7 +20,7 @@ mkdir -p "$OUT"
 
 case "$SIZE" in
   4b)  MODEL=Qwen/Qwen3.5-4B;  DR=selimaktas/Flow-Drafter-4B-v2;            GMU=0.55 ;;
-  9b)  MODEL=Qwen/Qwen3.5-9B;  DR=selimaktas/Flow-Drafter-9B;               GMU=0.70 ;;
+  9b)  MODEL=Qwen/Qwen3.5-9B;  DR=selimaktas/Flow-Drafter-9B-v2;            GMU=0.70 ;;
   27b) MODEL=Qwen/Qwen3.5-27B; DR=selimaktas/Flow-Drafter-Qwen3.5-27B-v2;   GMU=0.85 ;;
   *) echo "bad size"; exit 1 ;;
 esac

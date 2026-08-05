@@ -238,6 +238,15 @@ _FORK_MARKERS = (
     ("v1/spec_decode/tree_gdn.py", "CF_GDN_DEFER"),
     ("v1/spec_decode/tree_attn_fused.py", "CF_TREE_FUSED_ATTN"),
     ("config/vllm.py", "CF_ASYNC_SPEC"),
+    # THE .cu SOURCES, not just their Python loaders.  Those loaders JIT-compile a sibling
+    # ``.cu`` at model-load time, so a tree that has the .py files and not the .cu ones is a
+    # fork by every marker check and then dies inside `torch.utils.cpp_extension.load` -- with
+    # CF_TREE_FUSED_ATTN defaulted ON precisely because the fork "was present".  That is exactly
+    # the state the tree patch shipped in for a while (the diff carried the five .py files and
+    # none of the three .cu), so half-forks of this shape exist in the wild.
+    ("v1/spec_decode/tree_attn_fused.cu", "PYBIND11_MODULE"),
+    ("v1/spec_decode/tree_gdn_verify.cu", "gdn_verify"),
+    ("v1/spec_decode/tree_gdn_factor.cu", "gdn_factor"),
 )
 
 _FORK: dict | None = None

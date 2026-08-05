@@ -46,7 +46,11 @@ if [ "$SIZE" = "4b" ]; then
   export CF_GMU=${CF_GMU:-0.55}
 elif [ "$SIZE" = "9b" ]; then
   export CF_MODEL=Qwen/Qwen3.5-9B
-  : ${CF_DRAFTER_DIR:=selimaktas/Flow-Drafter-9B}; export CF_DRAFTER_DIR
+  # v2 (2026-08-05): measured v1-vs-v2 here, 7 domains, batch 1, maxtok 256, 8x5 tree, 2 repeats.
+  # Tree arm pooled accept 2.165 -> 2.302 and 110.1 -> 117.3 tok/s; chain arm 1.716 -> 1.819 and
+  # 96.3 -> 102.3 tok/s. This line was the last size still on v1, so every published 9B number
+  # before that date is a v1 number. docs/BENCHMARKING.md.
+  : ${CF_DRAFTER_DIR:=selimaktas/Flow-Drafter-9B-v2}; export CF_DRAFTER_DIR
   export CF_GMU=${CF_GMU:-0.70}
 else
   export CF_MODEL=Qwen/Qwen3.5-27B

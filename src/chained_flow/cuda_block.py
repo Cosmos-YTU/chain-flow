@@ -14,7 +14,7 @@ block-passes of a draft) out of the inner loop.
 Covered shapes (anything else silently falls back to PyTorch -- see ``supported()``):
     batch 1, fp16, heads 8, ffn multiplier 6, S in {4, 8}, C <= 16, and
     D = 640  (Flow-Drafter-4B-v2)
-    D = 1024 (Flow-Drafter-9B, Flow-Drafter-Qwen3.5-27B-v2)
+    D = 1024 (Flow-Drafter-9B-v2, Flow-Drafter-Qwen3.5-27B-v2)
 
 Tunables (env): ``CF_CUDA_BLOCK_G`` grid size, ``CF_CUDA_BLOCK_T`` threads/block,
 ``CF_CUDA_BLOCK_LB`` launch-bound variant (0 = (512,1), 1 = (512,2), 2 = (1024,1); the

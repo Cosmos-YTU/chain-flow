@@ -9,7 +9,7 @@ get one command.
     chained-flow info              # resolved flags, vLLM build, async guard, kernel, drafter
     chained-flow build-kernel      # precompile the fused-block extension (else it JITs on first use)
     chained-flow build-shortlist   # build a CF_SHORTLIST for a vocabulary we do not ship one for
-    chained-flow tree-patch        # where the OPTIONAL forked-vLLM patch is, and how to apply it
+    chained-flow tree-patch        # apply/revert/verify the OPTIONAL forked-vLLM tree patch
     chained-flow docs             # print docs/BENCHMARKING.md (it ships in the wheel)
     chained-flow env               # `eval "$(chained-flow env)"`: the flag table as exports
 
@@ -211,41 +211,23 @@ def cmd_docs(args) -> int:
 
 
 TREE_PATCH = "vllm-0.25.1-chained-flow-tree.patch"
+# The vLLM the patch is generated against, taken FROM the patch's own filename so the pin has one
+# source. Spelled out here (rather than imported from chained_flow.tree_patch) because building
+# the argument parser must not import the package: `chained-flow --help` would then pay for torch.
+_PIN = TREE_PATCH.split("-")[1]
 
 
-def patch_path() -> str:
-    from pathlib import Path
+def cmd_tree_patch(args) -> int:
+    """Apply / revert / verify the optional forked-vLLM tree path.
 
-    return str(Path(__file__).resolve().parent / "patches" / TREE_PATCH)
-
-
-def cmd_tree_patch(_args) -> int:
-    """Print the patch location and the exact command, and DO NOT apply it.
-
-    Applying it would mean writing into someone's site-packages from a tool they ran to ask a
-    question. The tree path is opt-in on purpose: it modifies vLLM, it is greedy-only, and the
-    default chain build needs none of it.
+    The whole implementation lives in ``chained_flow.tree_patch`` and is stdlib-only, so this
+    command works on a box that is only PREPARING an environment -- no torch, no GPU, no drafter.
+    Everything it can refuse, it refuses before writing a byte: see that module's docstring for
+    why a half-applied fork is worse than an unpatched one.
     """
-    import os.path
+    from chained_flow import tree_patch
 
-    p = patch_path()
-    if not os.path.isfile(p):
-        print(f"[cf] the tree patch is missing from this install (expected {p}). It ships as "
-              f"package data; a checkout has it at src/chained_flow/patches/{TREE_PATCH}.",
-              file=sys.stderr)
-        return 1
-    print(f"patch: {p}\n")
-    print("The tree path is OPTIONAL. It needs a patched vLLM 0.25.1 (tree-aware verify, "
-          "tree-shaped GDN recurrence and attention). The default chain build needs none of "
-          "it and does not modify vLLM.\n")
-    print("Apply into the vLLM install of the CURRENT interpreter:\n")
-    print(f'  cd "$(python -c \'import vllm,os;print(os.path.dirname(os.path.dirname(vllm.__file__)))\')"')
-    print(f"  patch -p1 --dry-run < {p}      # check first")
-    print(f"  patch -p1 < {p}\n")
-    print("Then run with VLLM_SPEC_TREE=1 and "
-          "num_speculative_tokens = CF_TREE_KEEP*CF_TREE_DEPTH + 1.")
-    print("`chained-flow info` will report `vLLM build : FORKED` once it is in.")
-    return 0
+    return tree_patch.main(args)
 
 
 def cmd_env(_args) -> int:
@@ -264,7 +246,24 @@ def main(argv=None) -> int:
     # subcommand is passed through verbatim rather than duplicated here and left to drift.
     sub.add_parser("build-shortlist", add_help=False,
                    help="build a CF_SHORTLIST token-id list (--help for its options)")
-    sub.add_parser("tree-patch", help="where the optional forked-vLLM patch is, and how to apply it")
+    # One command, three verbs, and no verb at all is the SAFE one (report, do not write).
+    # `--apply` is the explicit token the safety rules ask for; `--dry-run` pairs with either
+    # mutating verb and stages the whole change in memory without touching the install.
+    tp = sub.add_parser("tree-patch",
+                        help="apply / revert / verify the optional forked-vLLM tree patch")
+    g = tp.add_mutually_exclusive_group()
+    g.add_argument("--apply", action="store_true",
+                   help=f"patch the vLLM of THIS interpreter (needs vllm=={_PIN}); "
+                        "verified against the wheel's RECORD before and after")
+    g.add_argument("--revert", action="store_true",
+                   help="restore the vLLM byte-identically and delete the added files")
+    g.add_argument("--status", action="store_true",
+                   help="is it applied, and is every other file still the wheel's? "
+                        "(exit 0 applied / 1 not applied / 3 inconsistent)")
+    g.add_argument("--show", action="store_true",
+                   help="print the patch file's path and the manual `patch -p1` route")
+    tp.add_argument("--dry-run", action="store_true",
+                    help="with --apply/--revert: stage and verify everything, write nothing")
     d = sub.add_parser("docs", help="print a shipped doc (default: the benchmarking protocol)")
     d.add_argument("doc", nargs="?", default="benchmarking", choices=sorted(DOCS))
     sub.add_parser("env", help='shell exports for the flag table: eval "$(chained-flow env)"')

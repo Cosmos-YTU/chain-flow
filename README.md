@@ -57,7 +57,7 @@ Exactly two things. Everything else has a default that is gated and printed.
 | target model | drafter |
 |---|---|
 | `Qwen/Qwen3.5-4B`  | `selimaktas/Flow-Drafter-4B-v2` |
-| `Qwen/Qwen3.5-9B`  | `selimaktas/Flow-Drafter-9B` |
+| `Qwen/Qwen3.5-9B`  | `selimaktas/Flow-Drafter-9B-v2` |
 | `Qwen/Qwen3.5-27B` | `selimaktas/Flow-Drafter-Qwen3.5-27B-v2` |
 
 ## Quickstart
@@ -165,29 +165,54 @@ only its multi-branch acceptance.
 ### Enabling the tree path
 
 The tree needs a patched vLLM (a tree-aware verify, tree-shaped GDN recurrence
-and attention, and a KV/state hand-off none of which upstream exposes):
+and attention, and a KV/state hand-off none of which upstream exposes). One
+command, on the vLLM of the interpreter you run it with:
 
 ```bash
-chained-flow tree-patch      # prints the patch path and the exact commands
+chained-flow tree-patch                # what it would touch, and the current state
+chained-flow tree-patch --apply        # patch this environment's vLLM
+chained-flow tree-patch --status       # is it applied? is every other file still stock?
+chained-flow tree-patch --revert       # restore it byte-identically
 ```
 
-which amounts to:
+`--apply` and `--revert` both take `--dry-run`, which stages and verifies the
+whole change in memory and writes nothing.
 
-```bash
-cd "$(python -c 'import vllm,os;print(os.path.dirname(os.path.dirname(vllm.__file__)))')"
-patch -p1 --dry-run < .../chained_flow/patches/vllm-0.25.1-chained-flow-tree.patch
-patch -p1         < .../chained_flow/patches/vllm-0.25.1-chained-flow-tree.patch
-```
+It refuses rather than half-doing anything, because a **half-applied fork does
+not raise — it drafts wrongly, at full speed**:
+
+* the target is the vLLM this interpreter would `import`, resolved through the
+  import system, not a guessed `site-packages` path;
+* the version gate is hard and doubled — `vllm.__version__` *and* the dist-info
+  must both read `0.25.1` and must agree with each other;
+* before and after, **every one of the wheel's 4502 files is hashed against
+  `vllm-0.25.1.dist-info/RECORD`**. After `--apply` the expected diff is exactly
+  6 modified + 8 added; after `--revert`, zero. Any other number is reported
+  file by file;
+* the diff is applied at exact line numbers with zero fuzz, every file is built
+  in memory first, and one bad hunk aborts before a single byte is written —
+  there is no `.rej` path;
+* `--revert` *reverse-applies* the same hunks and re-hashes against RECORD, so
+  it needs no saved backup and still works after you have upgraded pip packages
+  around it. A file it cannot prove it would restore exactly is refused, not
+  guessed at;
+* re-running `--apply` on an already-patched install says so and exits 0.
+
+`--status` exits 0 applied / 1 not applied / 3 inconsistent, so it is usable in
+a script. `chained-flow tree-patch --show` prints the patch file's path and the
+manual `patch -p1` route, for patching a *different* interpreter's vLLM.
 
 Then run with `VLLM_SPEC_TREE=1`, `CF_TREE_KEEP` × `CF_TREE_DEPTH` nodes, and
 `num_speculative_tokens = CF_TREE_KEEP*CF_TREE_DEPTH + 1` (the extra column is a
 spare mamba-state slot, never an emitted token). `chained-flow info` reports
-`vLLM build : FORKED` once the patch is in; without it the tree flags report
-`fork_missing` and are **not offered** rather than silently ignored.
+`vLLM build : FORKED` once the patch is in, and the `[cf-defaults]` line lists
+`gdn_defer gdn_bv tree_fused_attn tree_fullcg` under **ON**; without the patch
+those flags report `fork_missing` and are **not offered** rather than silently
+ignored.
 
-The patch touches 6 upstream files and adds 5, all under
-`vllm/v1/spec_decode/`. It is generated against 0.25.1 exactly; the version pin
-is deliberate.
+The patch touches 6 upstream files and adds 8 (five `.py` and the three `.cu`
+sources their JIT loaders compile), all but two under `vllm/v1/spec_decode/`. It
+is generated against 0.25.1 exactly; the version pin is deliberate.
 
 ## CUDA kernel
 

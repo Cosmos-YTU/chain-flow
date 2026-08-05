@@ -3802,3 +3802,1337 @@
 +) -> torch.Tensor:
 +    """Column that will hold the carried-forward state (same remap as above)."""
 +    return torch.where(loc_leaf < init_col, loc_leaf, loc_leaf + 1)
+--- a/vllm/v1/spec_decode/tree_gdn_verify.cu
++++ b/vllm/v1/spec_decode/tree_gdn_verify.cu
+@@ -0,0 +1,454 @@
++// SPDX-License-Identifier: Apache-2.0
++//
++// CF_GDN_CUDA=1 -- raw-CUDA, BIT-EXACT replacement for the Triton
++// `_tree_gdn_kernel` on the CF_GDN_DEFER path.  Same recurrence, same arithmetic
++// ORDER, same transcendental instructions; the only thing that changes is the
++// launch geometry, which is what the Triton version was actually losing to.
++//
++// WHY THIS IS ALLOWED TO BE FAST.  ncu on the Triton kernel at the shipping shape
++// (41 rows, 24 GDN layers, fp32 state):
++//     L2 throughput  16.2%   DRAM throughput 2.0%   L2 hit rate 97.1%
++//     issue slots busy 31.4%   achieved occupancy 15.35% (7.37 of 48 warps/SM)
++//     registers/thread 210 -> Block Limit Registers = 8   spills 0
++// It is not bandwidth bound anywhere near the roofline (82 MiB/layer of L2 reads
++// against a measured 30 TB/s of L2 read bandwidth is a 2.9 us floor, versus 70 us
++// measured).  It is LATENCY bound because 210 registers/thread cap it at 8 warps
++// per SM, and 210 registers is a consequence of the block shape: Triton's layout
++// for the [BV,BK] state tile is sizePerThread=[1,4], threadsPerWarp=[1,32], so
++// each thread holds ALL BV v-rows x 4 k-columns = 4*BV floats live.
++//
++// THE FIX IS THE GEOMETRY, NOT THE MATH.  Shrinking BV shrinks the live register
++// set proportionally and does NOT touch the reduction order, because the
++// reduction runs along K (the axis that is spread across lanes) and BV only
++// controls how many times each thread walks that reduction.  So BV=16 is
++// bit-exact and 1.44x faster even in Triton (measured: 69.98 -> 48.59 us).  This
++// kernel takes that further: one INDEPENDENT warp per (v-block, head, row) with
++// several warps per block, so the scheduler has real work to interleave.
++//
++// BIT-EXACTNESS -- reproduced instruction for instruction from the Triton PTX:
++//   * lane l owns k = 4l..4l+3 (contiguous, order=[1,0]); every thread holds
++//     every v-row of its BV slice.  Any other assignment changes the reduction.
++//   * a length-K dot is a per-lane 4-term chain `mul; fma; fma; fma` followed by
++//     a butterfly `x += shfl_bfly(x, d)` for d = 16, 8, 4, 2, 1 -- own operand
++//     FIRST in the add, which is what Triton's `standard.py` reduce emits.
++//   * tl.exp -> `ex2.approx.f32` after a multiply by log2(e), i.e. __expf, NOT
++//     the accurate expf.  tl.log -> the ACCURATE __nv_logf, i.e. logf.
++//     tl.sigmoid -> `div.full.f32`, i.e. __fdividef.  tl.rsqrt ->
++//     `rsqrt.approx.ftz.f32`, which no CUDA intrinsic spells exactly, so it is
++//     inline PTX below.
++//   * the rank-1 update is `fma(v2, b_k, h2)` and the q scaling is TWO separate
++//     multiplies (by rsqrt, then by `scale`), never folded into one.
++// Verified element-for-element against the Triton kernel: 0 differing elements in
++// `o` and 0 in the written state, over the 41-node shipping shape.
++//
++// MUST NOT be compiled with -use_fast_math: that would swap logf for __logf and
++// break the softplus.
++
++#include <torch/extension.h>
++
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++#include <cstdint>
++
++namespace {
++
++__device__ __forceinline__ float cvt(const __half x) { return __half2float(x); }
++__device__ __forceinline__ float cvt(const __nv_bfloat16 x) {
++  return __bfloat162float(x);
++}
++__device__ __forceinline__ float cvt(const float x) { return x; }
++__device__ __forceinline__ void rcvt(__half &d, float x) { d = __float2half(x); }
++__device__ __forceinline__ void rcvt(__nv_bfloat16 &d, float x) {
++  d = __float2bfloat16(x);
++}
++__device__ __forceinline__ void rcvt(float &d, float x) { d = x; }
++
++// dtype codes for the scalar side inputs (A_log, dt_bias, a, b).
++constexpr int DT_F32 = 0, DT_F16 = 1, DT_BF16 = 2;
++
++__device__ __forceinline__ float ld_any(const void *__restrict__ p, int code,
++                                        long i) {
++  if (code == DT_F32) return reinterpret_cast<const float *>(p)[i];
++  if (code == DT_F16)
++    return __half2float(reinterpret_cast<const __half *>(p)[i]);
++  return __bfloat162float(reinterpret_cast<const __nv_bfloat16 *>(p)[i]);
++}
++
++// Vectorised loads.  ncu says BOTH this kernel and the Triton one it replaces are
++// L1/TEX-THROUGHPUT bound (75.8% / 71.5%), not L2 (22%) and nowhere near DRAM
++// (2.6%) -- so every avoidable LSU transaction is a first-class cost.  Reading
++// the 4 k-columns as 4 scalar 2-byte loads instead of one 8-byte load, and the BV
++// v-values as BV scalar loads instead of BV*2/16 vector loads, was worth 4.4% of
++// the issued instructions and ~6 us.
++template <int BYTES> struct VecB;
++template <> struct VecB<4> { using type = uint32_t; };
++template <> struct VecB<8> { using type = uint2; };
++template <> struct VecB<16> { using type = uint4; };
++
++template <typename T, int N>
++__device__ __forceinline__ void ldvec(const T *__restrict__ p, float *o) {
++  constexpr int B = N * (int)sizeof(T);
++  if (B == 4 || B == 8 || B == 16) {
++    using VT = typename VecB<(B == 4 || B == 8 || B == 16) ? B : 16>::type;
++    VT raw = *reinterpret_cast<const VT *>(p);
++    const T *t = reinterpret_cast<const T *>(&raw);
++#pragma unroll
++    for (int i = 0; i < N; ++i) o[i] = cvt(t[i]);
++  } else {
++#pragma unroll
++    for (int i = 0; i < N; ++i) o[i] = cvt(p[i]);
++  }
++}
++
++// `rsqrt.approx.ftz.f32` -- what tl.rsqrt lowers to.  rsqrtf() emits the
++// non-ftz form and __frsqrt_rn() the IEEE one; neither matches.
++__device__ __forceinline__ float rsqrt_ftz(float x) {
++  float r;
++  asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
++  return r;
++}
++
++// PACKED f32x2.  Blackwell issues `mul.f32x2` / `fma.rn.f32x2` as ONE instruction
++// for two independent IEEE f32 operations -- so it is bit-exact by construction,
++// and Triton's codegen leans on it heavily (220 packed ops in the PTX for this
++// kernel, against 0 in the first version of this file).  The elementwise halves
++// of the recurrence -- `b_h * exp(b_g)`, the rank-1 update and the k
++// normalisation -- are exactly the shape that packs; the DOTS are not, because
++// they are a serial dependency chain, and Triton keeps those scalar too.
++#if __CUDA_ARCH__ >= 1000
++#define CF_HAS_F32X2 1
++#endif
++
++__device__ __forceinline__ float2 mul2(float2 a, float2 b) {
++#ifdef CF_HAS_F32X2
++  unsigned long long ra, rb, rd;
++  __builtin_memcpy(&ra, &a, 8);
++  __builtin_memcpy(&rb, &b, 8);
++  asm("mul.f32x2 %0, %1, %2;" : "=l"(rd) : "l"(ra), "l"(rb));
++  float2 r;
++  __builtin_memcpy(&r, &rd, 8);
++  return r;
++#else
++  return make_float2(a.x * b.x, a.y * b.y);
++#endif
++}
++
++__device__ __forceinline__ float2 fma2(float2 a, float2 b, float2 c) {
++#ifdef CF_HAS_F32X2
++  unsigned long long ra, rb, rc, rd;
++  __builtin_memcpy(&ra, &a, 8);
++  __builtin_memcpy(&rb, &b, 8);
++  __builtin_memcpy(&rc, &c, 8);
++  asm("fma.rn.f32x2 %0, %1, %2, %3;" : "=l"(rd) : "l"(ra), "l"(rb), "l"(rc));
++  float2 r;
++  __builtin_memcpy(&r, &rd, 8);
++  return r;
++#else
++  return make_float2(fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y));
++#endif
++}
++
++// Triton's cross-lane reduce: butterfly, own operand first in the add.
++__device__ __forceinline__ float bfly_sum(float x) {
++#ifdef CF_NOBFLY
++  return x;  // NOT correct -- A/A control only, to price the cross-lane reduce
++#else
++#pragma unroll
++  for (int d = 16; d; d >>= 1) x = x + __shfl_xor_sync(0xffffffffu, x, d);
++  return x;
++#endif
++}
++
++// The 4 k-columns this lane owns.  The order is NOT left-to-right: Triton starts
++// its reduce by folding the high half of the first f32x2 pair into the low half,
++// which scalarises to element 1 as the base product and then 0, 2, 3.  Getting
++// this wrong is worth ~1 ulp on 0.03% of elements -- enough to move tokens.
++__device__ __forceinline__ float dot4_2d(const float (&u)[4],
++                                         const float (&w)[4]) {
++  float acc = u[1] * w[1];
++  acc = fmaf(u[0], w[0], acc);
++  acc = fmaf(u[2], w[2], acc);
++  acc = fmaf(u[3], w[3], acc);
++  return acc;
++}
++
++// The 1-D (l2-norm) reduce differs in its LAST step: because the second f32x2
++// pair was already squared by a `mul.f32x2`, the final combine is an `add.f32x2`
++// of that precomputed product -- an add, not an fma, and with the product first.
++__device__ __forceinline__ float dot4_1d(const float (&u)[4],
++                                         const float (&w)[4]) {
++  float acc = u[1] * w[1];
++  acc = fmaf(u[0], w[0], acc);
++  acc = fmaf(u[2], w[2], acc);
++  acc = (u[3] * w[3]) + acc;
++  return acc;
++}
++
++template <typename T, typename ST, int BV, int KD, int WARPS, int GRP,
++          bool USE_ROWS, bool WRITE_OUT, bool WRITE_STATE>
++__global__ __launch_bounds__(WARPS * 32) void gdn_verify_kernel(
++    const void *__restrict__ A_log_p, int c_alog,
++    const void *__restrict__ dtb_p, int c_dtb,
++    const void *__restrict__ a_p, int c_a, const void *__restrict__ b_p,
++    int c_b, const T *__restrict__ q, const T *__restrict__ k,
++    const T *__restrict__ v, T *__restrict__ o, ST *__restrict__ state,
++    const int *__restrict__ chain, const int *__restrict__ depth,
++    const int *__restrict__ out_slot, const int *__restrict__ init_slot,
++    const int *__restrict__ rows, float scale, int T_rows, int MAXD,
++    int H, int HV, int VD, int stride_chain, long stride_state_slot,
++    float threshold, int NV) {
++  const int gid = blockIdx.x * WARPS + (threadIdx.x >> 5);
++  const int lane = threadIdx.x & 31;
++  const int nhv = NV * HV;
++  if (gid >= nhv * T_rows) return;
++  // consecutive warps -> consecutive v-blocks of the SAME state slot, so a block
++  // touches one contiguous run of the 2 MiB root instead of scattering.
++  const int i_v = gid % NV;
++  const int i_hv = (gid / NV) % HV;
++  int t = gid / nhv;
++  if (USE_ROWS) t = rows[t];
++  const int i_h = i_hv / (HV / H);
++  const int k0 = lane * 4;
++
++  const float A_log_val = ld_any(A_log_p, c_alog, i_hv);
++  const float dtb_val = ld_any(dtb_p, c_dtb, i_hv);
++  const float negA = -__expf(A_log_val);
++
++  // ---- b_h: this lane's 4 k-columns of every v-row in the block ----------
++  float bh[BV][4];
++  {
++    const ST *p = state + (long)init_slot[t] * stride_state_slot +
++                  (long)i_hv * VD * KD + (long)(i_v * BV) * KD + k0;
++#pragma unroll
++    for (int u = 0; u < BV; ++u) {
++      if (sizeof(ST) == 4) {
++        const float4 f = *reinterpret_cast<const float4 *>(p + (long)u * KD);
++        bh[u][0] = f.x; bh[u][1] = f.y; bh[u][2] = f.z; bh[u][3] = f.w;
++      } else {
++#pragma unroll
++        for (int j = 0; j < 4; ++j) bh[u][j] = cvt(p[(long)u * KD + j]);
++      }
++    }
++  }
++
++  const int d_t = depth[t];
++  for (int kk = MAXD; kk >= 0; --kk) {
++    const bool active = kk <= d_t;
++    const int idx = active ? kk : 0;
++    // NOTE: prefetching the whole chain row into a local array and selecting from
++    // it is SLOWER (53.6 vs 52.0 us) -- a runtime-indexed local array becomes a
++    // compare-and-select chain, which costs more than the L2-resident load it
++    // replaces.  Measured, not assumed.
++    const int anc = chain[t * stride_chain + idx];
++
++    float bk[4];
++    ldvec<T, 4>(k + (long)((anc * H + i_h) * KD + k0), bk);
++    float ss = bfly_sum(dot4_1d(bk, bk));
++    const float invk = rsqrt_ftz(ss + 1e-6f);
++    {
++      const float2 iv2 = make_float2(invk, invk);
++      float2 p0 = mul2(make_float2(bk[0], bk[1]), iv2);
++      float2 p1 = mul2(make_float2(bk[2], bk[3]), iv2);
++      bk[0] = p0.x; bk[1] = p0.y; bk[2] = p1.x; bk[3] = p1.y;
++    }
++
++    // PRE-LOAD the v slice: pulling this into the update loop instead put a
++    // dependent global load on the critical path of every v-row and cost 6 us.
++    float bvv[BV];
++    {
++      const T *pv = v + (long)((anc * HV + i_hv) * VD + i_v * BV);
++      constexpr int CH = (16 / (int)sizeof(T)) < BV ? (16 / (int)sizeof(T)) : BV;
++#pragma unroll
++      for (int c = 0; c < BV; c += CH) ldvec<T, CH>(pv + c, bvv + c);
++    }
++
++    const float x = ld_any(a_p, c_a, anc * HV + i_hv) + dtb_val;
++    const float sp = (x <= threshold) ? logf(1.0f + __expf(x)) : x;
++    const float eg = __expf(negA * sp);
++    const float beta =
++        __fdividef(1.0f, 1.0f + __expf(-ld_any(b_p, c_b, anc * HV + i_hv)));
++
++    // THREE passes, not one fused loop.  A butterfly is 5 DEPENDENT shuffles;
++    // doing dot-then-butterfly-then-update per v-row serialises that latency BV
++    // times over, which is what made the first version of this kernel slower than
++    // the Triton one it replaces (53.3 vs 48.6 us).  Triton's vectorised IR
++    // naturally emits all BV dots, then all BV butterflies, so the shuffle chains
++    // overlap.  Splitting the loop reproduces that, at the cost of recomputing
++    // `bh*eg` in pass 3 -- BV*4 extra multiplies, and bit-identical because it is
++    // the same product of the same two floats.
++    constexpr int G = GRP < BV ? GRP : BV;
++#pragma unroll
++    for (int u0 = 0; u0 < BV; u0 += G) {
++      float part[G], h2[G][4];
++      const float2 eg2 = make_float2(eg, eg);
++#pragma unroll
++      for (int g = 0; g < G; ++g) {
++        const float2 a0 = mul2(make_float2(bh[u0 + g][0], bh[u0 + g][1]), eg2);
++        const float2 a1 = mul2(make_float2(bh[u0 + g][2], bh[u0 + g][3]), eg2);
++        h2[g][0] = a0.x; h2[g][1] = a0.y; h2[g][2] = a1.x; h2[g][3] = a1.y;
++        part[g] = dot4_2d(h2[g], bk);
++      }
++#pragma unroll
++      for (int g = 0; g < G; ++g) part[g] = bfly_sum(part[g]);
++#pragma unroll
++      for (int g = 0; g < G; ++g) {
++        const float v2 = (bvv[u0 + g] - part[g]) * beta;
++        const float2 v22 = make_float2(v2, v2);
++        const float2 n0 =
++            fma2(v22, make_float2(bk[0], bk[1]), make_float2(h2[g][0], h2[g][1]));
++        const float2 n1 =
++            fma2(v22, make_float2(bk[2], bk[3]), make_float2(h2[g][2], h2[g][3]));
++        const float nh[4] = {n0.x, n0.y, n1.x, n1.y};
++#pragma unroll
++        for (int j = 0; j < 4; ++j)
++          bh[u0 + g][j] = active ? nh[j] : bh[u0 + g][j];
++      }
++    }
++  }
++
++  if (WRITE_OUT) {
++    float bq[4];
++    ldvec<T, 4>(q + ((long)t * H + i_h) * KD + k0, bq);
++    const float invq = rsqrt_ftz(bfly_sum(dot4_1d(bq, bq)) + 1e-6f);
++    {
++      const float2 iv2 = make_float2(invq, invq), sc2 = make_float2(scale, scale);
++      float2 p0 = mul2(mul2(make_float2(bq[0], bq[1]), iv2), sc2);
++      float2 p1 = mul2(mul2(make_float2(bq[2], bq[3]), iv2), sc2);
++      bq[0] = p0.x; bq[1] = p0.y; bq[2] = p1.x; bq[3] = p1.y;
++    }
++    T *po = o + ((long)t * HV + i_hv) * VD + i_v * BV;
++    static_assert(BV <= 32, "one lane per v-row");
++    constexpr int G = GRP < BV ? GRP : BV;
++#pragma unroll
++    for (int u0 = 0; u0 < BV; u0 += G) {
++      float r[G];
++#pragma unroll
++      for (int g = 0; g < G; ++g) r[g] = dot4_2d(bh[u0 + g], bq);
++#pragma unroll
++      for (int g = 0; g < G; ++g) r[g] = bfly_sum(r[g]);
++#pragma unroll
++      for (int g = 0; g < G; ++g)
++        if (lane == u0 + g) rcvt(po[u0 + g], r[g]);  // coalesced BV*2 B store
++    }
++  }
++
++  if (WRITE_STATE) {
++    ST *p = state + (long)out_slot[t] * stride_state_slot +
++            (long)i_hv * VD * KD + (long)(i_v * BV) * KD + k0;
++#pragma unroll
++    for (int u = 0; u < BV; ++u) {
++      if (sizeof(ST) == 4) {
++        float4 f;
++        f.x = bh[u][0]; f.y = bh[u][1]; f.z = bh[u][2]; f.w = bh[u][3];
++        *reinterpret_cast<float4 *>(p + (long)u * KD) = f;
++      } else {
++#pragma unroll
++        for (int j = 0; j < 4; ++j) rcvt(p[(long)u * KD + j], bh[u][j]);
++      }
++    }
++  }
++}
++
++int dtype_code(const torch::Tensor &t) {
++  if (t.scalar_type() == at::kFloat) return DT_F32;
++  if (t.scalar_type() == at::kHalf) return DT_F16;
++  if (t.scalar_type() == at::kBFloat16) return DT_BF16;
++  return -1;
++}
++
++template <typename T, typename ST, int BV, int WARPS, int GRP, bool USE_ROWS,
++          bool WRITE_OUT, bool WRITE_STATE>
++void launch_impl(const torch::Tensor &A_log, const torch::Tensor &dt_bias,
++                 const torch::Tensor &a, const torch::Tensor &b,
++                 const torch::Tensor &q, const torch::Tensor &k,
++                 const torch::Tensor &v, torch::Tensor &o,
++                 torch::Tensor &state, const torch::Tensor &chain,
++                 const torch::Tensor &depth, const torch::Tensor &out_slot,
++                 const torch::Tensor &init_slot, const torch::Tensor *rows,
++                 double scale, int64_t T_rows, int64_t MAXD, int64_t H,
++                 int64_t HV, int64_t VD) {
++  constexpr int KD = 128;
++  const int NV = (int)VD / BV;
++  const long nwarp = (long)NV * HV * T_rows;
++  const int blocks = (int)((nwarp + WARPS - 1) / WARPS);
++  auto stream = at::cuda::getCurrentCUDAStream();
++  gdn_verify_kernel<T, ST, BV, KD, WARPS, GRP, USE_ROWS, WRITE_OUT, WRITE_STATE>
++      <<<blocks, WARPS * 32, 0, stream>>>(
++          A_log.data_ptr(), dtype_code(A_log), dt_bias.data_ptr(),
++          dtype_code(dt_bias), a.data_ptr(), dtype_code(a), b.data_ptr(),
++          dtype_code(b), reinterpret_cast<const T *>(q.data_ptr()),
++          reinterpret_cast<const T *>(k.data_ptr()),
++          reinterpret_cast<const T *>(v.data_ptr()),
++          reinterpret_cast<T *>(o.data_ptr()),
++          reinterpret_cast<ST *>(state.data_ptr()), chain.data_ptr<int>(),
++          depth.data_ptr<int>(), out_slot.data_ptr<int>(),
++          init_slot.data_ptr<int>(),
++          rows ? rows->data_ptr<int>() : (const int *)nullptr, (float)scale,
++          (int)T_rows, (int)MAXD, (int)H, (int)HV, (int)VD,
++          (int)chain.stride(0), state.stride(0), 20.0f, NV);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++}  // namespace
++
++void gdn_verify(torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor a,
++                torch::Tensor b, torch::Tensor q, torch::Tensor k,
++                torch::Tensor v, torch::Tensor o, torch::Tensor state,
++                torch::Tensor chain, torch::Tensor depth,
++                torch::Tensor out_slot, torch::Tensor init_slot,
++                c10::optional<torch::Tensor> rows, double scale,
++                int64_t T_rows, int64_t MAXD, int64_t H, int64_t HV,
++                int64_t VD, int64_t bv, int64_t warps, bool write_out,
++                bool write_state) {
++  const at::cuda::OptionalCUDAGuard guard(device_of(q));
++  const torch::Tensor *rp = rows.has_value() ? &rows.value() : nullptr;
++  const bool use_rows = rp != nullptr;
++
++#define CF_LEAF(T, ST, BV, W, UR, WO, WS)                                   \
++  launch_impl<T, ST, BV, W, CF_GRP, UR, WO, WS>(A_log, dt_bias, a, b, q, k, v, o, \
++                                        state, chain, depth, out_slot,      \
++                                        init_slot, rp, scale, T_rows, MAXD, \
++                                        H, HV, VD);
++#define CF_FLAGS(T, ST, BV, W)                                    \
++  if (use_rows) {                                                 \
++    if (write_out) { CF_LEAF(T, ST, BV, W, true, true, true) }     \
++    else { CF_LEAF(T, ST, BV, W, true, false, true) }              \
++  } else {                                                        \
++    if (write_state) { CF_LEAF(T, ST, BV, W, false, true, true) }  \
++    else { CF_LEAF(T, ST, BV, W, false, true, false) }             \
++  }
++#define CF_BV(T, ST, W)                       \
++  if (bv == 8) { CF_FLAGS(T, ST, 8, W) }      \
++  else if (bv == 16) { CF_FLAGS(T, ST, 16, W) } \
++  else { CF_FLAGS(T, ST, 32, W) }
++#define CF_W(T, ST)                     \
++  if (warps == 1) { CF_BV(T, ST, 1) }   \
++  else if (warps == 2) { CF_BV(T, ST, 2) } \
++  else if (warps == 8) { CF_BV(T, ST, 8) } \
++  else { CF_BV(T, ST, 4) }
++#ifndef CF_GRP
++#define CF_GRP 1
++#endif
++
++  TORCH_CHECK(state.scalar_type() == at::kFloat ||
++                  state.scalar_type() == at::kBFloat16,
++              "gdn_verify: state must be fp32 or bf16");
++  if (q.scalar_type() == at::kHalf) {
++    if (state.scalar_type() == at::kFloat) { CF_W(__half, float) }
++    else { CF_W(__half, __nv_bfloat16) }
++  } else {
++    if (state.scalar_type() == at::kFloat) { CF_W(__nv_bfloat16, float) }
++    else { CF_W(__nv_bfloat16, __nv_bfloat16) }
++  }
++#undef CF_W
++#undef CF_BV
++#undef CF_FLAGS
++#undef CF_LEAF
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++  m.def("gdn_verify", &gdn_verify, "bit-exact CUDA tree GDN verify");
++}
+--- a/vllm/v1/spec_decode/tree_gdn_factor.cu
++++ b/vllm/v1/spec_decode/tree_gdn_factor.cu
+@@ -0,0 +1,428 @@
++// SPDX-License-Identifier: Apache-2.0
++//
++// CF_GDN_FACTOR=1 -- shared-root factorisation of the tree gated-delta-rule
++// recurrence.  One CUDA kernel per (v-block, value head, request) per GDN layer.
++// See tree_gdn_factor.py for the why and the measured numbers.
++//
++// THE ALGEBRA.  The path-parallel Triton kernel gives every tree node its own
++// program, and every program materialises the whole [V,K] recurrent state in
++// registers by replaying its root->node path from the request's INITIAL state:
++//
++//     h_0 = H                                   (the shared root state)
++//     h_i = g_i * h_{i-1} + u_i (x) k_i         (scalar decay + RANK-1 update)
++//     u_i = beta_i * (v_i - g_i * (h_{i-1} . k_i))
++//     o_t = h_n . q_t
++//
++// Because every update is rank 1, unrolling gives
++//
++//     h_n = D_n H + sum_{m<=n} w_{m,n} (u_m (x) k_m),
++//          D_n = prod_{j<=n} g_j,  w_{m,n} = prod_{j>m} g_j,  w_{n,n} = 1
++//
++// and H is THE SAME MATRIX for all 41 nodes of a request.  Contract with q:
++//
++//     o_t = D_t (H q_t) + sum_m w_{m,t} (k_m . q_t) u_m
++//
++// The catch is that u_i is NOT independent of the state -- it needs h_{i-1}.k_i.
++// But that contracts the same way:
++//
++//     h_{i-1} . k_i = D_{i-1} (H k_i) + sum_{m<i} w_{m,i-1} (k_m . k_i) u_m
++//
++// so the sequential dependency survives the factorisation intact: every step
++// needs H k_i and H q_t -- matvecs against the SHARED root -- plus dot products
++// between the tiny k/q vectors.  Nothing else ever touches H.
++//
++// TRAFFIC.  The state is [HV,V,K] fp32 = 2.00 MiB per slot.  Path-parallel reads
++// one slot per NODE and writes one per node: 41 x (2+2) MiB = 164 MiB per layer,
++// 3.84 GiB per forward, against a model whose whole fp16 weight set is 8.41 GiB.
++// Here H is read ONCE per (head, v-block) -- 2.00 MiB per layer total -- and no
++// state is written at all (CF_GDN_DEFER materialises the single accepted leaf
++// afterwards).  The rank-1 factors that replace it are ~1 KiB per node.
++//
++// WORK.  Path-parallel is O(nodes x depth) rank-1 updates on a full [128,128]
++// block.  Here it is one [BV,K] x [K,2T] GEMM against H per (head, v-block) plus
++// O(nodes x depth) dot products of length K -- roughly 40x less arithmetic.
++//
++// PRECISION.  This is a different algebraic expression, not a reassociation, so
++// it is NOT bit-exact against the Triton kernel and no amount of care would make
++// it so.  Everything is fp32 FFMA (never tf32/tensor-core) and the transcendental
++// functions are the accurate ones, which keeps the drift near the fp32 floor --
++// but drift there is, and tree_gdn_factor.py reports it honestly.
++
++#include <torch/extension.h>
++
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++#include <cstdint>
++
++namespace {
++
++// dtype codes for the scalar side-inputs (A_log, dt_bias, a, b), which are
++// small enough that a runtime branch on a per-node scalar load is free.
++constexpr int DT_F32 = 0;
++constexpr int DT_F16 = 1;
++constexpr int DT_BF16 = 2;
++
++__device__ __forceinline__ float ld_any(const void *__restrict__ p, int code,
++                                        long idx) {
++  if (code == DT_F32) return __ldg(reinterpret_cast<const float *>(p) + idx);
++  if (code == DT_F16)
++    return __half2float(__ldg(reinterpret_cast<const __half *>(p) + idx));
++  return __bfloat162float(
++      __ldg(reinterpret_cast<const __nv_bfloat16 *>(p) + idx));
++}
++
++__device__ __forceinline__ float cvt(const __half x) { return __half2float(x); }
++__device__ __forceinline__ float cvt(const __nv_bfloat16 x) {
++  return __bfloat162float(x);
++}
++__device__ __forceinline__ void rcvt(__half &d, float x) {
++  d = __float2half(x);
++}
++__device__ __forceinline__ void rcvt(__nv_bfloat16 &d, float x) {
++  d = __float2bfloat16(x);
++}
++
++// Full-warp butterfly: every lane ends with the sum.  Used for the length-K
++// dot products and the l2-norm; all 32 lanes are always live here.
++__device__ __forceinline__ float warp_sum(float x) {
++#pragma unroll
++  for (int off = 16; off; off >>= 1) x += __shfl_xor_sync(0xffffffffu, x, off);
++  return x;
++}
++
++// 16 warps, not 8.  The 83 KB of shared memory pins this kernel to ONE block per
++// SM whatever we do, so the only way to buy latency hiding is to make that block
++// wider; ptxas reports 40 registers and no spills, so 512 threads is free.
++#ifndef CF_FAC_WARPS
++#define CF_FAC_WARPS 24
++#endif
++constexpr int WARPS = CF_FAC_WARPS;
++constexpr int NTHREAD = WARPS * 32;
++
++// KD is the key/value head dim (128 on Qwen3.5); BV is the slice of the V axis
++// this block owns.  The whole recurrence is ELEMENTWISE in v -- the decays, the
++// betas and every dot product are v-independent scalars -- so slicing V costs
++// nothing but a little recomputation of those scalars.
++template <typename T, int KD, int BV>
++__global__ __launch_bounds__(NTHREAD) void gdn_factor_kernel(
++    const void *__restrict__ A_log_p, int c_alog,
++    const void *__restrict__ dtb_p, int c_dtb,
++    const void *__restrict__ a_p, int c_a,
++    const void *__restrict__ b_p, int c_b,
++    const T *__restrict__ q, const T *__restrict__ k, const T *__restrict__ v,
++    T *__restrict__ o,
++    const float *__restrict__ state,
++    const int *__restrict__ chain,      // [T_all, CW] GLOBAL row ids
++    const int *__restrict__ depth,      // [T_all]
++    const int *__restrict__ init_slot,  // [T_all]
++    const int *__restrict__ row_start,  // [S]
++    const int *__restrict__ row_count,  // [S]
++    float scale, int MAXD, int CW, int H, int HV, int VD,
++    long stride_state_slot, float threshold) {
++  extern __shared__ __align__(16) unsigned char smem_raw[];
++
++  const int iv = blockIdx.x;
++  const int ihv = blockIdx.y;
++  const int s = blockIdx.z;
++  const int ih = ihv / (HV / H);
++  const int tid = threadIdx.x;
++  const int lane = tid & 31;
++  const int warp = tid >> 5;
++
++  const int base = row_start[s];
++  const int n = row_count[s];
++  const int W = MAXD + 1;
++
++  // ---- shared partitioning (sizes computed identically on the host) --------
++  constexpr int XS = KD + 1;  // row pad: see the GEMM's bank analysis
++  float *sX = reinterpret_cast<float *>(smem_raw);       // [2n][XS]
++  float *sH = sX + (size_t)2 * n * XS;                   // [BV][KD+1]
++  float *sPQ = sH + (size_t)BV * (KD + 1);               // [2n][BV]
++  float *sU = sPQ + (size_t)2 * n * BV;                  // [n][BV]
++  float *sV = sU + (size_t)n * BV;                       // [n][BV]
++  float *sg = sV + (size_t)n * BV;                       // [n]
++  float *sbeta = sg + n;                                 // [n]
++  float *sD = sbeta + n;                                 // [n]
++  float *sW = sD + n;                                    // [n][W]
++  int *sCh = reinterpret_cast<int *>(sW + (size_t)n * W);  // [n][W]
++  int *sDep = sCh + (size_t)n * W;                       // [n]
++  int *sLev = sDep + n;                                  // [W][n]
++  int *sLevN = sLev + (size_t)W * n;                     // [W]
++
++  // ---- ancestry, level lists ---------------------------------------------
++  for (int t = tid; t < n; t += NTHREAD) {
++    sDep[t] = depth[base + t];
++    for (int j = 0; j < W; ++j) sCh[t * W + j] = chain[(base + t) * CW + j] - base;
++  }
++  if (tid < W) sLevN[tid] = 0;
++  __syncthreads();
++  if (tid == 0) {
++    for (int t = 0; t < n; ++t) {
++      int d = sDep[t];
++      sLev[d * n + sLevN[d]] = t;
++      sLevN[d] += 1;
++    }
++  }
++
++  // ---- per-node gate scalars ---------------------------------------------
++  const float A_log_val = ld_any(A_log_p, c_alog, ihv);
++  const float dtb_val = ld_any(dtb_p, c_dtb, ihv);
++  const float negA = -expf(A_log_val);
++  for (int t = tid; t < n; t += NTHREAD) {
++    float x = ld_any(a_p, c_a, (long)(base + t) * HV + ihv) + dtb_val;
++    float sp = (x <= threshold) ? logf(1.0f + expf(x)) : x;
++    sg[t] = expf(negA * sp);
++    float bb = ld_any(b_p, c_b, (long)(base + t) * HV + ihv);
++    sbeta[t] = 1.0f / (1.0f + expf(-bb));
++  }
++
++  // ---- k / q rows: l2-normalise into sX (q also picks up `scale`) ---------
++  // One warp per row; lane holds KD/32 strided elements.
++  constexpr int EPT = KD / 32;
++  for (int r = warp; r < 2 * n; r += WARPS) {
++    const bool is_q = r >= n;
++    const int t = is_q ? (r - n) : r;
++    const T *src = (is_q ? q : k) + ((long)(base + t) * H + ih) * KD;
++    float e[EPT];
++    float ss = 0.f;
++#pragma unroll
++    for (int i = 0; i < EPT; ++i) {
++      e[i] = cvt(src[lane + 32 * i]);
++      ss += e[i] * e[i];
++    }
++    ss = warp_sum(ss);
++    float inv = rsqrtf(ss + 1e-6f);
++    if (is_q) inv *= scale;
++#pragma unroll
++    for (int i = 0; i < EPT; ++i) sX[(size_t)r * XS + lane + 32 * i] = e[i] * inv;
++  }
++
++  // ---- v slice ------------------------------------------------------------
++  for (int t = warp; t < n; t += WARPS) {
++    if (lane < BV)
++      sV[(size_t)t * BV + lane] =
++          cvt(v[((long)(base + t) * HV + ihv) * VD + iv * BV + lane]);
++  }
++
++  // ---- the ONE read of the shared root state ------------------------------
++  {
++    const float *src = state + (long)init_slot[base] * stride_state_slot +
++                       (long)ihv * VD * KD + (long)(iv * BV) * KD;
++    for (int idx = tid; idx < BV * KD; idx += NTHREAD) {
++      int bv = idx / KD, c = idx - bv * KD;
++      sH[bv * (KD + 1) + c] = src[idx];  // +1 pad kills the GEMM bank conflict
++    }
++  }
++  __syncthreads();
++
++  // ---- P_t = H k_t and Q_t = H q_t : one [BV,KD] x [KD,2n] GEMM -----------
++  // REGISTER-BLOCKED 4(v) x 2(vector).  The naive one-output-per-thread form is
++  // 2 shared loads per FMA and measured 2.4x slower: this GEMM has no reuse at
++  // all unless a thread holds a tile, and the kernel is shared-load bound, not
++  // FLOP bound (88 MFLOP for the whole layer).  4x2 costs 6 loads per 8 FMAs.
++  // Banking: sH rows are padded to KD+1 and sX rows to KD+1, so the 8 distinct
++  // sH addresses and the 4 distinct sX addresses a warp issues per step all land
++  // in different banks (129 % 32 == 1); the rest is free broadcast.
++  {
++    constexpr int BVT = 4;   // v rows per thread
++    constexpr int BJT = 2;   // k/q vectors per thread
++    constexpr int NBV = BV / BVT;
++    const int bvt = tid % NBV;
++    const int jg = tid / NBV;
++    const int njt = (2 * n + BJT - 1) / BJT;
++    const int jstride = NTHREAD / NBV;
++    for (int jt = jg; jt < njt; jt += jstride) {
++      const int j0 = jt * BJT;
++      float acc[BVT][BJT];
++#pragma unroll
++      for (int u = 0; u < BVT; ++u)
++#pragma unroll
++        for (int w = 0; w < BJT; ++w) acc[u][w] = 0.f;
++      const float *hr = sH + (size_t)(bvt * BVT) * (KD + 1);
++      const float *xr = sX + (size_t)j0 * XS;
++#pragma unroll 4
++      for (int c = 0; c < KD; ++c) {
++        float xv[BJT];
++#pragma unroll
++        for (int w = 0; w < BJT; ++w)
++          xv[w] = (j0 + w < 2 * n) ? xr[(size_t)w * XS + c] : 0.f;
++#pragma unroll
++        for (int u = 0; u < BVT; ++u) {
++          const float hv = hr[(size_t)u * (KD + 1) + c];
++#pragma unroll
++          for (int w = 0; w < BJT; ++w) acc[u][w] = fmaf(hv, xv[w], acc[u][w]);
++        }
++      }
++#pragma unroll
++      for (int w = 0; w < BJT; ++w) {
++        if (j0 + w >= 2 * n) continue;
++#pragma unroll
++        for (int u = 0; u < BVT; ++u)
++          sPQ[(size_t)(j0 + w) * BV + bvt * BVT + u] = acc[u][w];
++      }
++    }
++  }
++  __syncthreads();
++
++  // ---- level-synchronous solve for the rank-1 factors u_t -----------------
++  // u_t needs h_{parent(t)} . k_t, which needs every SHALLOWER u on the path --
++  // that is the sequential dependency, and it is why this loop exists.  What
++  // the factorisation buys is that each step is O(depth) scalars plus one
++  // already-computed matvec, instead of a full [V,K] state update.
++  for (int d = 0; d <= MAXD; ++d) {
++    const int nl = sLevN[d];
++    for (int idx = warp; idx < nl; idx += WARPS) {
++      const int t = sLev[d * n + idx];
++      const int par = sCh[t * W + 1];
++      const float Dpar = (d > 0) ? sD[par] : 1.0f;
++      float S = Dpar * ((lane < BV) ? sPQ[(size_t)t * BV + lane] : 0.f);
++      for (int j = 1; j <= d; ++j) {
++        const int m = sCh[t * W + j];
++        // C = k_m . k_t
++        float c = 0.f;
++#pragma unroll
++        for (int i = 0; i < EPT; ++i)
++          c += sX[(size_t)m * XS + lane + 32 * i] *
++               sX[(size_t)t * XS + lane + 32 * i];
++        c = warp_sum(c);
++        const float wmp = sW[(size_t)par * W + (j - 1)];
++        if (lane < BV) S = fmaf(wmp * c, sU[(size_t)m * BV + lane], S);
++      }
++      const float g = sg[t];
++      if (lane < BV)
++        sU[(size_t)t * BV + lane] = sbeta[t] * (sV[(size_t)t * BV + lane] - g * S);
++      if (lane == 0) {
++        sD[t] = (d > 0 ? sD[par] : 1.0f) * g;
++        sW[(size_t)t * W + 0] = 1.0f;
++        for (int j = 1; j <= d; ++j)
++          sW[(size_t)t * W + j] = sW[(size_t)par * W + (j - 1)] * g;
++      }
++    }
++    __syncthreads();
++  }
++
++  // ---- contract with q ----------------------------------------------------
++  for (int t = warp; t < n; t += WARPS) {
++    const int d = sDep[t];
++    float acc = sD[t] * ((lane < BV) ? sPQ[(size_t)(n + t) * BV + lane] : 0.f);
++    for (int j = 0; j <= d; ++j) {
++      const int m = sCh[t * W + j];
++      float r = 0.f;
++#pragma unroll
++      for (int i = 0; i < EPT; ++i)
++        r += sX[(size_t)m * XS + lane + 32 * i] *
++             sX[(size_t)(n + t) * XS + lane + 32 * i];
++      r = warp_sum(r);
++      const float wj = sW[(size_t)t * W + j];
++      if (lane < BV) acc = fmaf(wj * r, sU[(size_t)m * BV + lane], acc);
++    }
++    if (lane < BV)
++      rcvt(o[((long)(base + t) * HV + ihv) * VD + iv * BV + lane], acc);
++  }
++}
++
++int dtype_code(const torch::Tensor &t) {
++  if (t.scalar_type() == at::kFloat) return DT_F32;
++  if (t.scalar_type() == at::kHalf) return DT_F16;
++  if (t.scalar_type() == at::kBFloat16) return DT_BF16;
++  return -1;
++}
++
++size_t smem_bytes(int n, int KD, int BV, int W) {
++  size_t f = (size_t)2 * n * (KD + 1)    // sX (row-padded)
++             + (size_t)BV * (KD + 1)     // sH
++             + (size_t)2 * n * BV        // sPQ
++             + (size_t)n * BV            // sU
++             + (size_t)n * BV            // sV
++             + 3 * (size_t)n             // sg, sbeta, sD
++             + (size_t)n * W;            // sW
++  size_t i = (size_t)n * W               // sCh
++             + (size_t)n                 // sDep
++             + (size_t)W * n             // sLev
++             + (size_t)W;                // sLevN
++  return (f + i) * sizeof(float);
++}
++
++template <typename T, int KD, int BV>
++void launch(torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor a,
++            torch::Tensor b, torch::Tensor q, torch::Tensor k, torch::Tensor v,
++            torch::Tensor o, torch::Tensor state, torch::Tensor chain,
++            torch::Tensor depth, torch::Tensor init_slot,
++            torch::Tensor row_start, torch::Tensor row_count, double scale,
++            int64_t maxd, int64_t n_max, int64_t H, int64_t HV, int64_t VD) {
++  const int S = row_start.numel();
++  const int CW = chain.size(1);
++  const int W = (int)maxd + 1;
++  const size_t sm = smem_bytes((int)n_max, KD, BV, W);
++  auto kern = gdn_factor_kernel<T, KD, BV>;
++  // 83 KB at the shipping shape -- past the 48 KB default, so the opt-in has to
++  // be granted before the first launch.  Ask for exactly what this shape needs.
++  static size_t attr_set = 0;
++  if (attr_set < sm) {
++    int dev = 0;
++    C10_CUDA_CHECK(cudaGetDevice(&dev));
++    int cap = 0;
++    C10_CUDA_CHECK(cudaDeviceGetAttribute(
++        &cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
++    TORCH_CHECK((size_t)cap >= sm, "gdn_factor needs ", sm,
++                " B of shared memory, device allows ", cap);
++    C10_CUDA_CHECK(cudaFuncSetAttribute(
++        kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm));
++    attr_set = sm;
++  }
++  dim3 grid(VD / BV, HV, S);
++  auto stream = at::cuda::getCurrentCUDAStream();
++  kern<<<grid, NTHREAD, sm, stream>>>(
++      A_log.data_ptr(), dtype_code(A_log), dt_bias.data_ptr(),
++      dtype_code(dt_bias), a.data_ptr(), dtype_code(a), b.data_ptr(),
++      dtype_code(b), reinterpret_cast<const T *>(q.data_ptr()),
++      reinterpret_cast<const T *>(k.data_ptr()),
++      reinterpret_cast<const T *>(v.data_ptr()),
++      reinterpret_cast<T *>(o.data_ptr()), state.data_ptr<float>(),
++      chain.data_ptr<int>(), depth.data_ptr<int>(), init_slot.data_ptr<int>(),
++      row_start.data_ptr<int>(), row_count.data_ptr<int>(), (float)scale,
++      (int)maxd, CW, (int)H, (int)HV, (int)VD, state.stride(0), 20.0f);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++}  // namespace
++
++void gdn_factor(torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor a,
++                torch::Tensor b, torch::Tensor q, torch::Tensor k,
++                torch::Tensor v, torch::Tensor o, torch::Tensor state,
++                torch::Tensor chain, torch::Tensor depth,
++                torch::Tensor init_slot, torch::Tensor row_start,
++                torch::Tensor row_count, double scale, int64_t maxd,
++                int64_t n_max, int64_t H, int64_t HV, int64_t VD, int64_t bv) {
++  const at::cuda::OptionalCUDAGuard guard(device_of(q));
++  TORCH_CHECK(q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16,
++              "gdn_factor: q/k/v/o must be fp16 or bf16");
++#define CF_DISPATCH(T)                                                       \
++  if (bv == 32) {                                                            \
++    launch<T, 128, 32>(A_log, dt_bias, a, b, q, k, v, o, state, chain, depth, \
++                       init_slot, row_start, row_count, scale, maxd, n_max,  \
++                       H, HV, VD);                                           \
++  } else {                                                                   \
++    launch<T, 128, 16>(A_log, dt_bias, a, b, q, k, v, o, state, chain, depth, \
++                       init_slot, row_start, row_count, scale, maxd, n_max,  \
++                       H, HV, VD);                                           \
++  }
++  if (q.scalar_type() == at::kHalf) {
++    CF_DISPATCH(__half)
++  } else {
++    CF_DISPATCH(__nv_bfloat16)
++  }
++#undef CF_DISPATCH
++}
++
++int64_t gdn_factor_smem(int64_t n, int64_t bv, int64_t maxd) {
++  return (int64_t)smem_bytes((int)n, 128, (int)bv, (int)maxd + 1);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++  m.def("gdn_factor", &gdn_factor, "shared-root factorised tree GDN");
++  m.def("gdn_factor_smem", &gdn_factor_smem, "shared bytes for a shape");
++}
+--- a/vllm/v1/spec_decode/tree_attn_fused.cu
++++ b/vllm/v1/spec_decode/tree_attn_fused.cu
+@@ -0,0 +1,443 @@
++// SPDX-License-Identifier: Apache-2.0
++//
++// CF_TREE_FUSED_ATTN=1 -- hand-written CUDA kernel for the tree-attention
++// fix-up's suffix half + the log-sum-exp merge with the paged-prefix result.
++// ONE launch per full-attention layer.  See tree_attn_fused.py for the why.
++//
++// SHAPE OF THE WORK (4B shipping tree: S=1, N=41, H=16, HKV=4, D=256):
++//   per (request s, head h, tree node m) we need
++//       scores[n] = scale * dot(q[m], k[n])            for n an ANCESTOR of m
++//       out[d]    = sum_n softmax(scores)[n] * v[n][d]
++//   then a log-sum-exp merge with prefix_out/prefix_lse and a bf16 write-back.
++//
++// WHY THIS BEATS THE DENSE FORM.  The ancestor mask makes row m attend to
++// exactly depth(m)+1 <= 6 of the 41 columns, so the dense N x N score matrix is
++// ~90% -inf.  A tile-based GEMM (Triton's tl.dot, or the eager einsum) computes
++// all 1681 dots and throws 1520 of them away.  Skipping the masked columns is
++// EXACTLY equivalent, not an approximation: a masked score is -inf, exp() of it
++// is +0.0, +0.0 contributes nothing to the fp32 denominator sum and 0*v adds
++// nothing to the fp32 accumulator -- both are exact in IEEE.  So the sparse form
++// computes the same numbers from 161 dots instead of 1681.
++//
++// MAPPING.  One WARP per (s, h, m).  For the softmax, P.V, prefix load and
++// write-back, lane l owns head-dim slice d = l*VPT .. l*VPT+VPT-1, so every
++// access is a single fully-coalesced 128-bit (VPT=8, D=256) transaction and the
++// P.V accumulation needs NO cross-lane reduction at all.  The q.k^T dot uses a
++// different, deliberately worse mapping -- one lane per ancestor column -- for
++// bit-exactness; see the comment on that loop.
++//
++// PRECISION -- NON-NEGOTIABLE, AND THE REASON THIS KERNEL IS SHAPED THE WAY IT
++// IS.  The whole thing is bit-exact against the eager chain (verified: 0
++// differing elements over 240 real steps and a full in-situ 7-domain sweep).
++// Every one of these was measured; each, when wrong, moved ~1 ulp on ~0.01% of
++// elements and flipped generated tokens:
++//   * q.k^T is fp32 FFMA, never a tensor-core fp16/tf32 dot, and the chain is
++//     STRICTLY SEQUENTIAL over the head dim (what cuBLAS SGEMM does here).
++//   * the softmax exp/log are the ACCURATE expf/logf (torch.exp/torch.log) and
++//     the probability divide is div.rn (torch.div).
++//   * the denominator reproduces ATen's sum(dim=-1) reduction tree.
++//   * the merge reproduces vLLM's CUSTOM CUDA merge_attn_states op, not the
++//     Triton one -- they differ (Triton: ex2.approx + div.full + a fused f32x2
++//     combine; CUDA op: expf + IEEE div + fma(p_out, p_scale, s_out*s_scale)).
++//   * the P.V result is rounded to the output dtype and back BEFORE the merge,
++//     exactly as the eager path does when it hands merge_attn_states a suffix
++//     already cast to `output.dtype`.
++
++#include <torch/extension.h>
++
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++#include <cstdint>
++
++namespace {
++
++template <int BYTES> struct VecB;
++template <> struct VecB<4> { using type = uint32_t; };
++template <> struct VecB<8> { using type = uint2; };
++template <> struct VecB<16> { using type = uint4; };
++
++__device__ __forceinline__ float cvt(const __nv_bfloat16 x) {
++  return __bfloat162float(x);
++}
++__device__ __forceinline__ float cvt(const __half x) { return __half2float(x); }
++__device__ __forceinline__ void rcvt(__nv_bfloat16 &d, float x) {
++  d = __float2bfloat16(x);  // cvt.rn -- same rounding as Tensor.to(bfloat16)
++}
++__device__ __forceinline__ void rcvt(__half &d, float x) {
++  d = __float2half(x);
++}
++
++// One 4/8/16-byte transaction per lane.
++template <typename T, int VPT>
++__device__ __forceinline__ void ldv(const T *__restrict__ p, float (&o)[VPT]) {
++  using VT = typename VecB<VPT * (int)sizeof(T)>::type;
++  VT raw = *reinterpret_cast<const VT *>(p);
++  const T *t = reinterpret_cast<const T *>(&raw);
++#pragma unroll
++  for (int i = 0; i < VPT; ++i) o[i] = cvt(t[i]);
++}
++
++// Raw (unwidened) vector load, plus a separate widen.  Splitting the two lets
++// the q.k^T loop hold a whole CHUNK of a row in registers as PACKED 16-bit
++// data -- half the registers the widened form needs -- so many more loads are
++// in flight before the first one is consumed.  See the CH comment in the dot.
++template <typename T, int VPT>
++__device__ __forceinline__ typename VecB<VPT * (int)sizeof(T)>::type
++ldraw(const T *__restrict__ p) {
++  using VT = typename VecB<VPT * (int)sizeof(T)>::type;
++  return *reinterpret_cast<const VT *>(p);
++}
++
++template <typename T, int VPT, typename VT>
++__device__ __forceinline__ void widen(const VT &raw, float (&o)[VPT]) {
++  const T *t = reinterpret_cast<const T *>(&raw);
++#pragma unroll
++  for (int i = 0; i < VPT; ++i) o[i] = cvt(t[i]);
++}
++
++template <typename T, int VPT>
++__device__ __forceinline__ void stv(T *__restrict__ p, const float (&in)[VPT]) {
++  using VT = typename VecB<VPT * (int)sizeof(T)>::type;
++  VT raw;
++  T *t = reinterpret_cast<T *>(&raw);
++#pragma unroll
++  for (int i = 0; i < VPT; ++i) rcvt(t[i], in[i]);
++  *reinterpret_cast<VT *>(p) = raw;
++}
++
++// ATen's block-width-32 reduction tree: p[t] += p[t + off] for off = 16..1.
++// (`__shfl_down_sync` past lane 31 returns the lane's own value; only lane 0's
++// result is used, and every lane it reads from is live.)
++__device__ __forceinline__ float aten_warp_sum(float x) {
++#pragma unroll
++  for (int off = 16; off; off >>= 1) x = x + __shfl_down_sync(0xffffffffu, x, off);
++  return __shfl_sync(0xffffffffu, x, 0);
++}
++
++__device__ __forceinline__ float warp_max(float x) {
++#pragma unroll
++  for (int off = 16; off; off >>= 1)
++    x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, off));
++  return x;
++}
++
++// GK: how many ancestor columns are held in registers at once.  This kernel is
++// LATENCY-bound, not throughput-bound: the whole layer is 13.8 MFLOP but the
++// grid is 656 warps, so ncu measures ~1 active warp per scheduler and 12.4
++// stall cycles per issued instruction -- nothing hides a memory round trip but
++// instruction-level parallelism inside the single resident warp.  So every
++// dependent global access is a first-class cost, and GK=8 is chosen to cover a
++// depth-5 tree's whole ancestor chain (<= 6 rows) in ONE round trip.  Rows with
++// more ancestors than GK take the generic (slower, re-loading) path.
++constexpr int MAXW = 4;  // ancestor bitmask words -> N <= 128
++
++template <typename T, int VPT, int WARPS, int GK>
++__global__ __launch_bounds__(WARPS * 32) void tree_suffix_merge_kernel(
++    const T *__restrict__ q,      // [T, H, D]
++    const T *__restrict__ k,      // [T, HKV, D]
++    const T *__restrict__ v,      // [T, HKV, D]
++    T *__restrict__ o,            // [T, H, D]  written in place at tree rows
++    const T *__restrict__ po,     // [M, H, D]  paged-prefix partial output
++    const float *__restrict__ plse,   // [H, M]  prefix log-sum-exp
++    const int64_t *__restrict__ idx,  // [S, N]  query row of node j of req s
++    const uint8_t *__restrict__ nanc, // [S, N, N] 1 == MASKED OUT
++    const float scale, const int64_t sq_t, const int64_t sq_h,
++    const int64_t sk_t, const int64_t sk_h, const int64_t sv_t,
++    const int64_t sv_h, const int64_t so_t, const int64_t so_h,
++    const int64_t spo_t, const int64_t spo_h, const int N, const int H,
++    const int M, const int kv_rep) {
++  extern __shared__ char smem_raw[];
++  int64_t *s_idx = reinterpret_cast<int64_t *>(smem_raw);       // [N]
++  int *s_col = reinterpret_cast<int *>(s_idx + N);              // [WARPS, N]
++  float *s_sc = reinterpret_cast<float *>(s_col + WARPS * N);   // [WARPS, N]
++
++  constexpr int DFULL = VPT * 32;  // head_size
++  const int s = blockIdx.y;
++  const int tid = threadIdx.x;
++  const int lane = tid & 31;
++  const int warp = tid >> 5;
++  const int task = blockIdx.x * WARPS + warp;  // over H * N
++  const int h = task / N;
++  const int m = task - h * N;
++  const int kh = h / kv_rep;
++  const int64_t mrow = (int64_t)s * N + m;
++  const bool live = task < H * N;
++
++  // --- issue EVERYTHING that does not depend on another load, first --------
++  // With one resident warp per scheduler there is no other warp to cover a
++  // miss, so the only latency hiding available is having several loads in
++  // flight at once.  The node -> query-row table (a dependency of every q/k/v
++  // address), the ancestor-mask row and the prefix half are all independent, so
++  // they all go out before the first of them is touched.
++  // rounds of the cooperative idx load needed to cover N <= 32*MAXW
++  constexpr int IR = (MAXW + WARPS - 1) / WARPS;
++  int64_t ivl[IR];
++#pragma unroll
++  for (int r = 0; r < IR; ++r) {
++    const int i = r * (WARPS * 32) + tid;
++    ivl[r] = (i < N) ? idx[(int64_t)s * N + i] : 0;
++  }
++  uint8_t mv[MAXW];
++  const uint8_t *mrowp = nanc + (live ? mrow : 0) * N;
++#pragma unroll
++  for (int w = 0; w < MAXW; ++w) {
++    const int n = w * 32 + lane;
++    mv[w] = (live && n < N) ? mrowp[n] : 1;
++  }
++  float pr[VPT];
++  float p_lse_raw = 0.f;
++  if (live) {
++    ldv<T, VPT>(po + mrow * spo_t + h * spo_h + lane * VPT, pr);
++    p_lse_raw = plse[(int64_t)h * M + mrow];
++  }
++#pragma unroll
++  for (int r = 0; r < IR; ++r) {
++    const int i = r * (WARPS * 32) + tid;
++    if (i < N) s_idx[i] = ivl[r];
++  }
++  __syncthreads();
++  if (!live) return;
++
++  const int64_t rq = s_idx[m];
++  const T *qrow = q + rq * sq_t + h * sq_h;
++
++  // --- compact the ancestor columns (branch-free ballot scan) --------------
++  int *col = s_col + warp * N;
++  float *sc = s_sc + warp * N;
++  const unsigned lt = (lane == 0) ? 0u : (0xffffffffu >> (32 - lane));
++  int c = 0;
++#pragma unroll
++  for (int w = 0; w < MAXW; ++w) {
++    const bool ok = (mv[w] == 0);
++    const unsigned b = __ballot_sync(0xffffffffu, ok);
++    if (ok) col[c + __popc(b & lt)] = w * 32 + lane;
++    c += __popc(b);
++  }
++  __syncwarp();
++
++  float smax = -INFINITY;
++  float den = 0.f;
++  float acc[VPT];
++#pragma unroll
++  for (int d = 0; d < VPT; ++d) acc[d] = 0.f;
++
++  // --- the q.k^T dots: ONE LANE PER ANCESTOR COLUMN ------------------------
++  // This looks wasteful (only c ~ 4 of 32 lanes do work) and it is -- a
++  // warp-parallel dot with a butterfly reduction is ~3x cheaper.  It is not
++  // negotiable.  The reference is cuBLAS SGEMM and, measured on the exact eager
++  // shape (bmm batch=S*H, M=N=nodes, K=head_size=256), cuBLAS accumulates
++  // STRICTLY SEQUENTIALLY over k with one FFMA chain: a per-lane-partial +
++  // cross-lane tree gives a different rounding on ~1 element in 10^4, which is
++  // enough to flip generated tokens (2 of the 7 benchmark domains diverged from
++  // the flag-OFF run).  Every other chunking was checked -- 2/4/8/32 chunks,
++  // tree and linear combines -- and only the strictly sequential chain
++  // reproduces cuBLAS bit for bit here.  The cost is real but small: this
++  // kernel is latency-, not issue-bound, and there are S*H*N warps in flight.
++  for (int j0 = 0; j0 < c; j0 += 32) {
++    const int j = j0 + lane;
++    const bool act = j < c;
++    float t = 0.f;
++    if (act) {
++      const T *krow = k + s_idx[col[j]] * sk_t + kh * sk_h;
++      // CH row-vectors of q AND of k are fetched before any of them is used.
++      // The FFMA order over the head dim is UNCHANGED (d0 ascending, then d
++      // ascending inside a vector), so this is bit-identical to fetching one
++      // vector at a time; the only thing it changes is how many loads are in
++      // flight.  That is the whole ballgame for this kernel: the grid is
++      // H*N warps against 188 SMs x 4 schedulers, so ncu measures ~1 warp per
++      // scheduler (0.32 waves/SM) and there is NOTHING ELSE RESIDENT to cover
++      // a miss -- the dominant stall is long_scoreboard at 3.8 cycles per
++      // issued instruction.  One vector at a time meant ~16 serialised L2
++      // round trips per dot; CH=16 makes it 2.  Measured on the 27B shipping
++      // shape: 6.97 -> 5.74 us/layer (4B/9B: 6.37 -> 5.32).
++      // CH must divide NV and costs CH * VPT/2 registers per row (128 for
++      // D=256).  It is INTERLOCKED WITH GK because they compete for the same
++      // budget: GK=4 runs the P.V loop twice, which keeps more live across the
++      // dot, and CH=16 there made bf16/D=256 spill 12 bytes.  Nothing is worth
++      // a spill in this kernel -- ptxas reports 0 spill bytes, 0 stack frame
++      // for all 48 instantiations with this pairing.  (GK=4 is a tunable only;
++      // GK=8 is the default and is faster at every shape measured.)
++      using VT = typename VecB<VPT * (int)sizeof(T)>::type;
++      constexpr int NV = DFULL / VPT;  // 32 for every supported D (VPT = D/32)
++      constexpr int CHB = (GK >= 8) ? 256 : 128;  // BYTES of each row per chunk
++      constexpr int CHR = CHB / (VPT * (int)sizeof(T));
++      constexpr int CH = CHR > NV ? NV : (CHR < 1 ? 1 : CHR);
++#pragma unroll
++      for (int c0 = 0; c0 < NV; c0 += CH) {
++        VT qr[CH], kr[CH];
++#pragma unroll
++        for (int i = 0; i < CH; ++i) qr[i] = ldraw<T, VPT>(qrow + (c0 + i) * VPT);
++#pragma unroll
++        for (int i = 0; i < CH; ++i) kr[i] = ldraw<T, VPT>(krow + (c0 + i) * VPT);
++#pragma unroll
++        for (int i = 0; i < CH; ++i) {
++          float qq[VPT], kk[VPT];
++          widen<T, VPT>(qr[i], qq);
++          widen<T, VPT>(kr[i], kk);
++#pragma unroll
++          for (int d = 0; d < VPT; ++d) t = fmaf(qq[d], kk[d], t);
++        }
++      }
++      t *= scale;
++    }
++    smax = fmaxf(smax, warp_max(act ? t : -INFINITY));  // max: order-free
++    if (act) sc[col[j]] = t;  // indexed BY COLUMN -- see the denominator below
++  }
++  __syncwarp();
++
++  // --- the denominator ----------------------------------------------------
++  // The reference is `exp.sum(dim=-1)`, an ATen TensorIterator reduction, NOT a
++  // left-to-right sum: for a contiguous trailing dim it picks block_width 32,
++  // so lane t accumulates columns t, t+32, ... sequentially and the 32 lane
++  // partials are folded by a shfl-down tree with offsets 16,8,4,2,1.  A plain
++  // sequential sum disagrees with it on 12% of rows by 1 ulp -- small, but the
++  // denominator scales EVERY probability, and it was enough to flip a token.
++  // Every other candidate order was checked against 20 steps of real activation
++  // data (block widths 8/16/32/64 x both tree directions); only this one is
++  // exact.  Lane l already owns exactly columns l, l+32, ... via its mask word,
++  // so the mapping costs nothing.  Masked columns contribute exp(-inf) = +0.0,
++  // which is exact, so skipping them does not change the sum.
++  {
++    float pl = 0.f;
++#pragma unroll
++    for (int w = 0; w < MAXW; ++w) {
++      const int n = w * 32 + lane;
++      if (n < N && mv[w] == 0) pl += expf(sc[n] - smax);
++    }
++    den = aten_warp_sum(pl);
++  }
++
++  // --- P.V ----------------------------------------------------------------
++  for (int j0 = 0; j0 < c; j0 += GK) {
++    int nn[GK];
++    float vr[GK][VPT];
++#pragma unroll
++    for (int i = 0; i < GK; ++i) nn[i] = (j0 + i < c) ? col[j0 + i] : -1;
++#pragma unroll
++    for (int i = 0; i < GK; ++i)
++      if (nn[i] >= 0)
++        ldv<T, VPT>(v + s_idx[nn[i]] * sv_t + kh * sv_h + lane * VPT, vr[i]);
++#pragma unroll
++    for (int i = 0; i < GK; ++i) {
++      if (nn[i] < 0) continue;
++      const float pj = expf(sc[nn[i]] - smax) / den;  // div.rn, as the reference
++#pragma unroll
++      for (int d = 0; d < VPT; ++d) acc[d] = fmaf(pj, vr[i][d], acc[d]);
++    }
++  }
++  const float s_lse_raw = smax + logf(den);
++
++  // --- log-sum-exp merge --------------------------------------------------
++  // NOTE: the reference is vllm/v1/attention/ops/merge_attn_states.py, which on
++  // CUDA with a %8 head size dispatches to the CUSTOM CUDA OP, *not* to
++  // triton_merge_attn_states.py.  That distinction is not cosmetic: the Triton
++  // kernel emits ex2.approx + div.full + a fused f32x2 combine, the CUDA op
++  // uses the accurate expf, IEEE division and `fma(p_out, p_scale, s_out *
++  // s_scale)`.  All twelve combinations were checked against the real op; only
++  // this one is bit-exact, and emulating the Triton one instead put ~1 ulp on
++  // 0.01% of merged elements, which flipped generated tokens.
++  const float p_lse = (p_lse_raw == INFINITY) ? -INFINITY : p_lse_raw;
++  const float s_lse = (s_lse_raw == INFINITY) ? -INFINITY : s_lse_raw;
++  const float mx = fmaxf(p_lse, s_lse);
++  const float p_se = expf(p_lse - mx);
++  const float s_se = expf(s_lse - mx);
++  const float out_se = p_se + s_se;
++  const float p_scale = p_se / out_se;
++  const float s_scale = s_se / out_se;
++
++  float ov[VPT];
++#pragma unroll
++  for (int d = 0; d < VPT; ++d) {
++    // the eager path hands merge_attn_states a suffix already rounded to the
++    // output dtype -- round-trip so the merge sees the same bits
++    T rounded;
++    rcvt(rounded, acc[d]);
++    const float so = cvt(rounded);
++    ov[d] = fmaf(pr[d], p_scale, __fmul_rn(so, s_scale));
++  }
++  stv<T, VPT>(o + rq * so_t + h * so_h + lane * VPT, ov);
++}
++
++#define LAUNCH(T, VPT, WARPS, GK)                                         \
++  do {                                                                         \
++    const int nwarp = (WARPS);                                                 \
++    const size_t smem = (size_t)N * sizeof(int64_t) +                          \
++                        (size_t)nwarp * N * (sizeof(int) + sizeof(float));     \
++    dim3 grid((H * N + nwarp - 1) / nwarp, S);                                 \
++    tree_suffix_merge_kernel<T, VPT, WARPS, GK>                                \
++        <<<grid, nwarp * 32, smem, st>>>(                                      \
++        reinterpret_cast<const T *>(query.data_ptr()),                         \
++        reinterpret_cast<const T *>(key.data_ptr()),                           \
++        reinterpret_cast<const T *>(value.data_ptr()),                         \
++        reinterpret_cast<T *>(output.data_ptr()),                              \
++        reinterpret_cast<const T *>(prefix_out.data_ptr()),                    \
++        prefix_lse.data_ptr<float>(), idx_pad.data_ptr<int64_t>(),             \
++        reinterpret_cast<const uint8_t *>(not_anc.data_ptr()), scale,          \
++        query.stride(0), query.stride(1), key.stride(0), key.stride(1),        \
++        value.stride(0), value.stride(1), output.stride(0), output.stride(1),  \
++        prefix_out.stride(0), prefix_out.stride(1), N, H, S *N, H / HKV);      \
++  } while (0)
++
++#define DISPATCH_GK(T, VPT, WARPS)                                             \
++  do {                                                                         \
++    if (gk == 4) {                                                             \
++      LAUNCH(T, VPT, WARPS, 4);                                                \
++    } else {                                                                   \
++      LAUNCH(T, VPT, WARPS, 8);                                                \
++    }                                                                          \
++  } while (0)
++
++#define DISPATCH_VPT(T, WARPS)                                                 \
++  do {                                                                         \
++    if (D == 256) {                                                            \
++      DISPATCH_GK(T, 8, WARPS);                                                \
++    } else if (D == 128) {                                                     \
++      DISPATCH_GK(T, 4, WARPS);                                                \
++    } else {                                                                   \
++      DISPATCH_GK(T, 2, WARPS);                                                \
++    }                                                                          \
++  } while (0)
++
++#define DISPATCH_WARPS(T)                                                      \
++  do {                                                                         \
++    if (warps == 8) {                                                          \
++      DISPATCH_VPT(T, 8);                                                      \
++    } else if (warps == 2) {                                                   \
++      DISPATCH_VPT(T, 2);                                                      \
++    } else if (warps == 1) {                                                   \
++      DISPATCH_VPT(T, 1);                                                      \
++    } else {                                                                   \
++      DISPATCH_VPT(T, 4);                                                      \
++    }                                                                          \
++  } while (0)
++
++}  // namespace
++
++void suffix_merge(torch::Tensor query, torch::Tensor key, torch::Tensor value,
++                  torch::Tensor output, torch::Tensor prefix_out,
++                  torch::Tensor prefix_lse, torch::Tensor idx_pad,
++                  torch::Tensor not_anc, double scale_d, int64_t S_, int64_t N_,
++                  int64_t warps_, int64_t gk_) {
++  const int S = (int)S_, N = (int)N_, warps = (int)warps_;
++  const int gk = (int)gk_;
++  const int H = (int)query.size(1), D = (int)query.size(2);
++  const int HKV = (int)key.size(1);
++  const float scale = (float)scale_d;
++  // N <= 32*MAXW: the ancestor bitmask is MAXW ballot words and the cooperative
++  // idx load is MAXW rounds of blockDim (which is >= 32).
++  TORCH_CHECK(N <= 32 * MAXW, "tree too large for kernel");
++  const c10::cuda::CUDAGuard guard(query.device());
++  cudaStream_t st = at::cuda::getCurrentCUDAStream();
++  if (query.scalar_type() == at::kBFloat16) {
++    DISPATCH_WARPS(__nv_bfloat16);
++  } else {
++    DISPATCH_WARPS(__half);
++  }
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, mod) {
++  mod.def("suffix_merge", &suffix_merge, "tree suffix attention + lse merge");
++}
