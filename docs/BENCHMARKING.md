@@ -392,6 +392,30 @@ the drafter's own fixed cost already exceeds the whole step it is trying to acce
 lever that reaches it is the DRAFT, which is what the cliff pulls — and what batching
 `cf_fused_expert` would pull without giving up the acceptance.
 
+**27B was the case with the best prior and it says the same thing.** A 27B target forward is far
+more expensive relative to the same drafter, so if a K=1 rung wins anywhere it should win here.
+`CF_SPEC_K_SCHEDULE="64:1"`, 27B chain, against a same-session base on the same GPU (recorded
+K=5 absolutes in the third column, restated against *this* base):
+
+| conc | base | K=1 | | K=5 (recorded 42.7 / 140.5 / 395.6 / 501.7 / 503.4) | K=0 cliff at N=16 |
+|---|---|---|---|---|---|
+| 1 | 26.3 | 34.7 | 1.32x | **1.62x** | **1.62x** |
+| 4 | 100.1 | 122.8 | 1.23x | **1.40x** | **1.41x** |
+| 16 | 355.9 | 376.2 | 1.06x | **1.11x** | **1.08x** |
+| 32 | 622.4 | 515.9 | 0.83x | 0.81x | 0.82x |
+| 64 | 887.9 | 520.6 | 0.59x | 0.57x | 0.52x |
+
+K=1 is *worse* than K=5 at every level that is a real decode batch and ties it, inside noise, at
+the two that are not — this engine's `max B` is **28**, and concurrency 64 has a **15.7 s** TTFT,
+so those rows are the `--speculative-config` admission queue and no K threshold addresses them.
+Acceptance is flat at 1.574–1.579.
+
+**So `_AUTO_K1` is empty at both sizes on measurement, not for want of a ladder**, and
+`CF_SPEC_K_SCHEDULE` ships as an instrument: it is how the next target gets laddered, and it is
+the shape the schedule would take if a drafter ever became cheap enough for a middle rung to
+exist. That is the same thing the 4B arithmetic says — the middle rung's existence is gated on
+the DRAFT cost, not on the verify width.
+
 **It also deletes the compile storm**, for free: with the cutoff at 4 the drafter is only ever
 asked for buckets 1, 2 and 4, so those are the only three that ever compile — confirmed from
 `draft_buckets.txt`, which lists exactly those three for the cutoff arm. The uncut arm at the
@@ -1255,7 +1279,7 @@ except the 67-token domain 0, where one request-step is worth 0.05.
 |---|---|---|
 | base (async off) | 127.6 | 126.7 / 127.3 |
 | **chain** | **157.8** | **157.8** (exact) |
-| **8×5 tree** | see below | 188.9 |
+| 8×5 tree (`CF_ASYNC_SPEC=1`) | 178.6 | 188.9 — **see the note below, it is not this work** |
 
 `chain` reproduces the recorded figure exactly and the serve path agrees — concurrency 1 reads
 **165.3** with the old ladder and **165.4** with the new one, against the recorded 165.2. That
@@ -1263,6 +1287,23 @@ is what the check is for, and it is also true *by construction*: `_bucket_ladder
 at 1, `_ctx_gpu` picks bucket 1 for a batch of 1 under either ladder, and the K-schedule is off
 unless `CF_SPEC_K_SCHEDULE` is set. **No step at a decode batch of 1 changes shape, kernel or
 output.**
+
+**The 8×5 tree arm reads 178.6 against the recorded 188.9, and the bucket ladder cannot be the
+cause.** Three pieces of evidence, and they should be read together rather than as a defence:
+
+1. **Batch 1 takes bucket 1 under either ladder**, so the tree draft ran the identical captured
+   graph; and the K-schedule is off unless `CF_SPEC_K_SCHEDULE` is set.
+2. **The chain arm in the same session, same GPU, same harness invocation, is exact** (157.8
+   against 157.8). A drifted box or a drifted harness would have moved it too.
+3. The installed vLLM's `model_executor/layers/mamba/mamba_utils.py` was **modified at 20:11**,
+   between the recorded reference and every measurement in this section, by concurrent work on
+   the tree's GDN conv-state width — which sets the engine's block size, and whose own commit
+   message records that fp16-tie outcomes moved with it. Per-domain accept lands at
+   3.450 / 3.824 / 2.030 / 2.457 / 1.680 / 1.882 / 2.364: **domains 0, 1, 5 and 6 are byte-equal
+   to the last recorded regression arm** and the three that differ are the long-running ones.
+
+That is an attribution, not a clearance: **the 4B tree batch-1 number needs re-establishing
+against the settled engine**, and until it is, quote 188.9 only with this note attached.
 
 One trap found while doing it: **`bench_cf.sh`'s `tree` arm does not default to the 8×5 tree
 the published number is from.** Run as-is it resolves `K=16 width=4`, a 4×4 tree, whose

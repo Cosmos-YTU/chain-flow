@@ -180,6 +180,18 @@ It cannot be enough, because THE DRAFT ALONE IS 19.4 ms AND THE WHOLE NO-SPECULA
 14.1 ms.  No verify-width lever reaches parity while the drafter's fixed cost exceeds the entire
 step it is accelerating; only cutting the DRAFT does, which is what the cliff does.
 
+27B SAYS THE SAME THING, AND IT WAS THE CASE WITH THE BEST PRIOR (a 27B target forward is much
+more expensive relative to the same drafter):
+
+    conc          1       4      16      32      64
+    base       26.3   100.1   355.9   622.4   887.9   tok/s
+    K=1        34.7   122.8   376.2   515.9   520.6    1.32 / 1.23 / 1.06 / 0.83 / 0.59x
+    K=5      (recorded 42.7 / 140.5 / 395.6 / 501.7 / 503.4)  1.62 / 1.40 / 1.11 / 0.81 / 0.57x
+
+K=1 is WORSE than K=5 at every level that is a real decode batch, and ties it inside noise at the
+two that are not: this engine's largest decode batch is 28 and concurrency 64 has a 15.7 s TTFT,
+so those rows are the `--speculative-config` admission queue, which no K threshold addresses.
+
 DEFAULT OFF, AND IT STAYS OFF UNTIL A LADDER SAYS OTHERWISE.  `_AUTO_K1` is the measured
 `(hidden_size, K+1) -> highest decode batch at which K=1 is still at or above parity` table, and
 it is EMPTY -- for 4B chain because the ladder above says there is no such batch, and for every
@@ -347,9 +359,9 @@ _KFLAG = "CF_SPEC_K_SCHEDULE"
 FULL = -1
 
 #: MEASURED highest decode batch at which a K=1 arm is still at or above the no-speculation
-#: baseline, keyed exactly like `_AUTO`.  EMPTY, and for `(2560, 6)` that is itself a measurement:
-#: the 4B chain K=1 ladder in the module docstring is BELOW the K=0 cliff at every batch, so
-#: there is no rung to record.  Every other combination is simply unladdered.
+#: baseline, keyed exactly like `_AUTO`.  EMPTY, and for `(2560, 6)` and `(5120, 6)` that is
+#: itself a measurement: both K=1 ladders in the module docstring sit BELOW the K=0 cliff at every
+#: batch, so there is no rung to record.  The remaining combinations are simply unladdered.
 #:
 #: An entry here turns a K=1 rung ON by default for that target, and a rung set too high is a
 #: silent slowdown -- the same asymmetry that keeps `_AUTO` measured-only.  Add one only with a
