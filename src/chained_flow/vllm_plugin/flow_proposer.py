@@ -445,7 +445,13 @@ class FlowDrafterProposer:
             raise ValueError("CF_CTXDIAG inspects the per-request context tensor and only "
                              "works on the legacy path: set CF_GPUCTX=0")
         self._cg: dict[int, tuple] = {}          # batch-bucket -> (graph, ctx_buf, out_buf)
-        self._buckets = [1, 2, 4, 8, 16, 32]
+        # THE LADDER REACHES `max_num_seqs`, NOT 32.  It used to stop at 32, and the consequence
+        # was measured rather than reasoned about: profiling a 4B chain server at a decode batch
+        # of 64, 1901 of 2000 steps ran the draft with NO CUDAGRAPH AT ALL, and every distinct
+        # batch size in 33..64 (33, 34, 35, 37, 38, 40, 42, ..., 64) was its own `dynamic=False`
+        # max-autotune compile -- the ~850-autotune-event storm and the 70-80 s per-bucket stall.
+        # Both are the same missing rung. See `_bucket_ladder`.
+        self._buckets = self._bucket_ladder()
         self._t = {"n": 0, "ctx": 0.0, "flow": 0.0, "beam": 0.0, "sync": 0.0, "total": 0.0,
                    "gap": 0.0, "_last_exit": None}
         # CF_HPROF: HOST-ONLY segment timing. Unlike CF_PROFILE it inserts NO
@@ -774,7 +780,11 @@ class FlowDrafterProposer:
               # env vars. A flag that silently fails a shape gate is how CF_CUDA_BLOCK became a
               # no-op at two model sizes for hours.
               f" | path_trim={'on' if self.path_trim else 'off'}"
-              f" ring_slots={self._wmax()} of {self.K + 1}",
+              f" ring_slots={self._wmax()} of {self.K + 1}"
+              # The bucket ladder is the one part of this line that used to be a silent
+              # constant; the batch it STOPS at is the batch above which the draft ran eager,
+              # so it belongs next to `cudagraph=on`.
+              f" draft_buckets={self._buckets} (max_num_seqs={self.max_reqs})",
               flush=True)
         # ---- resolve the remaining gates and print ONE summary of what is actually on ----
         # Deliberately the LAST thing _build does and the FIRST forward's precondition: the
@@ -808,6 +818,14 @@ class FlowDrafterProposer:
                 _n, _why = (_cf_cut2.resolve(_h, _w) if _h
                             else (0, "target hidden size unavailable"))
                 _cf_cut2.set_resolved(_n, f"{_why}; hidden_size={_h}, verify width={_w}")
+                # The K-SCHEDULE resolves from the same two axes at the same moment.  It is a
+                # separate call rather than folded into `set_resolved` so that the cliff's
+                # provenance line and the ladder's stay independently auditable -- the ladder can
+                # be empty (today's default) while the cliff is not.
+                _rungs, _lwhy = (_cf_cut2.auto_ladder(_h, _w) if _h
+                                 else ((), "target hidden size unavailable"))
+                _cf_cut2.set_resolved_ladder(_rungs, _lwhy)
+            print(f"[cf-plugin] K-schedule: {_cf_cut2.describe_ladder()}", flush=True)
             # Both halves, on one line, from STATE.  The proposer half is this object; the
             # scheduler half is a class patch installed by a different module, and "the drafter
             # stopped but the target is still verifying zeros" is precisely the half-configured
@@ -1021,6 +1039,10 @@ class FlowDrafterProposer:
     #    but it is zero at batch 1 (the shipping config) and the draft barely scales with batch
     #    anyway because the flow is weight-bound -- see probe numbers in the report.  Fixing it
     #    means more buckets (more capture time + memory), not less compute.
+    #    That last sentence is also why the ladder now REACHES `max_num_seqs` (`_bucket_ladder`):
+    #    padding is cheap for exactly the reason above, so a coarse rung at 64 is much better
+    #    than no rung -- the alternative was not "an exact shape", it was an eager draft and a
+    #    fresh `dynamic=False` compile per batch size.
     #
     # 5. context ring / ctx_size=8 window.  Every one of the 8 context rows is consumed by the
     #    VAE encoder and the flow's cross-attention.  The front-padding repeats the OLDEST real
@@ -1389,7 +1411,8 @@ class FlowDrafterProposer:
               f"{dict(sorted(t['B'].items()))} | draft cudagraph bucket hist "
               f"{dict(sorted(t['bucket'].items()))} | fused block kernel (needs bucket==1) ran "
               f"on {fused}/{t['drafted']} = {100.0 * fused / d:.1f}% of DRAFTED steps -- the rest "
-              f"fell back to the PyTorch block stack | no-cudagraph drafted steps (B>32) "
+              f"fell back to the PyTorch block stack | no-cudagraph drafted steps "
+              f"(B above the top bucket {self._buckets[-1]}) "
               f"{t['nocg']} | CF_DRAFT_EARLY prelaunch: {t['pre_hit']} of {n} steps took the "
               f"side-stream fast path (guard bail-outs are steps where a request joined/left "
               f"the batch)", flush=True)
@@ -1444,6 +1467,39 @@ class FlowDrafterProposer:
             except Exception:                                # noqa: BLE001 - fork-only module
                 pass
         return v
+
+    def _bucket_ladder(self) -> list[int]:
+        """The draft cudagraph's batch buckets, up to `max_num_seqs`.
+
+        `CF_DRAFT_BUCKETS="1,2,4,8,16,32,64"` overrides it; unset gives powers of two capped at
+        `max_num_seqs`, with `max_num_seqs` itself appended when it is not one (so the top of the
+        range a server can actually reach is always covered, never merely approached).
+
+        WHY THE TOP RUNGS ARE FREE, AND WHY THE PADDING THEY COST IS NOT THE ISSUE.  A batch of
+        33 replays the bucket-64 graph, i.e. 31 whole drafts on padding rows -- which sounds
+        expensive and is not, because the flow net is WEIGHT-BANDWIDTH-BOUND and every row of a
+        batch shares those weights.  Measured eager, no engine, 4B: 10.13 ms at B=2 against
+        10.22 ms at B=32 -- FLAT.  So a padded replay costs about what an exact-shape one costs,
+        while an unbucketed batch costs a fresh `torch.compile` plus the launch overhead of an
+        eager draft, every step.  The trade the old ceiling made was backwards.
+
+        The cost of a rung is compile + capture (~70-80 s each, once) and one graph's worth of
+        pool memory.  That is why the ladder is coarse above 32 rather than one rung per batch
+        size: two extra rungs replace ~25 compiles.
+        """
+        env = (os.environ.get("CF_DRAFT_BUCKETS", "") or "").replace(",", " ").split()
+        cap = max(int(self.max_reqs), 1)
+        if env:
+            b = sorted({int(x) for x in env if int(x) > 0})
+        else:
+            b, n = [1, 2, 4, 8, 16, 32], 64
+            while n < cap:
+                b.append(n)
+                n *= 2
+            if cap > b[-1]:
+                b.append(cap)
+        b = [x for x in b if x <= cap]
+        return b or [1]
 
     def _warm_buckets(self) -> None:
         """CF_WARM_BUCKETS: pay the per-bucket compile+capture at BUILD time, not in the server.

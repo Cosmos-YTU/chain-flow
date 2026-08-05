@@ -12,14 +12,16 @@ and expensive to discover late.
 > 1. **The TREE arm is stable under concurrency now** (the crash is fixed; re-verified here to
 >    concurrency 64 at 4B, 982 requests, zero errors, acceptance flat at 2.40). But it is a
 >    batch-1 technique: 1.35x at concurrency 1, 0.85x at 4, **0.14x at 64**, because its `K+1` is
->    42 query positions per request against a chain's 6. Serve it with `CF_SPEC_MAX_BATCH=auto`.
+>    42 query positions per request against a chain's 6. The batch cutoff below now covers it.
 > 2. **Set `CF_TREE_GREEDY_GUARD=1` on any tree-mode server** — otherwise one `temperature>0`
 >    request kills it permanently, for every client.
-> 3. **Set `CF_SPEC_MAX_BATCH` on any server that will see concurrency — `4` at 4B, `16` at
->    27B.** Without it the 4B chain arm falls to 0.90x of the no-speculation baseline at
->    concurrency 8, 0.74x at 16 and **0.44x at 64**; with it, 1.19x at batch 1 (bit-identical to
->    the uncut arm) and 0.94–0.96x under load. The threshold is per model size and must be
->    measured — 4 is the right answer at 4B and the wrong one at 27B. Default off.
+> 3. **`CF_SPEC_MAX_BATCH` is now ON by default, and you no longer have to pick N.** Without a
+>    cutoff the 4B chain arm falls to 0.90x of the no-speculation baseline at concurrency 8,
+>    0.74x at 16 and **0.44x at 64**; with it, 1.19x at batch 1 (bit-identical to the uncut arm)
+>    and 0.94–0.96x under load. All six size × arm combinations are laddered — 4B **4**/**2**,
+>    9B **4**/**3**, 27B **16**/**3** for chain/tree — and the default engages *only* those. A
+>    target that was never laddered gets **no cutoff**, and says so; `=auto` opts into the
+>    derived guess for one, `=0` turns it off.
 > 4. **Do not serve 27B with speculation above concurrency ~16 at all.** There the binding cost
 >    is not drafting and the cutoff cannot fix it: `--speculative-config` more than halves the
 >    engine's KV cache, capping the 27B decode batch at ~28 against the base engine's 64.
@@ -194,7 +196,7 @@ The rest of the collapse is structural and not ours to fix — a speculative ste
 `(K+1) × B` tokens, so as `B` grows the target forward stops being bandwidth-bound per token
 and the thing speculation exploits goes away.
 
-### `CF_SPEC_MAX_BATCH=N` — stop speculating above a decode batch (default OFF)
+### `CF_SPEC_MAX_BATCH` — stop speculating above a decode batch (default ON where measured)
 
 Taken past concurrency 16, the 4B chain arm does not level off, it keeps falling: **0.44x of the
 no-speculation baseline at concurrency 64.** A server that is 2.3x slower under load because a
@@ -232,15 +234,34 @@ full cudagraphs captured and dispatched for every step that still speculates.
 concurrency 1, 1.00x at 4, 0.90x at 8. N is inclusive, so a batch of exactly 4 still speculates,
 and the batch-1 number is **bit-identical** to the uncut arm (0/70 sequences differ).
 
-**`CF_SPEC_MAX_BATCH=auto` picks N from the target's size**, because the threshold is a
-measurement and both ways of getting it wrong cost real throughput — N=4 on a 27B server measured
-190.4 tok/s at concurrency 8 against the uncut arm's 253.5, and N=16 on a 4B server leaves it
-under water from concurrency 8 up. The table is keyed on the loaded embedding's hidden size (read
-off the model, not off a config): **4B → 4, 27B → 16, 9B → 8 and flagged INTERPOLATED** wherever
-it is printed, because 9B was not laddered. Resolution happens in `_build()`, which is the first
-moment the target's size is known; until then `max_batch()` reads 0 and the cutoff is inert —
-correct rather than merely tolerable, since the only steps that precede `_build()` are the first
-few of the first request, at a decode batch of 1 that no threshold in the table would cut.
+**The threshold is picked from the target AND the arm**, because it is a measurement and both
+ways of getting it wrong cost real throughput — N=4 on a 27B server measured 190.4 tok/s at
+concurrency 8 against the uncut arm's 253.5, and N=16 on a 4B server leaves it under water from
+concurrency 8 up. `_AUTO` is keyed on `(hidden_size, K+1)`, the hidden size read off the loaded
+embedding rather than off a config. **All six combinations are now laddered**, each against its
+own no-speculation baseline on the same GPU:
+
+| | chain (`K+1` = 6) | 8×5 tree (`K+1` = 41) |
+|---|---|---|
+| 4B (2560) | **4** | **2** |
+| 9B (4096) | **4** | **3** |
+| 27B (5120) | **16** | **3** \* |
+
+\* the 27B tree engine cannot reach a decode batch above 3 at all; see below.
+
+Every entry is the last laddered decode batch still at or above parity, and the one next to it
+is below — that is the rule, applied the same way six times. Resolution happens in `_build()`,
+which is the first moment the target's size is known; until then `max_batch()` reads 0 and the
+cutoff is inert — correct rather than merely tolerable, since the only steps that precede
+`_build()` are the first few of the first request, at a decode batch of 1 that no threshold in
+the table would cut.
+
+**This is now the DEFAULT**, and the reason it can be is that it refuses to guess: a
+`(hidden_size, K+1)` that is not in the table resolves to *no cutoff at all*, printing
+`NOT MEASURED for hidden_size=… at verify width …`. `CF_SPEC_MAX_BATCH=auto` opts back into the
+derived width rule for such a target, `=<n>` sets one directly, `=0` or `off` disables. The
+asymmetry is the point: a derived N that is too low silently costs speedup and nothing in the
+throughput number says so, so it is not a thing to acquire by accident.
 
 **It also deletes the compile storm**, for free: with the cutoff at 4 the drafter is only ever
 asked for buckets 1, 2 and 4, so those are the only three that ever compile — confirmed from
@@ -381,19 +402,69 @@ prints the largest decode batch each arm reached, next to the ladder it was driv
 gap between offered load and decode batch is visible rather than something you have to know to
 go and grep for. (\* concurrency-2 base from the earlier `27b_base` ladder.)
 
-**Still unmeasured: 9B, on both arms.** `resolve()` under the default returns *no cutoff* for a
-combination that was never laddered, so a 9B server currently gets no protection at all — which
-is the safe failure, but it is a gap, and `tests/test_batch_cutoff.py::
-test_the_default_engages_exactly_the_laddered_combinations` fails for `(4096, 6)` and
-`(4096, 41)` to keep it visible. The project publishes 9B numbers (1.40x / 1.61x at batch 1), so
-it should not be the one size without a measured threshold.
+### 9B: both arms laddered, and the two thresholds are not the same number
 
-**The three ladders that close it are running** — `logs/bench_serve/9b_{base,chain,tree}_lad`,
-GPU 7, concurrency 1/2/4/8/16, chained so each waits for the previous to release the GPU. To
-finish: `vllm/ladder_report.py 9b base_lad chain_lad tree_lad`, then add `(4096, 6)` and
-`(4096, 41)` to `_AUTO` with the tok/s in the provenance string the way the other four carry
-theirs — and read the threshold off the **decode batch** column, not the offered concurrency, for
-the reason the 27B tree row above documents.
+`logs/bench_serve/9b_{base,chain,tree}_thr`, one RTX PRO 6000, `serve_ladder.sh`, each arm
+against the no-speculation baseline on the same GPU. Drafter `Flow-Drafter-9B-v2`, confirmed
+from the loaded path's hash `ed77e698e501423858effa9a596908a700876be7`.
+
+| conc | 1 | 2 | 3 | 4 | 6 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|---|---|
+| base | 83.7 | 157.7 | 236.8\* | 315.8 | 474.1\* | 632.4 | 1123.5 | 1983.8 | 3127.6 |
+| chain | 107.3 | 188.5 | — | 336.1 | — | 578.4 | 908.8 | 1231.3 | 1463.2 |
+| | **1.28x** | **1.20x** | | **1.06x** | | 0.91x | 0.81x | 0.62x | 0.47x |
+| tree | 123.7 | 191.3 | 258.9 | 307.2 | 383.8 | 419.8 | 464.0 | 446.5 | 445.8 |
+| | **1.48x** | **1.21x** | **1.09x** | 0.97x | 0.81x | 0.66x | 0.41x | 0.23x | 0.14x |
+
+**Chain crosses between 4 and 8 → N=4. Tree crosses between 3 and 4 → N=3.** The tree's
+concurrency 3 and 6 points were run separately (`9b_tree_mid`) for exactly this reason: 1.21x at
+2 and 0.97x at 4 do not say where in between the crossing sits, and the answer is what separates
+N=3 from the N=2 the 4B tree would suggest. Acceptance is flat across both ladders — 1.88–1.92
+chain, 2.40–2.45 tree — so, again, none of the decline is drafting quality.
+
+The **width rule would have derived 8 for the 9B chain**, which is to say it would have kept
+speculating at a measured 0.91x. That is the case for measuring rather than deriving, stated as
+a number rather than a principle.
+
+\* base at concurrency 3 and 6 is interpolated, and here that is sound rather than a caveat: the
+base arm's **per-request** throughput is flat at 78.8–79.1 tok/s from concurrency 2 through 8, so
+base(3) and base(6) are 3× and 6× that to within a fraction of a percent. The tree points at 3
+and 6 are measured. Note also that the 9B tree engine reaches a decode batch of only **17**
+(131,606 KV tokens), so its concurrency 32 and 64 levels are the admission queue — the same
+plateau the 4B tree shows, and no threshold applies to them.
+
+**With the cutoff — run with `CF_SPEC_MAX_BATCH` UNSET, i.e. the shipping default, which resolved
+`4` and `3` from the table and printed that it had:**
+
+| conc | 1 | 2 | 3 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|---|
+| chain uncut | 1.28x | 1.20x | — | 1.06x | 0.91x | 0.81x | 0.62x | **0.47x** |
+| chain + cutoff (N=4) | **1.28x** | **1.20x** | — | **1.07x** | 0.94x | 0.92x | **0.96x** | **0.96x** |
+| tree uncut | 1.48x | 1.21x | 1.09x | 0.97x | 0.66x | 0.41x | 0.23x | **0.14x** |
+| tree + cutoff (N=3) | **1.48x** | **1.22x** | **1.09x** | 0.93x | **0.90x** | **0.92x** | — | — |
+
+**At and below N the two arms are the same measurement**, which is the property the flag
+promises: chain 107.5 vs 107.3, 188.8 vs 188.5, 336.4 vs 336.1 tok/s; tree 123.7 vs 123.7, 191.7
+vs 191.3, 259.2 vs 258.9. Every pair is inside 0.3% — and concurrency 1 in particular is
+untouched, so the published batch-1 numbers cannot move.
+
+**The two halves are in exact lockstep, and the audit says so arithmetically** rather than by
+argument. 9B tree cutoff arm, cumulative over the whole ladder: `11530 drafted, 12969 skipped by
+CF_SPEC_MAX_BATCH`, against a decode-batch histogram of `{1: 5407, 2: 3676, 3: 2447, 4: 5724,
+6: 3, 7: 94, 8: 4514, 11: 4, 13: 3, 15: 21, 16: 2607}`. The B ≤ 3 bins sum to **11,530** and the
+B ≥ 4 bins to **12,969** — the drafter ran on exactly the steps at or below N and on no others.
+
+**The 9B chain cutoff is the best result the flag has**: 0.47x → **0.96x** at concurrency 64,
+against the 4B chain's 0.95x and the 27B chain's 0.52x. And unlike the 4B tree, the 9B *tree*
+cutoff also reaches ~0.92x rather than stalling in the 0.67x range, because a 9B tree engine
+holds 131,606 KV tokens against the 4B tree's 117,537 while serving a model whose base
+throughput is 3.6× lower — so the KV reservation binds much later relative to the load.
+
+**One honest cost at the boundary.** At concurrency 4 the tree cutoff reads 0.93x where the uncut
+arm reads 0.97x: N=3 cuts a batch of 4, and at that batch turning speculation off is not yet a
+win. It is the first batch above N, it is a ~4% effect on one rung, and the alternative (N=4)
+would keep speculating at a measured 0.97x instead. Both are inside the band the ladder can
+resolve; N=3 is the choice consistent with the rule used for the other five entries.
 
 **The cutoff helps the tree but cannot bring it to parity, and that is the interesting part.**
 The chain cutoff reaches 0.94–0.96x; the tree cutoff stalls at ~0.67x even though above N it is

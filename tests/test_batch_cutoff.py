@@ -57,7 +57,7 @@ def test_verify_width_moves_the_threshold_as_much_as_model_size_does():
 def test_a_combination_never_laddered_is_derived_floored_and_says_so():
     """A guess must be labelled as one, and must not be able to guess ABOVE 'batch 1 only' into
     a regime nobody measured."""
-    n, why = batch_cutoff.auto_for(4096, 41)                 # 9B tree: neither axis measured
+    n, why = batch_cutoff.auto_for(3584, 41)                 # no such target here: a pure guess
     assert n >= 1 and "DERIVED" in why
 
 

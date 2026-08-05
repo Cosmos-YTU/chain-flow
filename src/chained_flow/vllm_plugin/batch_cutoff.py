@@ -21,18 +21,32 @@ Enabling speculation more than halves a loaded 4B server.  Three costs compound:
     accept of 1.86 out of a possible 6 cannot pay for it.  Acceptance does not move across the
     whole ladder (1.854-1.863), so none of this is a drafting-quality problem.
   * THE DRAFTER's own fast paths are batch-1-gated BY CONSTRUCTION (`chunked_flow.py`'s fused
-    CUDA block runner takes `x.shape[0] == 1` only; the draft cudagraph has buckets up to 32 and
-    none beyond), so exactly where the target's bill goes up, the draft's does too.
-  * ABOVE BUCKET 32 EVERY DISTINCT BATCH SIZE IS ITS OWN `torch.compile`.  `CF_COMPILE` uses
-    `dynamic=False`, and past the last bucket `_ctx_gpu` falls back to `bucket = B`.  The uncut
-    ladder above logged draft batches of 34, 37, 38, 42, 45, 46, 50, 54, 55, 59, 62, 63 and 64 --
-    a fresh max-autotune codegen each, ~70-80 s of engine stall apiece, inside live traffic.
-    (This is the shape of the ~850 autotune blocks seen on a first `guidellm --rate 64` pass,
-    whose 0.048x figure is the same failure with the compile storm on top of it.)
+    CUDA block runner takes `x.shape[0] == 1` only), so exactly where the target's bill goes up,
+    the draft's does too.
+  * THE DRAFT CUDAGRAPH USED TO STOP AT BUCKET 32, and above it every distinct batch size was
+    its own `torch.compile` (`CF_COMPILE` uses `dynamic=False`, and past the last bucket
+    `_ctx_gpu` falls back to `bucket = B`).  The uncut ladder above logged draft batches of 34,
+    37, 38, 42, 45, 46, 50, 54, 55, 59, 62, 63 and 64 -- a fresh max-autotune codegen each,
+    ~70-80 s of engine stall apiece, inside live traffic.  (This is the shape of the ~850
+    autotune blocks seen on a first `guidellm --rate 64` pass, whose 0.048x figure is the same
+    failure with the compile storm on top of it.)
 
-The first two are not bugs to be fixed -- they are what speculative decoding IS.  The bug is
-that nothing stopped it.  The third is fixed here as a side effect, and by `CF_WARM_BUCKETS`
-directly.
+WHICH OF THOSE IS PHYSICS AND WHICH IS DEBT -- THE PROFILE, NOT THE INTUITION.  This docstring
+used to say the first two "are not bugs to be fixed -- they are what speculative decoding IS".
+The profile at B=64 on 4B chain falsifies that (commit 81d0ecc, docs/BENCHMARKING.md): a 65.7 ms
+step with the GPU 96% busy is 35.2 ms of target forward over 384 positions and **24.2 ms of
+DRAFTER**, and an A/B that skips only the draft prices the drafter at 26.0 ms/step against 18.5
+ms of verify inflation.  Of the 0.56x deficit at B=64, verify width is 0.21 (38%) and THE DRAFTER
+IS 0.35 (62%) -- the larger half, and the half that was engineering debt: 1901 of 2000 steps ran
+the draft with no cudagraph at all and the fused batch-1 kernel fired on 2.0% of steps.  The
+missing rungs are fixed in `FlowDrafterProposer._bucket_ladder` (the ladder now reaches
+`max_num_seqs`), which also deletes the compile storm outright rather than by avoidance.
+
+So the accurate statement is narrower: only the VERIFY WIDTH is intrinsic, and even it is
+smaller than the `accept/(K+1)` intuition says -- `F.linear` at this model's real shapes gives
+138-162 TFLOP/s at M=64 against a 330-380 asymptote, so B=64 is only half way to compute-bound
+and the measured forward is 2.75x for 6x the rows, not 6x.  That is what makes a K-SCHEDULE
+(below) worth having: M=128, i.e. K=1, costs only ~1.33x the M=64 forward.
 
 WHAT THIS DOES
 --------------
@@ -115,6 +129,44 @@ before that combination was laddered.  A wrong guess nobody opted into is worse 
 
 `CF_SPEC_MAX_BATCH=0` (or `off`) turns it off; a number sets N directly; `auto` is the old
 guess-allowed behaviour.
+
+A K-SCHEDULE INSTEAD OF A K=0 CLIFF -- `CF_SPEC_K_SCHEDULE` (DEFAULT OFF)
+------------------------------------------------------------------------
+The cutoff is a cliff: below N the arm speculates with the full K, above it with none.  The
+roofline says there is something in between.  `F.linear` at this model's real shapes runs at
+138-162 TFLOP/s at M=64 against an M=2688 asymptote of 330-380, so a batch of 64 is only half
+way to compute-bound, and M=128 -- which is exactly `B=64` at `K=1` -- costs only ~1.33x the
+M=64 forward that the no-speculation baseline pays.  A K=1 arm therefore has a chance of
+staying ABOVE parity at batches where K=5 provably cannot, and a cliff throws that away.
+
+`CF_SPEC_K_SCHEDULE="4:full,16:1"` reads: at a decode batch of 4 or below schedule the engine's
+full K, at 16 or below schedule K=1, above 16 schedule none.  Rungs are `<max decode batch>:<K>`,
+`full` means the engine's `num_speculative_tokens`, rungs must ascend in batch and descend in K,
+and there is always an implicit `K=0` above the last one.
+
+IT LANDS IN THE SAME PLACE THE CLIFF DOES, and that is why it costs nothing new to be sure of.
+`_update_after_schedule` already writes `scheduler_output.num_spec_tokens_to_schedule`; writing
+`1` there instead of `0` is the same field, one step earlier in the same decision.  vLLM then
+builds `request.spec_token_ids = [-1] * 1`, schedules two query positions per request, and
+`_prepare_input_ids` scatters `range(start, start + draft_len)` out of the draft tensor with
+`start = prev_index * self.prev_num_spec_tokens` -- i.e. it takes the FIRST `draft_len` COLUMNS
+of each row of whatever width tensor the proposer returned.  For a chain that is precisely the
+first `draft_len` links, in order, which is what "K=1" has to mean.  `prev_num_spec_tokens` is
+set from the returned tensor's own width on every step (`_copy_draft_token_ids_to_cpu`, above
+its async early-return), so the narrowing needs NO change in the proposer and cannot desynchronise
+from it.  The full-width draft is still computed; the K-schedule buys VERIFY width, not draft
+cost, and the profile says the two are 38% / 62% of the deficit respectively.
+
+WHY THIS AND NOT vLLM's `num_speculative_tokens_per_batch_size`: unchanged, see below -- setting
+it downgrades `cudagraph_mode` engine-wide including batch 1.  The scheduler patch expresses the
+same schedule without touching the config, which is the whole reason it exists.
+
+DEFAULT OFF, AND IT STAYS OFF UNTIL A LADDER SAYS OTHERWISE.  `_AUTO_K1` is the measured
+`(hidden_size, K+1) -> highest decode batch at which K=1 is still at or above parity` table, and
+it is EMPTY: a K=1 rung that is set too high is a slowdown nobody opted into, which is the same
+asymmetry `_AUTO` is governed by.  Until an entry exists, the schedule is only what
+`CF_SPEC_K_SCHEDULE` says, and the resolution log prints the ladder together with whether each
+rung was MEASURED or DERIVED.
 """
 from __future__ import annotations
 
@@ -165,10 +217,35 @@ _AUTO = {
     # (hidden_size, draft_width + 1): (N, provenance)
     (2560, 6): (4, "measured: 4B chain"),
     (5120, 6): (16, "measured: 27B chain"),
+    # 9B chain, `9b_chain_thr` vs `9b_base_thr`, 2026-08-05, one RTX PRO 6000:
+    #   conc     1      2      4      8     16     32     64
+    #   base  83.7  157.7  315.8  632.4 1123.5 1983.8 3127.6  tok/s
+    #   chain 107.3 188.5  336.1  578.4  908.8 1231.3 1463.2
+    #        1.28x  1.20x  1.06x  0.91x  0.81x  0.62x  0.47x
+    # Crossing between 4 and 8, so N=4 -- the last laddered batch still above parity, which is
+    # the same rule the other four entries were chosen by.  The width rule DERIVED 8 for this
+    # combination, i.e. it would have kept speculating at a measured 0.91x.  Acceptance is flat
+    # at 1.88-1.92 across the whole ladder, so none of the decline is drafting quality.  This
+    # engine reaches a decode batch of 64, so every level here is a real batch and not a queue.
+    (4096, 6): (4, "measured: 9B chain (1.28x at batch 1, 1.06x at 4, 0.91x at 8)"),
     # 4B tree, laddered at 1/2/3/4: 187.5 / 268.3 / 349.9 / 426.2 tok/s against a base of
     # 139.0 / 256.8 / ~378 (interpolated) / 498.8 -> 1.35x / 1.04x / 0.93x / 0.85x.  N=2 keeps
     # the point that is still above parity and drops the first one that is not.
     (2560, 41): (2, "measured: 4B tree (1.35x at batch 1, 1.04x at 2, 0.93x at 3)"),
+    # 9B tree, `9b_tree_lad` + `9b_tree_mid` vs `9b_base_thr`, 2026-08-05:
+    #   conc      1      2      3*     4      6*     8     16
+    #   base   83.7  157.7  236.8  315.8  474.1  632.4 1123.5  tok/s
+    #   tree  123.7  191.3  258.9  307.2  383.8  419.8  464.0
+    #        1.48x  1.21x  1.09x  0.97x  0.81x  0.66x  0.41x
+    # N=3: batch 3 is the last one above parity and batch 4 is the first one below.  Both
+    # neighbours were measured rather than assumed -- concurrency 3 and 6 were run separately
+    # (`9b_tree_mid`) precisely because 1.21x at 2 and 0.97x at 4 do not say where between them
+    # the crossing sits, and the answer moved N from the 2 the 4B tree's rule would suggest.
+    # * base at 3 and 6 is interpolated, and it is a safe interpolation here rather than a
+    #   flagged weakness: the base arm's PER-REQUEST throughput is flat at 78.8-79.1 tok/s from
+    #   concurrency 2 to 8, so base(3) and base(6) are 3x and 6x that to within a fraction of a
+    #   percent.  The tree points at 3 and 6 are measured.
+    (4096, 41): (3, "measured: 9B tree (1.48x at batch 1, 1.21x at 2, 1.09x at 3, 0.97x at 4)"),
     # 27B tree, `27b_tree_lad` vs `27b_base_lad`, laddered at nominal concurrency 1/2/4/8:
     # 48.7 / 79.1 / 107.8 / 107.2 tok/s against 26.3 / 51.0* / 100.2 / 190.8 -> 1.85x / 1.55x /
     # 1.08x / 0.56x.  The width rule DERIVED 2; the measurement says 3, and that extra batch is
@@ -197,7 +274,16 @@ _AUTO = {
 #: constant TOTAL verify width `B x (K+1)` for a given model size -- 4B chain crosses at 4 x 6 =
 #: 24, 27B chain at 16 x 6 = 96 -- because that width is where the target forward stops being
 #: memory-bound.  Interpolating on it is a guess, so it is floored at 1 (never worse than "batch
-#: 1 only") and always reported as derived.
+#: 1 only") and always reported as derived, and since the default refuses to use it, reaching
+#: this table now takes an explicit `CF_SPEC_MAX_BATCH=auto` on an unladdered target.
+#:
+#: THE RULE'S OWN TRACK RECORD, NOW THAT ALL SIX POINTS ARE MEASURED, IS MIXED -- which is the
+#: argument for laddering rather than trusting it.  It gets the 4B tree right (24/41 -> 1, and 2
+#: measured) and is close on the 27B tree (96/41 -> 2, and 3 measured), but the 9B row was pure
+#: interpolation and it was WRONG IN THE EXPENSIVE DIRECTION: 48/6 -> 8 for the 9B chain, which
+#: measured 0.91x at a batch of 8.  The 9B rung is left at its interpolated 48 rather than
+#: back-fitted to the measurement, because a table entry that has been tuned to the points it is
+#: judged on stops being evidence about the points it has not seen.
 _WIDTH_AT_CROSSING = ((3072, 24, "4B"), (4608, 48, "9B, itself interpolated"), (1 << 30, 96, "27B"))
 
 
@@ -229,6 +315,132 @@ def auto_for(hidden_size: int, k_plus_1: int = 6,
 #: proposer, because the SCHEDULER half reads it -- and the scheduler and the proposer are the
 #: same process (the engine core), so a module global is the whole mechanism.
 _RESOLVED: int = 0
+
+
+# ======================================================================================
+# THE K-SCHEDULE.  See the module docstring.
+# ======================================================================================
+_KFLAG = "CF_SPEC_K_SCHEDULE"
+
+#: `full`, as a rung's K.  Not a magic number in the ladder: the engine's own
+#: `num_spec_tokens_to_schedule` is what "full" resolves to, and only the SCHEDULER knows it.
+FULL = -1
+
+#: MEASURED highest decode batch at which a K=1 arm is still at or above the no-speculation
+#: baseline, keyed exactly like `_AUTO`.  DELIBERATELY EMPTY: an entry here turns a K=1 rung ON
+#: by default for that target, and a rung set too high is a silent slowdown -- the same asymmetry
+#: that keeps `_AUTO` measured-only.  Add an entry only with a ladder behind it, with the tok/s
+#: in the provenance string the way `_AUTO`'s entries carry theirs.
+_AUTO_K1: dict[tuple[int, int], tuple[int, str]] = {}
+
+#: The ladder actually in force: ascending `(max decode batch, K)` rungs, implicit K=0 above the
+#: last.  Empty means "no K-schedule" -- `should_cut` then falls back to the plain `_AUTO` cliff,
+#: which is the shipping behaviour.
+_RESOLVED_LADDER: tuple[tuple[int, int], ...] = ()
+_LADDER_WHY: str = "no K-schedule"
+
+
+def parse_schedule(spec: str) -> tuple[tuple[int, int], ...]:
+    """`"4:full,16:1"` -> `((4, FULL), (16, 1))`.
+
+    Validates rather than tolerates.  A schedule that ascends in K, or repeats a batch, or names
+    a K of 0 in the middle, is a typo whose only symptom would be a throughput number -- so it
+    raises here, in the process that read the flag, instead of quietly becoming a different
+    schedule than the one that was typed.
+    """
+    out: list[tuple[int, int]] = []
+    for part in spec.replace(",", " ").split():
+        n_s, _, k_s = part.partition(":")
+        if not _:
+            raise ValueError(f"{_KFLAG}: rung {part!r} is not '<max decode batch>:<K>'")
+        n = int(n_s)
+        k = FULL if k_s.strip().lower() in ("full", "max", "k") else int(k_s)
+        if n < 1:
+            raise ValueError(f"{_KFLAG}: rung {part!r} has a max decode batch below 1; use "
+                             f"{_FLAG}=0 to turn speculation off entirely")
+        if k == 0:
+            raise ValueError(f"{_KFLAG}: rung {part!r} names K=0, which is what the IMPLICIT "
+                             f"rung above the last one already means -- drop it")
+        if k < FULL:
+            raise ValueError(f"{_KFLAG}: rung {part!r} has a negative K")
+        if out and n <= out[-1][0]:
+            raise ValueError(f"{_KFLAG}: rung {part!r} does not ascend in decode batch")
+        if out and out[-1][1] != FULL and (k == FULL or k > out[-1][1]):
+            raise ValueError(f"{_KFLAG}: rung {part!r} raises K as the batch grows, which is "
+                             f"backwards -- a wider batch can afford LESS speculation, not more")
+        out.append((n, k))
+    return tuple(out)
+
+
+def auto_ladder(hidden_size: int, k_plus_1: int,
+                measured_only: bool = True) -> tuple[tuple[tuple[int, int], ...], str]:
+    """The default K-schedule for this target and arm, and where each rung came from.
+
+    Returns `((), why)` when there is nothing measured, which is the shipping answer today: the
+    plain `_AUTO` cliff then stands unchanged.
+    """
+    n1, why1 = auto_for(hidden_size, k_plus_1, measured_only=measured_only)
+    hit = _AUTO_K1.get((int(hidden_size), int(k_plus_1)))
+    if not hit:
+        return (), (f"no K=1 rung is MEASURED for hidden_size={hidden_size} at verify width "
+                    f"{k_plus_1}, so the schedule stays the {_FLAG} cliff (N={n1}). Set "
+                    f"{_KFLAG} to try one.")
+    n2, why2 = hit
+    if not n1:
+        return ((n2, 1),), f"K=1 up to {n2} ({why2}); no measured full-K rung ({why1})"
+    if n2 <= n1:
+        return ((n1, FULL),), (f"K=1 rung {n2} ({why2}) is not above the full-K rung {n1} "
+                               f"({why1}), so it would never fire -- ignored")
+    return ((n1, FULL), (n2, 1)), f"full K up to {n1} ({why1}); K=1 up to {n2} ({why2})"
+
+
+def ladder() -> tuple[tuple[int, int], ...]:
+    """The K-schedule in force.  `CF_SPEC_K_SCHEDULE` beats the resolved default.
+
+    Read from the environment every call for the same reason `_mode()` is: this module is
+    imported independently by the API-server and engine-core processes and must be the same fact
+    in both.
+    """
+    spec = (os.environ.get(_KFLAG, "") or "").strip()
+    if spec and spec.lower() not in _OFF_WORDS:
+        # An EXPLICIT schedule supersedes `CF_SPEC_MAX_BATCH` rather than being gated by it: its
+        # last rung IS the cutoff, so obeying both would mean two thresholds for one boundary.
+        return parse_schedule(spec)
+    if _mode() == "off":
+        return ()
+    return _RESOLVED_LADDER
+
+
+def set_resolved_ladder(rungs, why: str) -> None:
+    global _RESOLVED_LADDER, _LADDER_WHY
+    _RESOLVED_LADDER = tuple((int(n), int(k)) for n, k in rungs)
+    _LADDER_WHY = why
+
+
+def describe_ladder() -> str:
+    lad = ladder()
+    if not lad:
+        return f"no K-schedule ({_LADDER_WHY})"
+    body = ", ".join(f"B<={n} -> K={'full' if k == FULL else k}" for n, k in lad)
+    src = (f"{_KFLAG}={os.environ.get(_KFLAG, '').strip()}"
+           if (os.environ.get(_KFLAG, "") or "").strip() else _LADDER_WHY)
+    return f"{body}, else K=0  [{src}]"
+
+
+def k_for(nreq: int, full: int) -> int:
+    """How many speculative tokens a step of `nreq` requests should be scheduled.
+
+    `full` is the engine's own `num_spec_tokens_to_schedule`, i.e. what it would have used with
+    no patch at all -- so with no ladder and no cutoff this returns exactly that and the patch is
+    a no-op by construction rather than by matching a constant.
+    """
+    lad = ladder()
+    if not lad:
+        return 0 if should_cut(nreq) else full
+    for n, k in lad:
+        if nreq <= n:
+            return full if k == FULL else min(k, full)
+    return 0
 
 
 #: Words that mean "off".  `0` is one of them and has to stay one: before the default flipped,
@@ -306,8 +518,11 @@ def requested() -> bool:
     True by default.  A non-speculative engine never calls `_build()`, so `_RESOLVED` stays 0 and
     the installed patch never cuts anything -- the scheduler wrapper is inert, not merely
     harmless.
+
+    An explicit `CF_SPEC_K_SCHEDULE` also counts: its top rung is a cutoff, and it has to be able
+    to install the patch on its own.
     """
-    return _mode() != "off"
+    return _mode() != "off" or bool(ladder())
 
 
 def half() -> str:
@@ -325,12 +540,20 @@ def scheduler_half() -> bool:
 
 
 def should_cut(nreq: int) -> bool:
-    """Does a step of `nreq` requests fall ABOVE the cutoff?
+    """Does a step of `nreq` requests get NO speculative tokens at all?
 
     N is inclusive -- a batch of exactly N still speculates.  Both halves of the cutoff call
     this (the scheduler patch below, `FlowDrafterProposer._cut` in the proposer), because the two
     disagreeing by one would be invisible in any throughput number.
+
+    With a K-schedule in force this is the schedule's implicit top rung: above the last rung the
+    step gets K=0 and the drafter skips, exactly as under the cliff.  Note a K=1 step is NOT a
+    cut -- the drafter still runs, and must, because the scatter reads the first column of the
+    draft it returns.
     """
+    lad = ladder()
+    if lad:
+        return nreq > lad[-1][0]
     n = max_batch()
     return n > 0 and nreq > n
 
@@ -371,10 +594,15 @@ def install() -> None:
         # `len(num_scheduled_tokens)` is the number of requests in THIS step -- the exact
         # quantity vLLM's own dynamic-SD schedule keys on (`scheduler.py`, `dynamic_sd_lookup[
         # len(num_scheduled_tokens)]`).  Setting the field the base implementation is about to
-        # read makes the placeholder list empty for every request, which is bit-identical to
-        # what the native mechanism produces -- no second code path.
-        if should_cut(len(scheduler_output.num_scheduled_tokens)):
-            scheduler_output.num_spec_tokens_to_schedule = 0
+        # read makes the placeholder list the scheduled width for every request, which is
+        # bit-identical to what the native mechanism produces -- no second code path.
+        #
+        # The engine's own value is passed in as `full` rather than re-derived, so a step this
+        # patch has no opinion about is written back unchanged and the wrapper is provably inert.
+        full = scheduler_output.num_spec_tokens_to_schedule
+        k = k_for(len(scheduler_output.num_scheduled_tokens), full)
+        if k != full:
+            scheduler_output.num_spec_tokens_to_schedule = k
         return orig(self, scheduler_output)
 
     _update_after_schedule._cf_batch_cutoff = True            # type: ignore[attr-defined]
@@ -396,5 +624,8 @@ def install() -> None:
 def status() -> str:
     if not INSTALLED:
         return f"not installed ({REASON})"
+    lad = ladder()
+    if lad:
+        return f"installed ({describe_ladder()})"
     n = max_batch()
     return f"installed (N={n})" if n else "installed (N not yet resolved: auto, drafter not built)"
