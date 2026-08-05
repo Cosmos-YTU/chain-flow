@@ -342,6 +342,21 @@ With `CF_SPEC_MAX_BATCH=auto` (which resolves to **N=2** here, printed with its 
 | 4 | 498.8 | 426.2 (0.85x) | 453.1 (**0.91x**) | |
 | 8 | 952.9 | 560.7 (0.59x) | 642.9 (**0.67x**) | |
 | 16 | 1764.4 | 623.4 (0.35x) | 1257.8 (**0.71x**) | 2.0x the uncut arm |
+| 32 | 2968.3 | 625.4 (0.21x) | 1537.2 (**0.52x**) | 2.5x the uncut arm |
+| 64 | 4518.6 | 624.3 (0.14x) | 1426.2 (**0.32x**) | 2.3x the uncut arm |
+
+So for the tree the cutoff is **necessary but not sufficient**: it is worth 2.0–2.5x under load
+and it costs nothing at batch 1, but it leaves the arm at 0.32–0.71x of base rather than the
+0.94–0.96x the chain reaches. Do not serve a 4B tree above concurrency ~2 on the strength of the
+cutoff alone.
+
+**27B tree is only partly laddered and its threshold is NOT measured.** What exists: 48.7 tok/s
+at concurrency 1 (**1.85x**) and 79.1 at concurrency 2 (**1.55x**, against the earlier `27b_base`
+run's 51.0). `auto` therefore takes the DERIVED branch for `(5120, 41)` and returns 2 — which
+those two points already show is **too conservative**, since the arm is still at 1.55x there. It
+is safe (never below base) but leaves speedup unclaimed, and the log line says `DERIVED, not
+measured for this combination` precisely so this is not mistaken for a result. Ladder 27B tree to
+16 and put the measurement in `_AUTO` before quoting a 27B tree deployment number.
 
 **The cutoff helps the tree but cannot bring it to parity, and that is the interesting part.**
 The chain cutoff reaches 0.94–0.96x; the tree cutoff stalls at ~0.67x even though above N it is
