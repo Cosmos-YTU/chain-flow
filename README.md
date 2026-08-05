@@ -236,14 +236,27 @@ instantiated for, it falls back to the **bit-identical** PyTorch block stack
 or [docs/BENCHMARKING.md](https://github.com/Zeuss5/chained-flow/blob/main/docs/BENCHMARKING.md).
 The baseline is where this project has been wrong before.
 
+**`vllm serve` is the measurement path**; the offline harness is the regression gate.
+Wins in this repo are gated on a decode batch of 1 and disengage under continuous
+batching, so a batch-1 number is not a deployment number — see section 0 of the doc.
+
 ```bash
-./vllm/bench_cf.sh 4b base            # baseline
+./vllm/bench_serve.sh 4b base 3 8601   # <size> <arm> <gpu> <port>; concurrency 1..16
+./vllm/bench_serve.sh 4b chain 3 8602  # over a real HTTP server, engine core in its own process
+./vllm/bench_serve_report.py           # the table
+./vllm/bench_serve_diff.py logs/bench_serve/4b_{base,chain}/serve_bench.json
+```
+
+```bash
+./vllm/bench_cf.sh 4b base            # batch-1 regression gate: baseline
 ./vllm/bench_cf.sh 4b chain           # fork-free arm
 ./vllm/bench_cf.sh 4b tree            # needs the patch
 ./vllm/bench_forkfree.sh 4b 256       # all arms, both baselines, one run
 ```
 
 `CF_PY=<venv>/bin/python` selects which vLLM to run against.
+`CF_BATCH_AUDIT=1` makes the proposer report the decode batch it is *actually* running
+at, which is the only way to tell whether the batch-1-gated flags engaged.
 
 Two baseline hazards have corrupted results here before:
 

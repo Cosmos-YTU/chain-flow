@@ -23,6 +23,13 @@ export PYTHONPATH=/home/shadeform/chained-flow/src
 _CF_DEF=$(PYTHONPATH=/home/shadeform/chained-flow/src "$CF_PY" \
           /home/shadeform/chained-flow/src/chained_flow/defaults.py --sh)
 eval "$_CF_DEF"
+# The shortlist SHIPS IN THE PACKAGE now (src/chained_flow/data/shortlist_qwen3_5.pt,
+# 62642 ids, vocab-level so one file serves 4B/9B/27B). defaults.py still emits a
+# CF_SHORTLIST pointing at the pre-package out/flow/shortlist_q3527b.pt; its ids are
+# byte-identical, but exporting it means the benchmark exercises a path a pip user does
+# not have. Drop it and let the packaged default resolve.
+unset CF_SHORTLIST
+export CF_DEFAULTS_FROM_SHELL="${CF_DEFAULTS_FROM_SHELL#CF_SHORTLIST=*,}"
 
 if [ "$SIZE" = "4b" ]; then
   CF_MODEL=Qwen/Qwen3.5-4B

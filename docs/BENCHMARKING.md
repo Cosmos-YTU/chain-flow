@@ -6,7 +6,254 @@ and expensive to discover late.
 
 ---
 
-## 1. The async-scheduling trap (this one invalidated real, published-internally numbers)
+## 0. `vllm serve` compatibility. (Batch 1 is still the measurement of record.)
+
+> **Read first, if you are deploying:**
+> 1. **Do not serve the TREE arm above concurrency 1** — the engine core dies at concurrency 2
+>    (device assert) or hangs (with async off), at 4B and 27B alike.
+> 2. **Set `CF_TREE_GREEDY_GUARD=1` on any tree-mode server** — otherwise one `temperature>0`
+>    request kills it permanently, for every client.
+> 3. **At 4B, turn speculation off above ~4 concurrent requests** — the chain arm drops to
+>    0.90x/0.78x of the no-speculation baseline at concurrency 8/16. 27B never does.
+
+The published speedups and acceptance numbers are **batch-1 numbers**, taken through the
+offline `LLM()` API (`vllm/test_plugin_native.py`, which also forces
+`VLLM_ENABLE_V1_MULTIPROCESSING=0`), and that remains the measurement of record — sections 1–3
+below. This section is about something different: whether the same code is **correct and
+robust** under `vllm serve`, which is an engine core in its own process plus continuous
+batching. It is not, yet, in the ways listed above; the rest of this section is the evidence.
+
+The performance tables here are supporting context, not the headline. They are included
+because a flag that disengages under batching is only acceptable while the result stays
+*above* the no-speculation baseline, and at 4B it does not.
+
+| | `vllm/bench_cf.sh` | `vllm/bench_serve.sh` |
+|---|---|---|
+| entry point | offline `LLM()` | `vllm serve` + HTTP |
+| engine core | in-process (`VLLM_ENABLE_V1_MULTIPROCESSING=0`) | spawned subprocess |
+| batch | 1 | continuous, driven at concurrency 1/2/4/8/16 |
+| prompts | `bench_data/*.jsonl`, 7 domains | RedHat AI `speculator_benchmarks` subset, 7 domains × 10 |
+| acceptance from | the proposer object, in-process | the engine's `vllm:spec_decode_*` counters |
+| use it for | **a fast regression gate** (~3 min at 4B, one process) | **the number you quote** |
+
+Keep `bench_cf.sh`. It is the only harness that can read the proposer's own counters
+without a metrics round-trip, it is much faster, and batch 1 is a real deployment point
+(single-user, latency-bound). It is simply not *the* deployment point.
+
+```bash
+./vllm/bench_serve.sh 4b base 3 8601        # <size> <arm> <gpu> <port>
+./vllm/bench_serve.sh 4b chain 3 8602
+CF_SAMPLING_PROBE=1 ./vllm/bench_serve.sh 4b tree 3 8603
+./vllm/bench_serve_report.py                # the table, all runs
+./vllm/bench_serve_diff.py logs/bench_serve/4b_{base,chain}/serve_bench.json
+```
+
+Three things `bench_serve.sh` does that a naive serve script does not, each because
+getting it wrong produced a wrong answer here first:
+
+1. **It does not set `VLLM_ENABLE_V1_MULTIPROCESSING=0`.** Note that under `vllm serve`
+   that variable does not even do what its name suggests — the API server and the engine
+   core are separate processes either way (it gates the *offline* `LLMEngine`). Measuring
+   with it set measures a flag that is doing nothing, in a configuration nobody deploys.
+2. **It waits for a real request before reading the flag report.**
+   `FlowDrafterProposer._build()` is called lazily from the first `propose()`, so a server
+   that answers `/health` has *not yet resolved a single drafter flag*. Grepping a freshly
+   started log finds only the API server's copy of the `[cf-defaults]` line — printed at
+   import, in a process with no drafter in it — which states the *proposals* and cannot
+   state the outcome. `bench_serve.sh` sends one completion, then greps the
+   `(EngineCore pid=…)` copy, and refuses to benchmark if it is absent.
+3. **It keeps every completion** so `bench_serve_diff.py` can gate on the arms having
+   produced identical text before their throughputs are compared.
+
+### The `[cf-defaults]` line is a build-time statement. It cannot report a batch gate.
+
+Every gate in `chained_flow/defaults.py` is evaluated once, against the drafter and the
+engine config, *before any request exists*. So the line says `cuda_block(D=640 …)` for the
+whole life of a server on which the fused kernel runs on a minority of steps. Set
+**`CF_BATCH_AUDIT=1`** (default off) for the per-step answer: it prints a histogram of the
+decode batch and of the draft cudagraph bucket, and states outright what fraction of steps
+could have run the batch-1-only kernel.
+
+### What actually disengages above batch 1
+
+Everything here is reported ON by the startup line in every case. Nothing below is a bug;
+they are deliberate batch-1 specialisations that the flag report has no vocabulary for.
+
+| flag | still on at batch > 1? | why not |
+|---|---|---|
+| `CF_CUDA_BLOCK` | **no, from B ≥ 2** | `chunked_flow._cf_fused_runner` requires `x.shape[0] == 1`; the drafter's `x.shape[0]` is the cudagraph *bucket*, so only bucket 1 qualifies. Falls back to the bit-identical PyTorch block stack. |
+| `CF_CUDA_PAIR` | **no, from B ≥ 2** | rides on `CF_CUDA_BLOCK`. |
+| `CF_GDN_DEFER` / `CF_GDN_BV` | **no, from B ≥ 2** (tree) | `tree_gdn.defer_rows(T)` caps at `CF_GDN_DEFER_MAXROWS` = 64 rows. An 8×5 tree is 41 rows per request, so B = 1 fits and B = 2 (82 rows) does not. The cap is a *memory* decision — a deferred stash pins that layer's k/v inside the cudagraph pool — not a correctness one. |
+| draft cudagraph | degrades, then off above 32 | buckets are `[1,2,4,8,16,32]`; B = 5 replays the bucket-8 graph, i.e. three whole drafts on padding rows. Above 32 there is no bucket and the draft runs eager. |
+| `CF_DRAFT_EARLY` (side-stream prelaunch) | intermittent | the steady-state guard requires every input-batch slot to hold the *same request as last step*, which continuous batching breaks whenever a request joins or leaves. It is also tree-only: in chain mode `_prelaunch` returns immediately and the flag's remaining job is publishing the GPU counts for `CF_ASYNC_SPEC`. |
+| `CF_TREE_FUSED_ATTN` | yes | its `N < 128` limit is the per-request tree width, not the batch. |
+| `CF_TREE_FULLCG` | yes | a uniform multi-request decode still dispatches FULL. |
+| `CF_SHORTLIST`, `CF_COMPILE`, `CF_TWOPASS_M`, `CF_PATH_TRIM`, `CF_FUSE_PATH`, `CF_RING_TRIM`, `CF_ASYNC_SPEC` | yes | batch-agnostic. |
+
+### The first request at a new batch size stalls the engine
+
+`CF_COMPILE` compiles the flow net with `max-autotune-no-cudagraphs`, and the draft
+cudagraph is captured lazily per bucket. Both happen **inside the serving loop**, the first
+time a bucket is reached. Measured at 4B chain, from the engine's own step log: a **70–80 s
+stall on the first step at each of buckets 2, 4, 8 and 16** (32–36 inductor autotune blocks
+each). A benchmark must warm up *at the concurrency it is about to measure* or it charges
+that stall to steady-state throughput — `bench_serve_drive.py` warms up with `3 × concurrency`
+requests for exactly this reason, and got it wrong once (4B chain c=16 read 175.9 tok/s and a
+20.0 s mean TTFT against 826 tok/s at c=8, purely from the un-warmed bucket-16 capture).
+
+For a deployment the fix is to capture every bucket at startup rather than on demand; that
+is not implemented.
+
+### Measured, 2026-08-05 — the speedup is a batch-1 speedup
+
+4B on one RTX PRO 6000, `--async-scheduling` on every arm, `--max-num-seqs 64`, 70 prompts ×
+256 tokens with `ignore_eos`, server-side tok/s. `bench_serve.sh` at concurrency 1 reproduces
+the offline batch-1 references (base 139.0 vs 140.0, chain 165.3 vs 157.8, tree 187.5 vs
+188.9), so the two harnesses agree where they overlap.
+
+**4B**
+
+| conc | base | chain | vs base | accept | tree | vs base | accept |
+|---|---|---|---|---|---|---|---|
+| 1 | 139.0 | 165.3 | **1.19x** | 1.855 | 187.5 | **1.35x** | 2.395 |
+| 2 | 256.8 | 273.4 | **1.06x** | 1.854 | *engine crash* | | |
+| 4 | 485.6 | 494.5 | **1.02x** | 1.861 | *engine crash* | | |
+| 8 | 929.6 | 836.0 | **0.90x** | 1.855 | *engine crash* | | |
+| 16 | 1565.7 | 1213.8 | **0.78x** | 1.858 | *engine crash* | | |
+
+**27B** — the same shape, but it never goes under water, because a 27B target forward at batch
+16 is still bandwidth-bound per token and a 4B one is not:
+
+| conc | base | chain | vs base | accept | tree | vs base | accept |
+|---|---|---|---|---|---|---|---|
+| 1 | 26.3 | 42.6 | **1.62x** | 1.953 | 48.3 | **1.84x** | 2.485 |
+| 2 | 51.0 | 78.3 | **1.54x** | 1.949 | *engine crash* | | |
+| 4 | 97.4 | 142.6 | **1.46x** | 1.955 | *engine crash* | | |
+| 8 | 193.2 | 245.1 | **1.27x** | 1.955 | *engine crash* | | |
+| 16 | 327.5 | 381.3 | **1.16x** | 1.947 | *engine crash* | | |
+
+**The 4B chain arm goes BELOW the no-speculation baseline at concurrency ≥ 8** (0.90x, 0.78x).
+That is the disengagement biting: the drafter still costs a full draft per step while its
+batch-1 kernel is gone and the target forward has stopped being the bottleneck. A 4B server
+expecting more than ~4 concurrent requests is faster with speculation turned **off**. 27B is
+never in that regime on this hardware.
+
+**Acceptance does not move** (1.854–1.861 across the whole ladder). The entire collapse is
+draft *cost*, and roughly half of it is one flag. The A/B, same server config, `CF_CUDA_BLOCK`
+the only variable:
+
+| 4B chain | `CF_CUDA_BLOCK=1` | `CF_CUDA_BLOCK=0` | kernel worth |
+|---|---|---|---|
+| concurrency 1 | 165.3 | 149.3 | **+10.7%** |
+| concurrency 4 | 494.5 | 495.7 | **+0.0%** |
+
+That is the disengagement measured rather than read off the source: at concurrency 4 turning
+the kernel *off* costs nothing, because the `x.shape[0] == 1` gate had already turned it off.
+The rest of the collapse is structural and not ours to fix — a speculative step verifies
+`(K+1) × B` tokens, so as `B` grows the target forward stops being bandwidth-bound per token
+and the thing speculation exploits goes away.
+
+**The tree arm does not survive concurrency ≥ 2 under `vllm serve`,** in either scheduling
+mode. Bisected on 4B:
+
+| tree config at concurrency 2 | result |
+|---|---|
+| default (`CF_ASYNC_SPEC=1`, `--async-scheduling`) | device assert `indexSelectSmallIndex: srcIndex < srcSelectDimSize` → `EngineDeadError`, server gone |
+| `CF_CUDAGRAPH=0` (no draft cudagraph) | **same assert** — so it is not the captured graph, it is the index math |
+| `CF_ASYNC_SPEC=0` + no `--async-scheduling` | **hangs**: `Running: 1 reqs`, 0 tok/s, engine idle at 12% CPU with the bucket-2 graph already captured |
+
+**Reproduced identically at 27B** (same assert, same concurrency), so it is the tree serve path
+and not a size-specific shape.
+
+Batch > 1 *was* verified before — **offline**, with a static batch that starts and finishes
+together. Continuous batching adds what that never exercised: requests joining and leaving
+mid-flight, `InputBatch.condense()` re-mapping rows, slot migration. **Do not serve the tree
+arm above concurrency 1.** The chain arm is unaffected and was driven to concurrency 16 at
+both sizes without an error.
+
+Note the two spec flags are coupled and cannot be varied independently on the fork: with
+`CF_ASYNC_SPEC=0` the fork's `config/vllm.py` refuses `--async-scheduling` for `custom_class`
+outright, so a spec arm must turn both off together (`CF_NO_ASYNC_SCHED=1` in `bench_serve.sh`).
+
+### Correctness under concurrency — and why a token diff cannot be a pass/fail gate here
+
+**vLLM is not batch-invariant.** The BASE arm, with no speculation anywhere, agrees with its own
+concurrency-1 run on only 60/70 sequences at concurrency 16 (4B) and 62/70 (27B) — 256-token
+greedy generations, same prompts, same server. This is the fp16-tie hazard of section 3, and
+continuous batching multiplies it, because the batch a request is decoded in changes the
+kernels it goes through.
+
+So the honest test is a *rate against a null*, and the null is the base arm against itself:
+
+| | chain vs base, per concurrency | null (base vs base across concurrency) |
+|---|---|---|
+| 4B  | 10.0 – 17.1% of sequences differ | 7.1 – 14.3% |
+| 27B | 10.0 – 14.3% | 5.7 – 15.7% |
+
+**The chain arm is inside the null band at every concurrency at both sizes** — there is no
+evidence of a losslessness failure under continuous batching, and equally, a token diff at
+n=70 could not have detected a small one. `bench_serve_diff.py --null <rate>` implements
+exactly this comparison; without `--null` it reports and refuses to judge.
+
+`InputBatch.condense()` — the slot-identity hazard — is handled: the proposer keys the ring on
+`req_id` STRINGS, distinguishes migration (move the history) from recycle (reset it), snapshots
+before moving because two requests can swap slots in one `condense()`, and prunes `_req_slot`
+and `ctx_hist` against the live set every step. No leak found on the default path. (The
+`CF_ORACLE` diagnostic dicts are keyed by `req_id` and never pruned — diagnostics only, off by
+default, but do not leave it on in a long-running server.)
+
+### Sampled (`temperature > 0`) requests
+
+- **chain: fine.** Verified against a live 4B server: a sampled request alone, a sampled
+  request sharing the batch with a greedy one, and the server afterwards — all 200 OK, health
+  green throughout. Chain mode never consults `SamplingMetadata`; vLLM's own rejection
+  sampler handles the sampled case.
+- **tree: ONE sampled request kills the server, permanently.** Measured against a live 4B
+  tree server: greedy request 200 OK → one `temperature=0.8` request → **500**, `/health`
+  **503**, and every subsequent *greedy* request 500 forever. The engine log carries our
+  intended message —
+
+  > `RuntimeError: chained-flow tree mode requires greedy sampling (temperature=0, no
+  > logprobs, no penalties)… Run with VLLM_SPEC_TREE=0…`
+
+  — but "fail fast with an actionable message" was designed for the offline `LLM()` path,
+  where the exception reaches the caller. Under `vllm serve` it is raised inside the engine
+  core's step loop, so it becomes `EngineDeadError` and takes the process down. **Any client
+  that sends `temperature > 0` to a tree-mode server denies service to every other client.**
+  A tree-mode server is therefore only deployable behind something that rejects non-greedy
+  requests before they reach vLLM.
+
+  `CF_NONGREEDY_CHAIN=1` opts into a per-step chain fallback that is **still shape-broken**
+  (fixed-shape ring of `keep*depth+1` vs a chain of `draft_length`). Note `all_greedy` is a
+  property of the whole batch, so under continuous batching *one* sampled request makes the
+  step non-greedy for every request sharing it.
+
+#### `CF_TREE_GREEDY_GUARD=1` — the mitigation (default OFF)
+
+`chained_flow/vllm_plugin/greedy_guard.py`, installed from the existing `vllm.general_plugins`
+entry point. In **tree mode only**, it wraps `AsyncLLM.add_request` — the single funnel every
+serving front end goes through — and raises `ValueError` for a request whose `SamplingParams`
+would fail the tree's preconditions. That happens **in the API-server process**, so the engine
+core never sees it and vLLM maps it to a 4xx. Verified on a live 4B tree server:
+
+| probe step | guard OFF (today's default) | guard ON |
+|---|---|---|
+| greedy request | 200 | 200 |
+| **one `temperature=0.8` request** | **500 `EngineDeadError`** | **400, message says what to change** |
+| `GET /health` after | **503** | **200** |
+| greedy request after | **500** | **200** |
+| greedy *batched with* a sampled one | **500** | **200** (the greedy one is served) |
+| `GET /health` at the end | **503** | **200** |
+
+Why reject rather than degrade to no-speculation for that request: "emit no draft" is
+expressible on the synchronous path (return empty lists) but **not** under `CF_ASYNC_SPEC`,
+which owes vLLM a `[num_reqs, draft_width]` GPU tensor — a short or absent draft there scatters
+the previous step's tokens into `input_ids` silently, which is worse than an error. Making the
+draft width dynamic is real surgery on the ring, the capture buckets and the tree hand-off.
+Until that exists, refusing the request is the honest behaviour. It does **not** make tree mode
+support sampling; it stops one client from taking the server away from everyone else.
+
+
 
 **vLLM gives the base arm an engine feature that the speculative arm structurally
 cannot have.** Unless you correct for it, every speedup you report is understated.

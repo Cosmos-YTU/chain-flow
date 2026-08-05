@@ -196,11 +196,15 @@ def main():
                 rep = tag.rsplit("_r", 1)[1]
                 acc = rec.get("accept")
                 accs = f"{acc['mean_accept_len']:.3f}" if acc else "-"
+                def f(v, w=11, p=2):
+                    return f"{v:<{w}.{p}f}" if isinstance(v, (int, float)) else f"{'-':<{w}}"
+
                 print(f"{arm:6s} {rep:4s} {rec['n_req']:<5d} {rec['out_tokens']:<8.0f} "
-                      f"{rec['duration']:<7.1f} {rec['pooled_tps']:<11.2f} "
-                      f"{rec['decode_tps']:<11.2f} {rec['gl_output_tps']:<11.2f} "
-                      f"{rec['ttft_ms']:<8.1f} {accs:7s}")
-                base_vals.setdefault(arm, []).append(rec)
+                      f"{rec['duration']:<7.1f} {f(rec['pooled_tps'])} "
+                      f"{f(rec['decode_tps'])} {f(rec['gl_output_tps'])} "
+                      f"{f(rec['ttft_ms'], 8, 1)} {accs:7s}")
+                if rec["n_req"] and rec["pooled_tps"] and rec["decode_tps"]:
+                    base_vals.setdefault(arm, []).append(rec)
         # speedups + spread
         if "base" in base_vals:
             def mean(a, k):
@@ -240,6 +244,50 @@ def main():
             diff = [a for a in common if bout[a] != aout[a]]
             print(f"  {cfg:24s} {arm:5s}: {len(common)-len(diff)}/{len(common)} identical"
                   + (f"  DIFFERING: {len(diff)}" if diff else ""))
+
+    per_domain(args.root, args.size, "fixed256_synchronous_r1")
+
+
+def per_domain(root, size, cfg):
+    """Pooled tok/s per dataset FILE, so the aggregation choice is visible.
+
+    The seven files are separate benchmarks in the RedHat harness and are never pooled by
+    it; our own sweep pools them. The two give different speedups because the domains have
+    very different accept rates, so this prints both.
+    """
+    import collections
+    dom = {}
+    for line in open(f"{root}/data/subset_fixed256.jsonl"):
+        r = json.loads(line)
+        dom[r["prompt"]] = r["domain"]
+
+    print(f"\n=== {size} per-domain pooled tok/s [{cfg}] "
+          f"(sum output tokens / sum request latency, prefill INCLUDED) ===")
+    rows = {}
+    for arm in ("base", "chain", "tree"):
+        f = pathlib.Path(root) / f"{size}_{arm}" / f"gl_{cfg}.json"
+        if not f.exists():
+            continue
+        b = json.loads(f.read_text())["benchmarks"][0]
+        agg = collections.defaultdict(lambda: [0.0, 0.0])
+        for r in b["requests"]["successful"]:
+            p = json.loads(r["request_args"])["body"]["messages"][0]["content"][0]["text"]
+            d = dom.get(p, "?")
+            agg[d][0] += r["output_tokens"]
+            agg[d][1] += r["request_latency"]
+        rows[arm] = {k: v[0] / v[1] for k, v in agg.items() if v[1]}
+    if not rows:
+        return
+    doms = sorted(set().union(*[set(v) for v in rows.values()]))
+    print(f"{'domain':16s} " + " ".join(f"{a:>9s}" for a in rows)
+          + "   " + " ".join(f"{a+'/base':>11s}" for a in rows if a != "base"))
+    for d in doms:
+        line = f"{d:16s} " + " ".join(f"{rows[a].get(d, float('nan')):9.1f}" for a in rows)
+        if "base" in rows and rows["base"].get(d):
+            line += "   " + " ".join(
+                f"{rows[a].get(d, float('nan'))/rows['base'][d]:11.3f}"
+                for a in rows if a != "base")
+        print(line)
 
 
 if __name__ == "__main__":

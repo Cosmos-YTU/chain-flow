@@ -171,6 +171,20 @@ RETIRED: dict[str, str] = {
     "CF_COMPILE_BEAM": "inductor AOT pass fails under inference_mode; the beam is not the cost",
 }
 
+# DEPLOYMENT POLICY, not a capability gate.  Everything in DRAFTER/TREE above is "can this run
+# here, and is it worth it"; these are choices about REQUEST HANDLING that only a deployment can
+# make, so they are never defaulted on -- but a serve operator has to know they exist, which is
+# why they are printed rather than left to the source.
+POLICY: dict[str, str] = {
+    "CF_TREE_GREEDY_GUARD":
+        "OFF by default. In TREE mode, ONE temperature>0 request raises inside the engine core's "
+        "step loop and kills the server FOR EVERY CLIENT, permanently (measured under `vllm "
+        "serve`: 500, then /health 503 and every later greedy request 500). Set to 1 and the API "
+        "server rejects such requests with a 4xx instead, leaving the engine untouched. Chain "
+        "mode does not need it -- it serves sampled requests correctly. "
+        "See chained_flow/vllm_plugin/greedy_guard.py.",
+}
+
 
 # ------------------------------------------------------------------ capability probes
 
@@ -791,5 +805,7 @@ if __name__ == "__main__":
         fk = fork()
         print(f"[cf-defaults] fork: present={fk['present']} root={fk['root']} "
               f"missing={fk['missing']}")
+        for f, why in POLICY.items():
+            print(f"[cf-defaults] POLICY {f}={os.environ.get(f, '0')}: {why}")
         for f, why in RETIRED.items():
             print(f"[cf-defaults] RETIRED {f}: {why}")

@@ -486,6 +486,20 @@ class FlowDrafterProposer:
         self._ones_b = None
         self._pre_n = 0
         self._pre_skip = 0
+        # CF_BATCH_AUDIT (DEFAULT OFF): per-step tally of the DECODE BATCH the drafter actually
+        # ran at.  The `[cf-defaults]` line is a BUILD-TIME statement -- it is printed once,
+        # before a single request has arrived, and it cannot express a flag that is gated on the
+        # batch of an individual step.  Two of ours are:
+        #   * the fused block kernel (`chunked_flow._cf_fused_runner`) engages only for
+        #     `x.shape[0] == 1`, and the drafter's x.shape[0] is exactly the cudagraph BUCKET
+        #     below -- so `bucket==1` steps ran the CUDA kernel and every other step silently
+        #     ran the PyTorch stack.  CF_CUDA_PAIR rides on it and disengages with it.
+        #   * a bucket of `None` (batch > 32) means the draft cudagraph was skipped entirely.
+        # So this histogram is the per-REQUEST answer that the startup banner cannot give.
+        # Host-side dict arithmetic once per step, no sync, no GPU work; still default off
+        # because a benchmark should not pay for its own instrumentation unasked.
+        self._audit = os.environ.get("CF_BATCH_AUDIT", "0") == "1"
+        self._audit_t = {"steps": 0, "bucket": {}, "B": {}, "nocg": 0, "pre_hit": 0}
         # CF_ASYNC_SPEC (default OFF): become GPU-token-native so vLLM's async scheduling
         # can be enabled for this proposer.  See `_install_async_hooks`.  Requires the
         # `_sample` hook, so it implies CF_DRAFT_EARLY.
@@ -1301,11 +1315,36 @@ class FlowDrafterProposer:
         for k, v in agg.most_common(14):
             print(f"[cf-draftprof]   {v:8.1f} us  x{cnt[k]:5.1f}  {k[:70]}", flush=True)
 
+    def _audit_step(self, bucket: int, B: int) -> None:
+        """CF_BATCH_AUDIT: record the batch this step's draft actually ran at, and say what
+        that implies for the batch-1-gated flags.  Printed periodically because a server has
+        no exit to report at."""
+        t = self._audit_t
+        t["steps"] += 1
+        t["bucket"][bucket] = t["bucket"].get(bucket, 0) + 1
+        t["B"][B] = t["B"].get(B, 0) + 1
+        if bucket not in self._buckets:
+            t["nocg"] += 1
+        if t["steps"] % 500:
+            return
+        n = t["steps"]
+        fused = t["bucket"].get(1, 0)
+        print(f"[cf-batch-audit] steps={n} | decode batch B hist "
+              f"{dict(sorted(t['B'].items()))} | draft cudagraph bucket hist "
+              f"{dict(sorted(t['bucket'].items()))} | fused block kernel (needs bucket==1) ran "
+              f"on {fused}/{n} = {100.0 * fused / n:.1f}% of steps -- the rest fell back to the "
+              f"PyTorch block stack | no-cudagraph steps (B>32) {t['nocg']} | "
+              f"CF_DRAFT_EARLY prelaunch: {t['pre_hit']} of {n} steps took the side-stream "
+              f"fast path (guard bail-outs are steps where a request joined/left the batch)",
+              flush=True)
+
     def _draft_from_ring(self, rows_g, k0_g):
         return self._draft_fn(self._ring_gather(rows_g), k0_g)
 
     def _ring_cg(self, rows_g, k0_g, B):
         bucket = rows_g.shape[0]
+        if self._audit:
+            self._audit_step(bucket, B)
         if not self.use_cg or bucket not in self._buckets:
             return self._draft_from_ring(rows_g, k0_g)[:B]
         if bucket not in self._cg:
@@ -1629,7 +1668,11 @@ class FlowDrafterProposer:
                         "logprobs, no penalties). Got non-greedy sampling params. Run with "
                         "VLLM_SPEC_TREE=0 (chain mode, 1.61x vs the tree's 1.68x at 27B) for "
                         "sampled decoding, or CF_NONGREEDY_CHAIN=1 to try the experimental "
-                        "per-step chain fallback (currently shape-incompatible).")
+                        "per-step chain fallback (currently shape-incompatible). "
+                        "UNDER `vllm serve` THIS RAISE KILLS THE ENGINE CORE for every client, "
+                        "permanently -- it was designed for the offline LLM() path, where it "
+                        "reaches the caller. Set CF_TREE_GREEDY_GUARD=1 to have the API server "
+                        "reject such requests with a 4xx before they ever get here.")
             else:
                 # _ring_cg drives self._draft_fn, which is _beam_chains in chain mode and
                 # _beam_tree in tree mode -- correct for BOTH. Only the non-greedy-with-branching
@@ -1945,6 +1988,13 @@ class FlowDrafterProposer:
                                           device=self.dev)
             self._ring_write(sh, rows_g[:nreq], starts_g, cnt_g, self._ones_b[:nreq],
                              ts.accepted_path, self._wmax())
+            if self._audit:
+                # The prelaunch fast path replays the graph HERE and `propose()` then consumes
+                # `self._pre` without ever reaching `_ring_cg`, so the audit has to count this
+                # step itself or the histogram silently omits every steady-state tree step --
+                # i.e. exactly the steps the report is about.
+                self._audit_step(bucket, nreq)
+                self._audit_t["pre_hit"] += 1
             self._cg[bucket][0].replay()
             out = self._cg[bucket][3][:nreq]
             if self.async_spec:

@@ -76,15 +76,36 @@ run_one() {  # cfg profile rate repeat body [maxreq]
 }
 
 # Warm the server (compile + cudagraph capture) so repeat 1 is not the warmup.
+# BOTH profiles must be warmed. CF_COMPILE defaults on with mode=max-autotune-no-cudagraphs,
+# so the flow net re-autotunes for every new batch shape: a batch-1 warmup leaves the
+# concurrency-64 run paying minutes of Triton autotuning inside the measured window, which
+# the base arm (no drafter to compile) never pays. That asymmetry is a fake regression.
 echo "[specbench] warmup"
 run_one fixed256 synchronous "" 0 '{"temperature":0}'
 
 for rep in $(seq 1 "$REPEATS"); do
   # PRIMARY: greedy, exactly 256 output tokens per request (ignore_eos), batch 1.
+  [ "${SPECBENCH_ONLY:-}" = "eos" ] || \
   run_one fixed256 synchronous "" "$rep" '{"temperature":0}'
-  # PRIMARY: same but server-saturated, max_num_seqs=64.
-  run_one fixed256 throughput 64 "$rep" '{"temperature":0}'
+  # NO concurrency-64 arm. It does not measure inference for the spec arms: CF_COMPILE=1
+  # (mode=max-autotune-no-cudagraphs, a capability-gated default) re-autotunes the flow net
+  # for EVERY new batch shape, and a throughput run walks every shape from 64 down to 1 as
+  # requests retire. Measured at 4B/chain: 850 AUTOTUNE events and 9.2 tok/s generation with
+  # 51 requests resident, against 3099 tok/s for base -- a compile storm, not a throughput
+  # number. Warming it honestly means warming all 64 shapes. Batch 1 is the regime this
+  # project's numbers describe, so that is what is reported.
   # HARNESS-AS-SHIPPED: temp 0.6 / top_p 0.95 / top_k 20, generate to EOS.
+  # NOT RUNNABLE ON THE TREE ARM. flow_proposer.py:1666 raises
+  #   "chained-flow tree mode requires greedy sampling (temperature=0, no logprobs,
+  #    no penalties)"
+  # and it raises inside propose(), i.e. inside the EngineCore step -- so the request does
+  # not fail, the ENGINE dies (EngineDeadError) and every later benchmark against that
+  # server fails to connect. The RedHat harness ships temperature=0.6/top_p=0.95/top_k=20,
+  # so the tree arm cannot run the benchmark's default sampling at all.
+  if [ "$ARM" = "tree" ]; then
+    echo "[specbench] SKIP eos config on tree arm (requires greedy; non-greedy kills EngineCore)"
+    continue
+  fi
   # Qwen3.5 is a reasoning model, so "to EOS" means a median ~1160 and p95 ~8100
   # output tokens per request; SPECBENCH_EOS_MAXREQ trims the request count at the
   # larger sizes. The subset is round-robin interleaved, so a prefix stays balanced.

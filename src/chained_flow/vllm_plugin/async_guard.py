@@ -119,6 +119,17 @@ def register() -> None:
     """
     global RELAXED, REASON
 
+    # Independent of everything below, and deliberately FIRST so it is installed even when the
+    # async relaxation is not wanted: CF_TREE_GREEDY_GUARD stops one temperature>0 request from
+    # killing a tree-mode server (measured: EngineDeadError, /health 503, permanent). Default
+    # OFF, tree-only, and it cannot raise -- see greedy_guard.install().
+    try:
+        from chained_flow.vllm_plugin import greedy_guard
+
+        greedy_guard.install()
+    except Exception as e:                                  # noqa: BLE001 - advisory only
+        print(f"[cf-plugin] greedy guard not installed ({e!r})", flush=True)
+
     if _truthy(os.environ.get(_DISABLE)):
         REASON = f"{_DISABLE} is set"
         return
