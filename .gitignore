@@ -1,25 +1,73 @@
-# ---- large artefacts: regenerable or huge ----
+# NOTE ON SYNTAX: git does NOT support trailing inline comments. `out/   # checkpoints` is a
+# pattern whose literal text includes the spaces and the `#`, so it matches nothing. Four rules
+# here were written that way and silently ignored ~1.1 TB of nothing; `git add -A` would have
+# staged data/ + teacher_states/ + out/ in full. Comments go on their OWN line. Verify any change
+# with: git check-ignore -v <path>
+
+# ---- environments ----
 .venv/
 vllm/.venv/
-out/                    # trained checkpoints (published on HF)
-data/                   # preprocessed flow caches
-teacher_states/         # collected teacher hidden states
-bench_data/*.arrow
 
-# ---- logs: keep the pipeline .sh, drop the multi-MB run logs ----
-logs/*.log
+# ---- large artefacts: regenerable or huge ----
+# trained checkpoints (published on HF), 128G
+out/
+# preprocessed flow caches, 374G
+data/
+# collected teacher hidden states, 631G
+teacher_states/
+# benchmark prompt sets: third-party eval data, kept out of the repo
+bench_data/
+
+# ---- logs: keep the pipeline .sh drivers, drop everything else ----
+# An allow-list, because the deny-list version kept losing: `logs/*.log` is non-recursive and
+# missed logs/async/ and logs/tfa/, and neither covered the 46 empty *_DONE.flag sentinels.
+# The ONLY thing in logs/ that belongs in git is the top-level run drivers.
+logs/*
+!logs/*.sh
 scripts/viz/*.log
 vllm/*.log
 *.out
 
-# ---- misc bulk ----
-scripts/viz/media/      # rendered animation frames (34M)
-newback.zip
+# ---- rendered media ----
+# manim/animation output
+media/
+scripts/viz/media/
+*.mp4
+*.zip
+
+# ---- scratch / session dumps ----
 newback/
 session_*_events.json
+interm.html
+ar5iv_*.html
+untitled.txt
+strip.py
 tmp/
+.claude/
+*.orig
+
+# ---- python ----
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+.uv-cache/
+
+# ---- model weights: never in git ----
 *.pt
 *.safetensors
-.ipynb_checkpoints/
+*.bin
+*.arrow
+
+# ---- stale vendored copies of upstream vLLM (Apache-2.0) ----
+# The tree fork ships as patches/vllm-0.25.1-chained-flow-tree.patch, generated from the
+# installed wheel. These _backup/_preopt trees are snapshots of intermediate states, are
+# documented as STALE, and put ~1.8 MB of upstream source in the repo with no NOTICE.
+vllm/_vllm_backup/
+vllm/_vllm_preopt/
+vllm/_vllm_preopt2/
+vllm/_cf_backup/

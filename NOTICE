@@ -1,0 +1,27 @@
+chained-flow
+Copyright 2026 Selim Aktas
+
+This product includes software developed as a derivative of vLLM
+(https://github.com/vllm-project/vllm), Copyright the vLLM Team, licensed under
+the Apache License, Version 2.0.
+
+Specifically, patches/vllm-0.25.1-chained-flow-tree.patch is a diff against vLLM
+0.25.1 source files and, when applied, modifies:
+
+  vllm/config/vllm.py
+  vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+  vllm/v1/attention/backends/flash_attn.py
+  vllm/v1/sample/rejection_sampler.py
+  vllm/v1/spec_decode/metadata.py
+  vllm/v1/worker/gpu_model_runner.py
+
+and adds:
+
+  vllm/v1/spec_decode/tree_state.py
+  vllm/v1/spec_decode/tree_gdn.py
+  vllm/v1/spec_decode/tree_gdn_verify.py
+  vllm/v1/spec_decode/tree_gdn_factor.py
+  vllm/v1/spec_decode/tree_attn_fused.py
+
+The patch is OPTIONAL and is required only for the branching-tree verify path.
+The default install does not modify vLLM in any way.

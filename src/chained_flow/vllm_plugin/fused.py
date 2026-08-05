@@ -22,12 +22,17 @@ def fuse_path_head(drafter) -> None:
     b = torch.stack([ph.offset_proj[j].bias for j in range(order)], 0).contiguous()    # [o, D]
     drafter._fused_W, drafter._fused_b = W, b
 
-    def _residual_fused(self, lastp: torch.Tensor) -> torch.Tensor:
+    def _residual_fused(self, lastp: torch.Tensor, nlive: int | None = None) -> torch.Tensor:
+        # `nlive` trims the batched GEMM to the offsets that can actually have an ancestor at this
+        # depth (see TreeFlowDrafter._residual_from_lastp) -- the rest are masked to zero anyway,
+        # so this is bit-exact and saves (order - nlive) x D x D of weight traffic per depth.
+        o = order if nlive is None else min(nlive, order)
+        lastp = lastp[:, :o]
         mask = (lastp >= 0).to(self._dtype)                       # [N, o]
         emb = self._embed(lastp.clamp_min(0))                     # [N, o, D]
-        # [o, N, D] @ [o, D, D]^T -> [o, N, D]   (single batched GEMM over the 8 offsets)
-        t = torch.baddbmm(self._fused_b.unsqueeze(1), emb.transpose(0, 1),
-                          self._fused_W.transpose(1, 2))
+        # [o, N, D] @ [o, D, D]^T -> [o, N, D]   (single batched GEMM over the live offsets)
+        t = torch.baddbmm(self._fused_b[:o].unsqueeze(1), emb.transpose(0, 1),
+                          self._fused_W[:o].transpose(1, 2))
         h = (t * mask.transpose(0, 1).unsqueeze(-1)).sum(0)        # [N, D]
         return self.path_head.mlp(self.path_head.norm(h))
 

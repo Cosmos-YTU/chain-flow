@@ -132,6 +132,8 @@ def install() -> None:
 
     _wrap(GPUModelRunner, "execute_model", "1.execute_model")
     _wrap(GPUModelRunner, "_prepare_inputs", "1a._prepare_inputs")
+    _wrap(GPUModelRunner, "_update_states", "1a0._update_states")
+    _wrap(GPUModelRunner, "_prepare_input_ids", "1a2._prepare_input_ids")
     _wrap(GPUModelRunner, "_model_forward", "1b._model_forward")
     _wrap(GPUModelRunner, "sample_tokens", "2.sample_tokens")
     _wrap(GPUModelRunner, "_sample", "2a._sample")

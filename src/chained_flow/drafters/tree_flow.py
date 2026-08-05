@@ -160,18 +160,68 @@ class TreeFlowDrafter(nn.Module):
         steps = torch.arange(1, k + 1, device=context.device, dtype=self._dtype)
         return last + steps.view(1, k, 1) * delta
 
-    def flow_velocity(self, z_tau, tau, context, previous=None, anchor=None) -> torch.Tensor:
-        vels = []
-        for ci, expert in enumerate(self._chunk_experts()):
+    def _chunk_args(self, z_tau, previous):
+        """(chunk_start, previous_hidden, current_h_tau) per chunk.  Note that `previous_hidden`
+        is sliced from z_tau (or the caller's `previous`) -- an INPUT to this Euler step -- never
+        from another chunk's output, which is why the chunks can run concurrently."""
+        out = []
+        for ci in range(len(self._chunk_experts())):
             start = ci * self.config.chunk_size
-            end = start + self.config.chunk_size
             prev = (previous if previous is not None else z_tau)[:, :start, :]
             if previous is not None and self.config.detach_previous_chunks:
                 prev = prev.detach()
+            out.append((start, prev, z_tau[:, start : start + self.config.chunk_size, :]))
+        return out
+
+    def flow_velocity(self, z_tau, tau, context, previous=None, anchor=None) -> torch.Tensor:
+        experts = self._chunk_experts()
+        args = self._chunk_args(z_tau, previous)
+        # CF_CUDA_PAIR: the chunks are independent (see cuda_block.run_pair), so issue both
+        # block stacks CONCURRENTLY on two streams instead of one after the other.  Off by
+        # default; falls back to the serial loop for any shape the fused kernel cannot take.
+        paired = None if self._cf_pair_off else self._cf_pair(experts, args, context, tau, anchor)
+        if paired is not None:
+            return paired
+        vels = []
+        for expert, (start, prev, cur) in zip(experts, args):
             vels.append(expert(context_hidden=context, previous_hidden=prev,
-                               current_h_tau=z_tau[:, start:end, :], tau=tau, chunk_start=start,
+                               current_h_tau=cur, tau=tau, chunk_start=start,
                                anchor=anchor))
         return torch.cat(vels, dim=1)
+
+    @property
+    def _cf_pair_off(self) -> bool:
+        """Resolved ONCE, like HiddenKVFlowExpert._cf_fused_off: a local import plus env lookups
+        inside this torch.compile'd region graph-breaks on every call."""
+        off = self.__dict__.get("_cf_pair_off_cached")
+        if off is None:
+            from chained_flow import cuda_block
+            off = not (cuda_block.enabled() and cuda_block.pair_enabled())
+            self.__dict__["_cf_pair_off_cached"] = off
+        return off
+
+    def _cf_pair(self, experts, args, context, tau, anchor):
+        """Both chunks' block stacks on two streams, or None to fall back to the serial loop."""
+        from chained_flow import cuda_block
+
+        if len(experts) != 2:
+            return None
+        pre = [ex.pre_blocks(context_hidden=context, previous_hidden=prev, current_h_tau=cur,
+                             tau=tau, chunk_start=start, anchor=anchor)
+               for ex, (start, prev, cur) in zip(experts, args)]
+        fbs = [ex._cf_fused_runner(x, context) for ex, (x, _, _) in zip(experts, pre)]
+        if any(fb is None for fb in fbs):
+            return None
+        Ss = [x.shape[1] for x, _, _ in pre]
+        grids = cuda_block.pair_grids(fbs, Ss, context.shape[1])
+        if grids is None:
+            return None
+        # Dynamo must not trace into the extension (inference-mode version counters) -- same
+        # reason as the single-expert path in HiddenKVFlowExpert.forward.
+        outs = torch._dynamo.disable(cuda_block.run_pair)(
+            fbs, [x for x, _, _ in pre], context, [m for _, m, _ in pre], grids)
+        return torch.cat([ex.post_blocks(o, cl) for ex, o, (_, _, cl) in zip(experts, outs, pre)],
+                         dim=1)
 
     def integrate(self, context: torch.Tensor, z0: torch.Tensor, anchor=None) -> torch.Tensor:
         z = z0
@@ -378,14 +428,20 @@ class TreeFlowDrafter(nn.Module):
         return DraftTree(tokens=tokens, parents=parents, depths=depths, cum_logprob=cum,
                          marginal_hidden=pred_hidden)
 
-    def _residual_from_lastp(self, lastp: torch.Tensor) -> torch.Tensor:
+    def _residual_from_lastp(self, lastp: torch.Tensor, nlive: int | None = None) -> torch.Tensor:
         """Path residual for a batch of nodes given their last-`order` path tokens [W, order]
         (lastp[:, j] = token at offset j+1 back; -1 = no such ancestor). Vectorised twin of
-        _position_residual used by build_tree_fast."""
+        _position_residual used by build_tree_fast.
+
+        ``nlive``: how many LEADING offsets can be non-negative at this call site.  A draft at depth
+        d has only d ancestors, so offsets >= d are guaranteed masked and their Linear(D, D) is a
+        BIT-EXACT no-op -- skipping them is free.  None = the full order (unchanged)."""
+        o = self.config.path_order if nlive is None else min(nlive, self.config.path_order)
+        lastp = lastp[:, :o]
         mask = (lastp >= 0).to(self._dtype)
-        emb = self._embed(lastp.clamp_min(0))                 # [W, order, D]
+        emb = self._embed(lastp.clamp_min(0))                 # [W, o, D]
         h = None
-        for j in range(self.config.path_order):
+        for j in range(o):
             term = self.path_head.offset_proj[j](emb[:, j, :]) * mask[:, j : j + 1]
             h = term if h is None else h + term
         return self.path_head.mlp(self.path_head.norm(h))

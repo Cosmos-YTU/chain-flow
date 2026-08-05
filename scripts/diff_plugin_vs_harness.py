@@ -87,6 +87,12 @@ def build_proposer(ckd, embed_w, lm_w, K, width, dev, dtype, flow_steps=None):
     p.K, p.width, p.dev, p.dtype = K, width, dev, dtype
     p._sl, p._hw, p._w2 = None, lm_w, d.markov.w2.weight
     p.prof, p.use_cg, p.feedback = False, False, False
+    # two-pass candidate head (CF_TWOPASS_M) -- same env knob the plugin reads, so the offline
+    # accept measured here is the accept the engine gets.
+    p.twopass_m = int(os.environ.get("CF_TWOPASS_M", "0"))
+    p.twopass_seed = os.environ.get("CF_TWOPASS_SEED", "0") == "1"
+    p.path_trim = os.environ.get("CF_PATH_TRIM", "0") == "1"
+    p.twopass_shared = os.environ.get("CF_TWOPASS_SHARED", "0") == "1"
     p._t = {"flow": 0.0, "beam": 0.0}
     return p, dcfg
 
@@ -105,6 +111,14 @@ def main():
                     help="override the checkpoint's num_flow_steps (inference-only ODE steps)")
     ap.add_argument("--lag_ckd", default=None,
                     help="lag-trained ckpt: adds a 4th arm using build_context(h[..t-1], token t)")
+    ap.add_argument("--shortlist", default=None,
+                    help="CF_SHORTLIST .pt: restrict the head to these token ids (shipping config)")
+    ap.add_argument("--plugin_tree", action="store_true",
+                    help="also score the plugin's REAL _beam_tree draft with tree acceptance "
+                         "(the shipping path: lagged context + branching)")
+    ap.add_argument("--keep", type=int, default=8)
+    ap.add_argument("--depth", type=int, default=5)
+    ap.add_argument("--topb", type=int, default=8)
     args = ap.parse_args()
 
     dev, dtype = "cuda", torch.float16
@@ -119,6 +133,18 @@ def main():
         pl, _ = build_proposer(args.lag_ckd, embed_w, lm_w, args.K, args.width, dev, dtype)
         assert pl.drafter.lag_proj is not None, "lag_ckd was not trained with lag_context=true"
         pl.feedback = True   # lag ctx already represents position t -> draft depths 0..K-1
+    if args.shortlist:
+        V = lm_w.shape[0]
+        sl = torch.load(args.shortlist, map_location="cpu").flatten().long()
+        sl = sl[(sl >= 0) & (sl < V)].unique().to(dev)
+        p._sl = sl
+        p._hw = lm_w[sl].contiguous()
+        p._w2 = p.drafter.markov.w2.weight[sl].contiguous()
+        print(f"[diff] shortlist head: {sl.numel()} of {V} rows", flush=True)
+    if p.twopass_m:
+        print(f"[diff] TWO-PASS candidate head: M={p.twopass_m} of {p._hw.shape[0]} rows, "
+              f"seed_cond={'on' if p.twopass_seed else 'off'}", flush=True)
+    p.tree_keep, p.tree_topb, p.tree_depth = args.keep, args.topb, args.depth
     C, K = p.ctx_size, args.K
     print(f"ctx_size={C} draft_length={dcfg.draft_length} K={K} width={args.width} "
           f"num_flow_steps={dcfg.num_flow_steps}", flush=True)
@@ -174,6 +200,24 @@ def main():
             p.feedback = False
             ch_p = p._beam_chains(ctx_p, k0).tolist()
 
+            if args.plugin_tree:
+                # PLUGIN TREE arm: the shipping path -- lagged context, branching draft, tree
+                # acceptance. This is the arm the two-pass candidate head has to not regress.
+                N = args.keep * args.depth
+                bt = p._beam_tree(ctx_p, k0)
+                tk, tp = bt[:, :N].tolist(), bt[:, N:].tolist()
+                for j, t in enumerate(tgt):
+                    kids = {}
+                    for ni, pa in enumerate(tp[j]):
+                        kids.setdefault(int(pa), []).append(ni)
+                    cur, dd = -1, 0
+                    while dd < len(t):
+                        nx = next((c for c in kids.get(cur, []) if int(tk[j][c]) == int(t[dd])), None)
+                        if nx is None:
+                            break
+                        cur, dd = nx, dd + 1
+                    acc["pt"] = acc.get("pt", 0) + dd
+
             if pl is not None:
                 # LAG arm: exactly what the vLLM proposer can supply -- h(..t-1) plus token t,
                 # with the missing slot synthesized by the trained lag_proj.
@@ -212,6 +256,10 @@ def main():
         ah, apl, at = 1 + acc["h"] / n, 1 + acc["p"] / n, 1 + acc["t"] / n
         tot["h"].append(ah); tot["p"].append(apl); tot.setdefault("t", []).append(at)
         extra = ""
+        if args.plugin_tree:
+            apt = 1 + acc.get("pt", 0) / n
+            tot.setdefault("pt", []).append(apt)
+            extra += f"   PLUGIN-TREE {apt:>5.2f}"
         if pl is not None:
             al = 1 + acc["l"] / n
             tot.setdefault("l", []).append(al)
@@ -224,6 +272,11 @@ def main():
         mt = sum(tot["t"]) / len(tot["t"])
         print("-" * 76)
         print(f"{'MEAN':<18} {'':>6} {mt:>12.2f} {mh:>14.2f} {mp:>13.2f} {mp - mh:>+7.2f}")
+        if "pt" in tot and tot["pt"]:
+            mpt = sum(tot["pt"]) / len(tot["pt"])
+            print(f"{'MEAN PLUGIN-TREE':<18} {'':>6} {mpt:>12.2f}"
+                  f"   (keep={args.keep} depth={args.depth} topb={args.topb}"
+                  f", twopass_M={p.twopass_m or 'off'}; worst domain {min(tot['pt']):.2f})")
         if "l" in tot and tot["l"]:
             ml = sum(tot["l"]) / len(tot["l"])
             print(f"{'MEAN LAG':<18} {'':>6} {'':>12} {'':>14} {ml:>13.2f} "

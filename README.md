@@ -1,11 +1,170 @@
 # chained-flow
 
-Experimental scaffolding for hidden-state speculative decoding with a frozen
-causal LM backbone.
+A flow-matching **hidden-state drafter** for lossless speculative decoding in vLLM.
+Instead of a second transformer, the drafter integrates a small conditional flow
+over the target model's own final hidden states, then decodes the trajectory
+through the frozen `lm_head`. Verification is vLLM's, unchanged, so the output
+distribution is the target model's.
 
-The current base targets `Qwen/Qwen3.5-0.8B` through `FrozenLMWrapper`, but tests
-use a fake backend so core alignment and cache behavior can be checked without
-loading the real model.
+## Install
+
+```bash
+pip install chained-flow          # pulls vllm==0.25.*
+```
+
+That is the **default build: fork-free**. It runs the *chain* path on unmodified
+vLLM and needs no patching. The install registers a `vllm.general_plugins` entry
+point ([`chained_flow/vllm_plugin/async_guard.py`](src/chained_flow/vllm_plugin/async_guard.py))
+that relaxes one guard so a `custom_class` proposer is allowed to keep vLLM's
+async scheduling, which vLLM otherwise hands to the baseline and denies to us.
+Measured worth on the chain arm: **+6.1% at 4B**. That is why the install has to
+be a real install — a bare `PYTHONPATH` creates no entry points and the plugin
+never fires.
+
+Measured on pristine vLLM 0.25.1, batch 1, 7 domains, 256 tokens, pooled:
+
+| | base (vLLM default) | chain | speedup |
+|---|---|---|---|
+| Qwen3.5-4B  | 139.6 tok/s | **157.8** | **1.13x** |
+| Qwen3.5-27B |  26.2 tok/s |  **41.0** | **1.57x** |
+
+Check what you got:
+
+```bash
+chained-flow info
+```
+
+It prints the vLLM build in use, whether the async guard was relaxed, whether the
+fused CUDA kernel compiles on this box, and the resolved state of every flag.
+
+## Quickstart
+
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="Qwen/Qwen3.5-4B",
+    dtype="float16",
+    speculative_config={
+        "method": "custom_class",
+        "model": "chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer",
+        "num_speculative_tokens": 5,
+    },
+)
+print(llm.generate(["Explain gradient descent simply."],
+                   SamplingParams(temperature=0, max_tokens=256))[0].outputs[0].text)
+```
+
+The drafter checkpoint comes from `CF_DRAFTER_DIR` — a local directory or a
+Hugging Face repo id, downloaded on first use:
+
+| target model | drafter |
+|---|---|
+| `Qwen/Qwen3.5-4B`  | `selimaktas/Flow-Drafter-4B-v2` |
+| `Qwen/Qwen3.5-9B`  | `selimaktas/Flow-Drafter-9B` |
+| `Qwen/Qwen3.5-27B` | `selimaktas/Flow-Drafter-Qwen3.5-27B-v2` |
+
+```bash
+CF_DRAFTER_DIR=selimaktas/Flow-Drafter-4B-v2 python your_script.py
+```
+
+One thing worth setting explicitly: `CF_SHORTLIST=<a .pt of token ids>`. Without
+it the drafter scores the full 248k-row `lm_head` at every depth, which is ~40%
+of the draft spent on rows the beam never looks at. `scripts/build_shortlist.py`
+builds one; drop it next to the checkpoint as `shortlist.pt` and it is picked up
+automatically. A run without one says so at startup.
+
+Everything else is defaulted and **capability-gated**: ten optimisation flags are
+proposed, each gate is evaluated against the real process (does the CUDA
+extension build? does the drafter's shape fit the kernel? did the engine actually
+enable async scheduling?), and the resolved state of all of them is printed on one
+`[cf-defaults]` line at startup. See
+[`defaults.py`](src/chained_flow/defaults.py). A flag that could not engage says
+so; nothing here fails silently.
+
+## The two arms
+
+|  | **chain** (default) | **tree** (opt-in) |
+|---|---|---|
+| vLLM | unmodified, `pip install` only | requires the fork |
+| verification | vLLM's linear chain | branching tree verify |
+| sampling | any | greedy only |
+| enable with | nothing | `VLLM_SPEC_TREE=1` + the patch |
+
+The chain path builds the same draft tree from one flow pass and beam-searches
+it, but emits the single best **path** as a linear chain, because vLLM V1 has no
+tree-verify hook. That keeps the tree's token-*selection* benefit and gives up
+only its multi-branch acceptance.
+
+### Enabling the tree path
+
+The tree needs a patched vLLM (a tree-aware verify, tree-shaped GDN recurrence
+and attention, and a KV/state hand-off none of which upstream exposes):
+
+```bash
+chained-flow tree-patch      # prints the patch path and the exact commands
+```
+
+which amounts to:
+
+```bash
+cd "$(python -c 'import vllm,os;print(os.path.dirname(os.path.dirname(vllm.__file__)))')"
+patch -p1 --dry-run < .../chained_flow/patches/vllm-0.25.1-chained-flow-tree.patch
+patch -p1         < .../chained_flow/patches/vllm-0.25.1-chained-flow-tree.patch
+```
+
+Then run with `VLLM_SPEC_TREE=1`, `CF_TREE_KEEP` × `CF_TREE_DEPTH` nodes, and
+`num_speculative_tokens = CF_TREE_KEEP*CF_TREE_DEPTH + 1` (the extra column is a
+spare mamba-state slot, never an emitted token). `chained-flow info` reports
+`vLLM build : FORKED` once the patch is in; without it the tree flags report
+`fork_missing` and are **not offered** rather than silently ignored.
+
+The patch touches 6 upstream files and adds 5, all under
+`vllm/v1/spec_decode/`. It is generated against 0.25.1 exactly; the version pin
+is deliberate.
+
+## CUDA kernel
+
+The drafter's block stack has a hand-written fused CUDA kernel (`CF_CUDA_BLOCK`,
+default on). It is **JIT-compiled on first use** via torch's extension loader,
+takes ~60 s once per machine, and is then cached in
+`~/.cache/torch_extensions` (`CF_KERNEL_DIR` overrides). Precompile it if you do
+not want that stall inside your first engine start:
+
+```bash
+chained-flow build-kernel
+```
+
+If the toolchain is missing or the drafter's shape is not one the kernel is
+instantiated for, it falls back to the **bit-identical** PyTorch block stack
+(~2x slower draft) and says why. It never hard-fails.
+
+## Benchmarking
+
+**Before quoting any speedup, read [docs/BENCHMARKING.md](docs/BENCHMARKING.md).**
+The baseline is where this project has been wrong before.
+
+```bash
+./vllm/bench_cf.sh 4b base            # baseline
+./vllm/bench_cf.sh 4b chain           # fork-free arm
+./vllm/bench_cf.sh 4b tree            # needs the patch
+./vllm/bench_forkfree.sh 4b 256       # all arms, both baselines, one run
+```
+
+`CF_PY=<venv>/bin/python` selects which vLLM to run against.
+
+Two baseline hazards have corrupted results here before:
+
+1. **async scheduling.** Without the entry point above, vLLM gives the base arm a
+   feature it force-disables for `custom_class` speculative decoding, understating
+   every speedup by **+10.5% / +5.5% / +1.6%** at 4B / 9B / 27B. `bench_cf.sh`'s
+   base arm defaults to `CF_ASYNC_SCHED=0` (like-for-like); pass
+   `CF_ASYNC_SCHED=1` for the deployment number. **Quote both, labelled.**
+2. **pooled vs mean-of-domain.** The harness prints both and they differ a lot —
+   one 27B run reads 1.47x pooled and 1.68x mean-of-domain. Always say which.
+
+Greedy decoding of an fp16-logit model is ill-posed at ~0.3-0.9% of tokens, so a
+single-run token diff is never a signal; see the doc for the verification protocol.
 
 ## Current components
 
@@ -194,3 +353,4 @@ For CUDA collection, set `dtype: float16` in
 ```bash
 UV_CACHE_DIR=.uv-cache uv run pytest
 ```
+

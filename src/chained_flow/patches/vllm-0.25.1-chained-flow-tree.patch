@@ -1,0 +1,3804 @@
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -969,8 +969,23 @@
+                     "select a different all2all backend."
+                 )
+             if self.speculative_config is not None:
++                # CHAINED-FLOW (CF_ASYNC_SPEC=1, default OFF).  Our `custom_class`
++                # proposer becomes GPU-token-native under that flag: it derives cnt/k0
++                # from the verify's own GPU tensors, hands vLLM a GPU draft TENSOR, and
++                # publishes valid_sampled_token_count / prev_sampled_token_ids -- the
++                # same contract the EAGLE / NGram-GPU drafters satisfy.
++                # This is deliberately CONDITIONAL, not a blanket removal: with the flag
++                # off the proposer still reads the CPU token lists, which async fills
++                # with -1 placeholders, and it would silently collapse to accept 1.0.
++                import os as _cf_os
++
++                _cf_async_spec = (
++                    self.speculative_config.method == "custom_class"
++                    and _cf_os.environ.get("CF_ASYNC_SPEC", "0") == "1"
++                )
+                 if (
+-                    self.speculative_config.method not in get_args(EagleModelTypes)
++                    not _cf_async_spec
++                    and self.speculative_config.method not in get_args(EagleModelTypes)
+                     and self.speculative_config.method not in get_args(NgramGPUTypes)
+                     and self.speculative_config.method != "draft_model"
+                     and self.speculative_config.method != "dspark"
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -1338,7 +1338,44 @@
+             mixed_qkv_non_spec = mixed_qkv
+ 
+         # 1.1: Process the multi-query part
++        _tree_meta = None
+         if spec_sequence_masks is not None:
++            from vllm.v1.spec_decode import tree_gdn as _tg
++            from vllm.v1.spec_decode import tree_state as _ts_mod
++
++            _ts = _ts_mod.get_current()
++            if _ts is not None and (_ts.branching or _ts_mod.force_tree_gdn()):
++                _lay = _ts.extras.get("gdn_layout")
++                if _lay is None:
++                    _lay = _tg.build_gdn_layout(
++                        parents_np=_ts.parents_np,
++                        depths_np=_ts.depths_np,
++                        num_draft_tokens=_ts.num_draft_tokens,
++                        spec_req_order=_ts.extras["spec_req_np"],
++                        device=mixed_qkv.device,
++                    )
++                    _ts.extras["gdn_layout"] = _lay
++                # NOTE: every GDN layer owns a DIFFERENT set of mamba blocks,
++                # so the absolute slot ids must be resolved per layer.
++                _tree_meta = _tg.layer_meta(
++                    _lay,
++                    spec_state_indices_tensor[: attn_metadata.num_spec_decodes],
++                    num_accepted_tokens[: attn_metadata.num_spec_decodes],
++                )
++                assert _tree_meta.num_rows == mixed_qkv_spec.shape[0], (
++                    f"tree GDN row mismatch: {_tree_meta.num_rows} vs "
++                    f"{mixed_qkv_spec.shape[0]}"
++                )
++        if _tree_meta is not None:
++            mixed_qkv_spec = _tg.tree_causal_conv1d(
++                mixed_qkv_spec,
++                conv_state,
++                conv_weights,
++                self.conv1d.bias,
++                _tree_meta,
++                activation=self.activation,
++            )
++        elif spec_sequence_masks is not None:
+             # spec_state_indices_tensor is always set when spec_sequence_masks is set
+             assert spec_state_indices_tensor is not None
+             mixed_qkv_spec = causal_conv1d_update(
+@@ -1452,7 +1489,30 @@
+         # 2. Recurrent attention
+ 
+         # 2.1: Process the multi-query part
+-        if spec_sequence_masks is not None:
++        if _tree_meta is not None:
++            _a_spec = a
++            _b_spec = b
++            if a.shape[0] != _tree_meta.num_rows:
++                _a_spec = a.index_select(0, spec_token_indx)
++                _b_spec = b.index_select(0, spec_token_indx)
++            core_attn_out_spec = _tg.tree_gated_delta_rule_update(
++                self.A_log,
++                _a_spec,
++                _b_spec,
++                self.dt_bias,
++                query_spec,
++                key_spec,
++                value_spec,
++                ssm_state,
++                _tree_meta,
++                use_qk_l2norm=True,
++                # identity of THIS step's layout, so the CF_GDN_DEFER finalize can
++                # refuse a stash left over from a different tree shape
++                layout=_lay,
++                layer_key=id(self),
++            ).unsqueeze(0)
++            last_recurrent_state = ssm_state
++        elif spec_sequence_masks is not None:
+             core_attn_out_spec, last_recurrent_state = (
+                 fused_sigmoid_gating_delta_rule_update(
+                     A_log=self.A_log,
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -31,6 +31,7 @@
+ from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+ from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+ from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
++from vllm.v1.spec_decode import tree_attn_fused, tree_state
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ if is_flash_attn_varlen_func_available():
+@@ -975,6 +976,26 @@
+                     mask_mod=rswa_mask_mod_fn or mm_mask_mod,
+                     aux_tensors=rswa_aux or mm_aux,
+                 )
++                _ts = tree_state.get_current()
++                if _ts is not None and _ts.tree_token_idx is not None and (
++                    not tree_state.attn_off()
++                ) and (
++                    _ts.branching or tree_state.force_tree_attn()
++                ):
++                    _tree_attention_fixup(
++                        self,
++                        _ts,
++                        query,
++                        key,
++                        value,
++                        key_cache,
++                        value_cache,
++                        output,
++                        attn_metadata,
++                        q_descale=q_descale,
++                        k_descale=k_descale,
++                        v_descale=v_descale,
++                    )
+                 return output
+ 
+         # Cascade attention (rare case).
+@@ -1298,6 +1319,180 @@
+     return mm_prefix_mask_mod
+ 
+ 
++def _tree_attention_fixup(
++    impl: "FlashAttentionImpl",
++    ts,
++    query: torch.Tensor,
++    key: torch.Tensor,
++    value: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    output: torch.Tensor,
++    attn_metadata: "FlashAttentionMetadata",
++    q_descale=None,
++    k_descale=None,
++    v_descale=None,
++) -> None:
++    """Recompute the DRAFT-TREE query rows under an ancestor mask.
++
++    FlashAttention's causal mask is over FLAT token order, so sibling tree nodes
++    would attend to each other.  The exact tree result decomposes into
++
++        softmax over [ shared prefix ] u [ own tree nodes, ancestor-masked ]
++
++    which is two independent attentions merged by log-sum-exp -- exactly the
++    cascade-attention trick vLLM already uses.  The prefix half is a normal
++    paged FlashAttention call with ``causal=False`` and ``seqused_k = ctx_len``
++    (every node sees the whole committed prefix); the suffix half is a dense
++    N x N attention (N <= a handful of draft nodes) with the ancestor mask.
++    """
++    idx = ts.tree_token_idx
++    idx_pad = ts.extras["idx_pad"]  # [S, Nmax]
++    valid_pad = ts.extras["valid_pad"]  # [S, Nmax]
++    nmax = ts.extras["nmax"]
++    S = ts.extras["num_spec"]
++
++    q = query.index_select(0, idx)  # [M, H, D]
++    M, H, D = q.shape
++    block_table = attn_metadata.block_table.index_select(0, ts.spec_req_idx)
++
++    prefix_out, prefix_lse = flash_attn_varlen_func(
++        q=q,
++        k=key_cache,
++        v=value_cache,
++        cu_seqlens_q=ts.cu_q,
++        max_seqlen_q=nmax,
++        seqused_k=ts.ctx_lens,
++        max_seqlen_k=ts.extras["max_ctx"],
++        softmax_scale=impl.scale,
++        causal=False,
++        alibi_slopes=impl.alibi_slopes,
++        block_table=block_table,
++        softcap=impl.logits_soft_cap,
++        fa_version=impl.vllm_flash_attn_version,
++        q_descale=q_descale[:S] if q_descale is not None else None,
++        k_descale=k_descale[:S] if k_descale is not None else None,
++        v_descale=v_descale[:S] if v_descale is not None else None,
++        return_softmax_lse=True,
++    )
++
++    # CF_TREE_FUSED_ATTN=1: the whole suffix half + the LSE merge in ONE CUDA
++    # launch instead of the ~16 eager ops below.  Restricted to the static
++    # FULL-cudagraph step (no padded rows), which is the shipping shape; the
++    # kernel returns False for any head_size/layout it is not built for and we
++    # fall through to the eager chain.
++    if tree_attn_fused.enabled() and ts.extras.get("static"):
++        # CF_TFA_CHECK=1 runs the eager tail ALONGSIDE the kernel and tallies
++        # mismatching elements in a device counter (cudagraph-safe, no sync);
++        # CF_TFA_CHECK=2 is the control that runs the eager tail only.
++        chk = tree_attn_fused.check_mode()
++        if chk:
++            ref = _tree_suffix_eager(
++                impl, ts, query, key, value, output, prefix_out, prefix_lse,
++                idx_pad, S, nmax, H, D
++            )
++            if chk == 2:
++                output.index_copy_(0, idx, ref.to(output.dtype))
++                return
++            tree_attn_fused.fused_suffix_merge(
++                query=query, key=key, value=value, output=output,
++                prefix_out=prefix_out, prefix_lse=prefix_lse, idx_pad=idx_pad,
++                not_anc=ts.extras["not_anc"], scale=impl.scale, S=S, N=nmax,
++            )
++            got = output.index_select(0, idx)
++            tkey = f"S{S}xN{nmax}xH{H}xHKV{key.shape[1]}xD{D}"
++            tree_attn_fused.tally(got, ref, key=tkey)
++            if tree_attn_fused.capturing():
++                # same NaN exclusion as tally(): both-NaN rows are not a
++                # mismatch, and they are common enough to swallow the capture
++                tree_attn_fused.capture(
++                    ((got != ref) & ~(got.isnan() & ref.isnan())).any(),
++                    dict(
++                        q=query.index_select(0, idx_pad.view(-1)),
++                        k=key.index_select(0, idx_pad.view(-1)),
++                        v=value.index_select(0, idx_pad.view(-1)),
++                        prefix_out=prefix_out,
++                        prefix_lse=prefix_lse,
++                        not_anc=ts.extras["not_anc"],
++                        got=got,
++                        ref=ref,
++                    ),
++                    key=tkey,
++                )
++            return
++        if tree_attn_fused.fused_suffix_merge(
++            query=query,
++            key=key,
++            value=value,
++            output=output,
++            prefix_out=prefix_out,
++            prefix_lse=prefix_lse,
++            idx_pad=idx_pad,
++            not_anc=ts.extras["not_anc"],
++            scale=impl.scale,
++            S=S,
++            N=nmax,
++        ):
++            return
++
++    output.index_copy_(
++        0,
++        idx,
++        _tree_suffix_eager(
++            impl, ts, query, key, value, output, prefix_out, prefix_lse,
++            idx_pad, S, nmax, H, D
++        ).to(output.dtype),
++    )
++
++
++def _tree_suffix_eager(
++    impl, ts, query, key, value, output, prefix_out, prefix_lse, idx_pad,
++    S, nmax, H, D,
++):
++    """The eager suffix half + LSE merge -- the reference the CUDA kernel must
++    reproduce bit for bit.  Returns the merged [S*nmax, H, D] rows."""
++    # --- dense ancestor-masked attention over this request's own tree nodes ---
++    Hkv = key.shape[1]
++    rep = H // Hkv
++    qp = query.index_select(0, idx_pad.view(-1)).view(S, nmax, H, D)
++    kp = key.index_select(0, idx_pad.view(-1)).view(S, nmax, Hkv, D)
++    vp = value.index_select(0, idx_pad.view(-1)).view(S, nmax, Hkv, D)
++    if rep > 1:
++        kp = kp.repeat_interleave(rep, dim=2)
++        vp = vp.repeat_interleave(rep, dim=2)
++    # [S, H, N, N]
++    scores = torch.einsum("snhd,smhd->shnm", qp.float(), kp.float()) * impl.scale
++    # in-place, on a precomputed negated mask: `masked_fill(~anc_mask)` allocated a new
++    # [S, H, N, N] tensor and re-negated the mask once per attention layer.
++    scores.masked_fill_(ts.extras["not_anc"].unsqueeze(1), float("-inf"))
++    smax = scores.amax(dim=-1, keepdim=True)
++    exp = torch.exp(scores - smax)
++    denom = exp.sum(dim=-1, keepdim=True)
++    suffix_lse = (smax + torch.log(denom)).squeeze(-1)  # [S, H, N]
++    probs = exp / denom
++    suffix_out = torch.einsum("shnm,smhd->snhd", probs, vp.float())
++
++    # Compact the padded rows with index_select on a PRECOMPUTED int index --
++    # never `x[bool_mask]`.  Boolean-mask indexing has a data-dependent output
++    # shape, so torch must SYNCHRONIZE THE DEVICE to learn it, and this runs once
++    # per attention layer: the mask form cost 2 x n_attn_layers host syncs inside
++    # every verify forward and made the forward impossible to pipeline (measured
++    # 16 syncs/step at 4B, _model_forward blocking 12.4 ms of host time against
++    # 7.6 ms of GPU work).  `valid_idx` is built host-side in
++    # tree_state.build_attn_plumbing from the same `valid` array.
++    flat_idx = ts.extras["valid_idx"]
++    suffix_out = suffix_out.reshape(S * nmax, H, D).index_select(0, flat_idx).to(output.dtype)
++    suffix_lse = (
++        suffix_lse.permute(0, 2, 1).reshape(S * nmax, H).index_select(0, flat_idx).transpose(0, 1)
++    ).contiguous()
++
++    merged = torch.empty_like(prefix_out)
++    merge_attn_states(
++        merged, prefix_out, prefix_lse, suffix_out, suffix_lse.float()
++    )
++    return merged
++
++
+ def _make_rswa_mask_mod():
+     """Build a CuTE-DSL mask_mod for Reference Sliding Window Attention (R-SWA).
+ 
+--- a/vllm/v1/sample/rejection_sampler.py
++++ b/vllm/v1/sample/rejection_sampler.py
+@@ -118,6 +118,28 @@
+         """
+         assert metadata.max_spec_len <= MAX_SPEC_LEN
+ 
++        # ---- tree verify (chained-flow fork) -----------------------------
++        # A draft TREE cannot be verified by the linear walk below: the
++        # accepted continuation is a PATH, and which node predicts which is
++        # given by `tree_parents`.  Greedy-only; anything that needs logits
++        # processors / logprobs falls through to the stock chain path (which
++        # is exact whenever the tree happens to be a chain).
++        if (
++            metadata.tree_parents is not None
++            and sampling_metadata.all_greedy
++            and sampling_metadata.max_num_logprobs is None
++            and not self._tree_needs_processors(sampling_metadata)
++        ):
++            return SamplerOutput(
++                sampled_token_ids=tree_rejection_sample(metadata, logits),
++                logprobs_tensors=None,
++            )
++        if metadata.tree_branching:
++            raise RuntimeError(
++                "tree spec-decode: branching tree reached the stock linear "
++                "rejection sampler (greedy/no-logprobs/no-penalties required)"
++            )
++
+         bonus_logits_indices = metadata.bonus_logits_indices
+         target_logits_indices = metadata.target_logits_indices
+ 
+@@ -196,6 +218,20 @@
+             logprobs_tensors=logprobs_tensors,
+         )
+ 
++    @staticmethod
++    def _tree_needs_processors(sampling_metadata: SamplingMetadata) -> bool:
++        holder = sampling_metadata.thinking_budget_state_holder
++        return bool(
++            sampling_metadata.bad_words_token_ids
++            or not sampling_metadata.no_penalties
++            or sampling_metadata.allowed_token_ids_mask is not None
++            or (holder is not None and holder.has_tracked_requests())
++        )
++        # NOTE: like the stock chain path (`apply_logits_processors`), the tree
++        # descent does NOT run `sampling_metadata.logitsprocs` -- stock applies
++        # them only to the bonus row via `self.sampler`.  min_tokens / logit_bias
++        # / min_p therefore do not affect the bonus token in tree mode.
++
+     def _get_logprobs_tensors(
+         self,
+         max_num_logprobs: int,
+@@ -391,6 +427,129 @@
+         return result
+ 
+ 
++# ---------------------------------------------------------------------------
++#  TREE verify (chained-flow fork)
++# ---------------------------------------------------------------------------
++@triton.jit(do_not_specialize=["max_spec_len", "max_nodes"])
++def tree_greedy_descent_kernel(
++    output_token_ids_ptr,  # [batch, max_spec_len + 1]
++    accepted_path_ptr,  # [batch, max_spec_len]  node indices, -1 padded
++    accepted_len_ptr,  # [batch]
++    cu_num_draft_tokens_ptr,  # [batch]
++    cu_num_sampled_tokens_ptr,  # [batch]
++    draft_token_ids_ptr,  # [num_tokens]
++    parents_ptr,  # [num_tokens] local parent node index, -1 for root
++    row_argmax_ptr,  # [num_tokens + batch] argmax of every logits row
++    max_spec_len,
++    max_nodes,
++):
++    """Descend the draft tree along the target model's greedy continuation.
++
++    Row layout for request r: ``row 0`` is the last committed token, ``row
++    1 + i`` is tree node ``i``.  ``row_argmax[row]`` is the token the target
++    model would emit at that row.  Starting at the root row we repeatedly look
++    for a CHILD of the current node whose draft token equals the target's
++    argmax; the accepted output is that path plus one extra (bonus) token.
++    """
++    req_idx = tl.program_id(0)
++    d0 = (
++        tl.zeros([], dtype=cu_num_draft_tokens_ptr.dtype.element_ty)
++        if req_idx == 0
++        else tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
++    )
++    d1 = tl.load(cu_num_draft_tokens_ptr + req_idx)
++    n = d1 - d0
++    s1 = tl.load(cu_num_sampled_tokens_ptr + req_idx)
++    # row base of this request inside the flat logits array
++    s0 = s1 - (n + 1)
++    if n <= 0:
++        return
++
++    cur = -1  # current node index; -1 == the root row
++    pos = 0
++    active = 1
++    for _ in range(max_nodes + 1):
++        tok = tl.load(row_argmax_ptr + s0 + cur + 1)
++        tl.store(
++            output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
++            tok,
++            mask=active == 1,
++        )
++        nxt = -1
++        for i in range(n):
++            p = tl.load(parents_ptr + d0 + i)
++            dt = tl.load(draft_token_ids_ptr + d0 + i)
++            hit = (p == cur) & (dt == tok) & (nxt < 0)
++            nxt = tl.where(hit, i, nxt)
++        found = (nxt >= 0) & (active == 1)
++        tl.store(
++            accepted_path_ptr + req_idx * max_spec_len + pos, nxt, mask=found
++        )
++        cur = tl.where(found, nxt, cur)
++        pos = tl.where(found, pos + 1, pos)
++        active = tl.where(found, active, 0)
++    tl.store(accepted_len_ptr + req_idx, pos)
++
++
++def tree_rejection_sample(
++    metadata: SpecDecodeMetadata,
++    logits: torch.Tensor,
++) -> torch.Tensor:
++    device = logits.device
++    batch_size = len(metadata.num_draft_tokens)
++    max_spec_len = metadata.max_spec_len
++    output_token_ids = torch.full(
++        (batch_size, max_spec_len + 1),
++        PLACEHOLDER_TOKEN_ID,
++        dtype=torch.int32,
++        device=device,
++    )
++    accepted_path = torch.full(
++        (batch_size, max_spec_len), -1, dtype=torch.int32, device=device
++    )
++    accepted_len = torch.zeros(batch_size, dtype=torch.int32, device=device)
++    # argmax of EVERY logits row (draft rows + bonus rows).  Same total work as
++    # the stock path (which argmaxes the target rows and samples the bonus row).
++    row_argmax = logits.argmax(dim=-1).to(torch.int32)
++    tree_greedy_descent_kernel[(batch_size,)](
++        output_token_ids,
++        accepted_path,
++        accepted_len,
++        metadata.cu_num_draft_tokens,
++        metadata.cu_num_sampled_tokens,
++        metadata.draft_token_ids,
++        metadata.tree_parents,
++        row_argmax,
++        max_spec_len,
++        max_spec_len,
++    )
++    from vllm.v1.spec_decode import tree_state
++
++    cur = tree_state.get_current()
++    if cur is not None:
++        cur.accepted_path = accepted_path
++        cur.accepted_len = accepted_len
++        # h(t) HARVEST: every tree node is a query row of THIS forward, so its
++        # hidden state is the real h(node token).  The accepted path's rows are
++        # scattered (row 1 + path[j], not row 1 + j), so publish them for the
++        # proposer -- gathering the first L rows instead silently feeds the
++        # drafter the hiddens of REJECTED nodes.
++        # The GPU tensors above are all the proposer needs: it gathers the harvested
++        # rows with a device-side index.  These two BLOCKING D2H copies existed only
++        # for the proposer's legacy host-side row list (CF_GPUCTX=0) and cost 2 host
++        # syncs per step on the critical path, so they are built only for that path.
++        import os as _os
++
++        # CF_RINGCHECK runs the legacy build alongside the ring to diff them, and the legacy
++        # build needs these; without them it silently falls back to a CONTIGUOUS row slice
++        # (i.e. rejected siblings' hiddens) and the diff reports phantom mismatches.
++        if (_os.environ.get("CF_GPUCTX", "1") != "1"
++                or _os.environ.get("CF_RINGCHECK", "0") == "1"):
++            cur.extras["accepted_path_cpu"] = accepted_path.to("cpu", non_blocking=False)
++            cur.extras["accepted_len_cpu"] = accepted_len.to("cpu", non_blocking=False)
++    return output_token_ids
++
++
+ def rejection_sample(
+     # [num_tokens]
+     draft_token_ids: torch.Tensor,
+--- a/vllm/v1/spec_decode/metadata.py
++++ b/vllm/v1/spec_decode/metadata.py
+@@ -23,6 +23,18 @@
+     # [num_tokens + batch_size]
+     logits_indices: torch.Tensor
+ 
++    # ---- tree speculative decoding (chained-flow fork) -------------------
++    # [num_tokens] int32: node-local parent index of each draft token
++    # (-1 for the root of a request's tree).  None => stock linear chain.
++    tree_parents: torch.Tensor | None = None
++    # [num_tokens] int32: node-local depth (root == 0)
++    tree_node_depths: torch.Tensor | None = None
++    # host mirrors, used to build attention / GDN metadata
++    tree_parents_np: np.ndarray | None = None
++    tree_depths_np: np.ndarray | None = None
++    # True when at least one request's tree actually branches
++    tree_branching: bool = False
++
+     def __post_init__(self):
+         self.max_spec_len = max(self.num_draft_tokens)
+ 
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -187,6 +187,8 @@
+ from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+ from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
+ from vllm.v1.spec_decode.medusa import MedusaProposer
++from vllm.v1.spec_decode import tree_state
++import os as _os_env
+ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+ from vllm.v1.spec_decode.ngram_proposer_gpu import (
+     NgramProposerGPU,
+@@ -840,9 +842,51 @@
+             )
+ 
+         self.uniform_decode_query_len = 1 + self.num_spec_tokens
++        # Expected GDN row depth of a graphable tree step.  The proposer emits
++        # CF_TREE_KEEP nodes at each of CF_TREE_DEPTH levels, so node depths run
++        # 0..D-1 and GDN row depths (which prepend the last committed token as
++        # row 0) run 0..D -- i.e. maxd == D, always, for the shipped shape.
++        self._cf_tree_keep = int(_os_env.environ.get("CF_TREE_KEEP", "0") or 0)
++        self._cf_tree_maxd = int(_os_env.environ.get("CF_TREE_DEPTH", "0") or 0)
++        self._cf_tree_fullcg = (
++            tree_state.tree_enabled()
++            and self.num_spec_tokens > 0
++            and _os_env.environ.get("CF_TREE_FULLCG", "0") == "1"
++            and self._cf_tree_maxd > 0
++            and self._cf_tree_keep > 0
++            and self._cf_tree_keep * self._cf_tree_maxd == self.num_spec_tokens - 1
++        )
++        self._cf_force_uniform: bool | None = None
++        # `max_seqlen_k` of the fix-up's prefix attention is a HOST argument and
++        # therefore baked into the captured graph, so it must be an UPPER BOUND
++        # on any context the graph will ever replay against; the true per-request
++        # lengths come from the `ctx_lens` tensor.  max_model_len is the only
++        # value that is always safe.  CF_TREE_MAXCTX exists to MEASURE the cost
++        # of that bound (a tighter value is only valid if it really bounds the
++        # context) -- do not set it in a shipping config.
++        self._cf_tree_max_ctx = (
++            int(_os_env.environ.get("CF_TREE_MAXCTX", "0") or 0) or self.max_model_len
++        )
++        if self._cf_tree_fullcg:
++            # TREE VERIFY + CUDAGRAPHS.  A tree of N nodes is configured as
++            # num_speculative_tokens = N+1 (the spare mamba state column, see
++            # tree_gdn._colmap) but only N draft tokens are ever emitted, so a tree
++            # decode step schedules N+1 == num_spec_tokens query rows -- one FEWER
++            # than the stock uniform_decode_query_len of 1+num_spec_tokens.  The
++            # mismatch made `_is_uniform_decode` false on EVERY tree step, so the
++            # step fell out of the FULL decode cudagraph onto the PIECEWISE path and
++            # ran ~36 attention/GDN ops eager from Python.  Measured at 4B batch 1:
++            # _model_forward 10.1 ms of HOST dispatch against 7.6 ms of GPU work,
++            # versus 0.26 ms for the (FULL-graphed) chain arm.
++            self.uniform_decode_query_len = self.num_spec_tokens
+ 
+         # Cudagraph dispatcher for runtime cudagraph dispatching.
+         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
++        # The dispatcher recomputes uniform_decode_query_len from the config
++        # (1 + num_speculative_tokens) and never re-reads the runner's value, so the
++        # tree adjustment above has to be mirrored here or the capture-size
++        # divisibility assert in _create_padded_batch_descriptor fires.
++        self.cudagraph_dispatcher.uniform_decode_query_len = self.uniform_decode_query_len
+ 
+         self.mm_budget = (
+             MultiModalBudget(self.vllm_config, self.mm_registry)
+@@ -877,6 +921,9 @@
+             self._num_valid_draft_tokens_copy_stream = torch.cuda.Stream()
+ 
+         self._draft_token_req_ids: list[str] | None = None
++        # chained-flow tree + async spec: previous step's GDN carry-forward column
++        # (see `_tree_postprocess` and the correction in `_prepare_inputs`).
++        self._cf_gdn_next_accepted: torch.Tensor | None = None
+         self.transfer_event = torch.Event()
+         self.sampled_token_ids_pinned_cpu = torch.empty(
+             (self.max_num_reqs, 1),
+@@ -1519,6 +1566,194 @@
+         else:
+             return None
+ 
++    def _gdn_finalize_deferred(self, ts) -> None:
++        """CF_GDN_DEFER: write the accepted leaf's GDN recurrent state.
++
++        The verify forward skipped all 41 per-node state writes (1.92 GiB of fp32
++        traffic per forward at the shipping shape); exactly one of them mattered
++        and which one is only known now.  Re-running the SAME kernel for the S
++        accepted-leaf rows reproduces the bits the skipped store would have
++        written, at 1/41 of the traffic.
++        """
++        import os as _os
++
++        from vllm.v1.spec_decode import tree_gdn as _tg
++
++        if not _tg.defer_state():
++            return
++        lay = None if ts is None else ts.extras.get("gdn_layout")
++        if lay is None or getattr(lay, "row_start", None) is None:
++            # No live layout to resolve leaves against; a stash from an OLDER step
++            # must never be replayed against this one, but anything this step's
++            # python deferred still has to be flushed.
++            _tg.disarm_deferred()
++            return
++        rows = None
++        if (
++            ts.accepted_path is not None
++            and ts.accepted_len is not None
++            and ts.spec_req_idx is not None
++        ):
++            num_reqs = self.input_batch.num_reqs
++            full_len = ts.accepted_len.long()
++            li = (full_len - 1).clamp(min=0).unsqueeze(1)
++            last = ts.accepted_path.long()[:num_reqs].gather(1, li[:num_reqs])
++            last = last.squeeze(1)
++            leaf_local = torch.where(
++                full_len[:num_reqs] > 0, last + 1, torch.zeros_like(last)
++            )
++            rows = (
++                lay.row_start + leaf_local.index_select(0, ts.spec_req_idx)
++            ).to(torch.int32)
++        if _os.environ.get("CF_GDN_DEFER_ALL", "0") == "1":
++            rows = None  # debug: deferred pass writes EVERY node's state
++        # rows=None -> write every node's state (correct, just not the point)
++        _tg.finalize_deferred(rows, layout=lay)
++
++    def _tree_postprocess(self, slot_mappings) -> None:
++        """Fix up per-request state after a TREE verify step.
++
++        Two things have to happen once the accepted path is known:
++
++        1. full-attention KV compaction.  Tree node ``i`` wrote its KV to the
++           flat cache slot of logical position ``C+1+i``, but the accepted path
++           node ``path[j]`` must end up at logical position ``C+1+j`` -- the
++           next step reads a contiguous prefix.  Since ``path[j] >= j`` always,
++           copying in increasing ``j`` is safe.
++        2. GDN initial-state column.  The state to carry forward is the one
++           written by the accepted LEAF query row, not by ``num_accepted-1``
++           flat positions (see tree_gdn._colmap).
++        """
++        ts = tree_state.get_current()
++        # Consumed by the async-spec correction in `_prepare_inputs`; must be cleared on
++        # every non-tree step so a stale column can never be carried into one.
++        self._cf_gdn_next_accepted = None
++        import os as _os
++        if _os.environ.get("VLLM_SPEC_TREE_DEBUG") == "1":
++            GPUModelRunner._tdbg0 = getattr(GPUModelRunner, "_tdbg0", 0) + 1
++            if GPUModelRunner._tdbg0 <= 4:
++                print(f"[tree-post-entry] ts={ts is not None} "
++                      f"path={None if ts is None else ts.accepted_path is not None} "
++                      f"tok={None if ts is None else ts.tree_token_idx is not None} "
++                      f"hybrid={self.model_config.is_hybrid} "
++                      f"evt={self.num_accepted_tokens_event is not None} "
++                      f"mamba_mode={self.cache_config.mamba_cache_mode}", flush=True)
++        # CF_GDN_DEFER: the verify forward computed the tree recurrence but did
++        # NOT write any node's state.  Materialise the one state that survives --
++        # the accepted leaf's -- before anything downstream reads it.  This has to
++        # happen ahead of every early return below: leaving the slots stale would
++        # silently feed the next step a state from some rejected sibling.
++        self._gdn_finalize_deferred(ts)
++        if ts is None or ts.accepted_path is None or ts.tree_token_idx is None:
++            return
++        if not (
++            ts.branching
++            or tree_state.force_tree_attn()
++            or tree_state.force_tree_gdn()
++        ):
++            return
++        idx_pad = ts.extras["idx_pad"]  # [S, Nmax] flat query rows of nodes
++        nmax = ts.extras["nmax"]
++        S = ts.extras["num_spec"]
++        req = ts.spec_req_idx
++        import os as _os
++        if _os.environ.get("VLLM_SPEC_TREE_CHECK", "0") == "1" and slot_mappings:
++            # Siblings share a RoPE position but MUST NOT share a KV slot.
++            for _gi, _sm in slot_mappings.items():
++                _s = _sm[idx_pad.view(-1)].view(S, nmax)
++                for _r in range(S):
++                    _row = _s[_r]
++                    assert _row.unique().numel() == _row.numel(), (
++                        f"tree KV slot collision (group {_gi}, spec req {_r}): "
++                        f"{_row.tolist()}"
++                    )
++        path = ts.accepted_path[req][:, :nmax].long()  # [S, Nmax]
++        alen = ts.accepted_len[req].long()  # [S]
++        ar = torch.arange(nmax, device=path.device)
++        valid = (ar.unsqueeze(0) < alen.unsqueeze(1)) & (path != ar.unsqueeze(0))
++        if True:  # (was `if valid.any():` -- see below)
++            # NO `if valid.any():` and NO `x[bool_mask]` here.  Both read a GPU-resident
++            # predicate from the host, so between them they cost 3 host syncs per step.
++            # Instead the compaction runs UNCONDITIONALLY at a fixed shape and the entries
++            # that used to be masked out are turned into SELF-COPIES (src == dst), which
++            # `kv[dst] = kv[src]` executes as a no-op.  Duplicate dst indices are safe for
++            # the same reason: idx_pad's padding entries all point at the request's first
++            # node row, and every one of them is now a self-copy.
++            src_rows = idx_pad.gather(1, path.clamp(min=0))
++            dst_rows = idx_pad
++            src_rows = torch.where(valid, src_rows, dst_rows).reshape(-1)
++            dst_rows = dst_rows.reshape(-1)
++            # NOTE: `slot_mappings` here is keyed by LAYER NAME (see
++            # _get_slot_mappings -> slot_mappings_by_layer), not by group id.
++            assert isinstance(slot_mappings, dict), (
++                "tree verify needs the per-layer slot mapping dict"
++            )
++            fwd_ctx = self.compilation_config.static_forward_context
++            _cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
++            for group in self.kv_cache_config.kv_cache_groups:
++                if not isinstance(group.kv_cache_spec, AttentionSpec):
++                    continue
++                for name in group.layer_names:
++                    sm = slot_mappings.get(name)
++                    layer = fwd_ctx.get(name)
++                    kvc = getattr(layer, "kv_cache", None) if layer is not None else None
++                    if sm is None or kvc is None:
++                        continue
++                    # `Attention.kv_cache` is the tensor itself for the unified
++                    # attention path; older/other paths keep a per-virtual-engine
++                    # list.  [num_blocks, 2, block_size, num_kv_heads, head_size]
++                    kv = kvc if torch.is_tensor(kvc) else (kvc[0] if len(kvc) else None)
++                    if kv is None or kv.dim() != 5:
++                        continue
++                    # [num_blocks, 2, block_size, num_kv_heads, head_size]
++                    bs = kv.shape[2]
++                    key = id(sm)
++                    if key not in _cache:
++                        _cache[key] = (sm[src_rows].long(), sm[dst_rows].long())
++                    src, dst = _cache[key]
++                    if _os.environ.get("VLLM_SPEC_TREE_DEBUG") == "1":
++                        GPUModelRunner._kvdbg = getattr(GPUModelRunner, "_kvdbg", 0) + 1
++                        if GPUModelRunner._kvdbg <= 3:
++                            print(f"[tree-kv] layer={name} kv.shape={tuple(kv.shape)} "
++                                  f"bs={bs} sm.numel={sm.numel()} "
++                                  f"srcrow[{src_rows.min().item()},{src_rows.max().item()}] "
++                                  f"dstrow[{dst_rows.min().item()},{dst_rows.max().item()}] "
++                                  f"src[{src.min().item()},{src.max().item()}] "
++                                  f"dst[{dst.min().item()},{dst.max().item()}]", flush=True)
++                    kv[dst // bs, :, dst % bs] = kv[src // bs, :, src % bs]
++                    self._tree_kv_moves = getattr(self, "_tree_kv_moves", 0) + 1
++        # --- GDN: which state column carries forward -----------------------
++        if self.model_config.is_hybrid:
++            num_reqs = self.input_batch.num_reqs
++            prev = self.num_accepted_tokens.gpu[:num_reqs]
++            init_col = prev.to(torch.int64) - 1
++            full_path = ts.accepted_path.long()
++            full_len = ts.accepted_len.long()
++            li = (full_len - 1).clamp(min=0).unsqueeze(1)
++            last = full_path[:num_reqs].gather(1, li[:num_reqs]).squeeze(1)
++            leaf_local = torch.where(
++                full_len[:num_reqs] > 0, last + 1, torch.zeros_like(last)
++            )
++            col = torch.where(leaf_local < init_col, leaf_local, leaf_local + 1)
++            has_tree = torch.zeros(num_reqs, dtype=torch.bool, device=prev.device)
++            # index_fill_, not `has_tree[req] = True`: the latter materialises the python
++            # scalar as a host tensor and copies it, which torch's sync debugger flags as
++            # one device synchronization per step.
++            has_tree.index_fill_(0, req, True)
++            ts.extras["gdn_next_accepted"] = torch.where(has_tree, col + 1, prev)
++            if self.use_async_spec_decode:
++                # `tree_state.CURRENT` is refilled in place next step, so keep our own
++                # handle to the tensor the async correction has to restore.
++                self._cf_gdn_next_accepted = ts.extras["gdn_next_accepted"]
++            import os as _os
++            if _os.environ.get("VLLM_SPEC_TREE_DEBUG") == "1":
++                GPUModelRunner._tdbg = getattr(GPUModelRunner, "_tdbg", 0) + 1
++                if GPUModelRunner._tdbg <= 4:
++                    print(f"[tree-post] prev={prev[:4].tolist()} "
++                          f"len={full_len[:4].tolist()} leaf={leaf_local[:4].tolist()} "
++                          f"col={col[:4].tolist()} path={ts.accepted_path[:2].tolist()}",
++                          flush=True)
++
+     def _update_states_after_model_execute(
+         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
+     ) -> None:
+@@ -1538,6 +1773,13 @@
+         # tokens gives us the first -1 position (i.e., number of accepted).
+         num_reqs = output_token_ids.size(0)
+         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
++        _ts = tree_state.get_current()
++        if _ts is not None and "gdn_next_accepted" in _ts.extras:
++            # tree verify: the GDN state slot is named by the accepted LEAF
++            # node, not by a count of flat positions.
++            self.num_accepted_tokens.gpu[:num_reqs] = _ts.extras[
++                "gdn_next_accepted"
++            ][:num_reqs].to(self.num_accepted_tokens.gpu.dtype)
+ 
+         if self.cache_config.mamba_cache_mode == "align":
+             # Fused GPU postprocess: state copies + per-request accepted-token
+@@ -2125,6 +2367,25 @@
+                 self.prev_num_draft_tokens.gpu,
+                 cpu_values,
+             )
++            # CHAINED-FLOW TREE + async spec.  The correction above sets BOTH
++            # num_computed_tokens (which does advance by the number of committed tokens,
++            # so it is right) and num_accepted_tokens := valid_sampled_token_count.  The
++            # second is only right for a CHAIN.  For a tree verify num_accepted_tokens is
++            # not a count at all -- it names the GDN state COLUMN the accepted LEAF NODE
++            # left its recurrent state in (`_tree_postprocess` -> gdn_next_accepted), and
++            # siblings make that differ from accepted_len + 1.  Restore it.
++            _cf_gna = self._cf_gdn_next_accepted
++            if _cf_gna is not None:
++                _n = min(num_reqs, _cf_gna.shape[0])
++                _pp = self.prev_positions.gpu[:_n]
++                _dst = self.num_accepted_tokens.gpu[:_n]
++                _dst.copy_(
++                    torch.where(
++                        _pp >= 0,
++                        _cf_gna.index_select(0, _pp.clamp(min=0)).to(_dst.dtype),
++                        _dst,
++                    )
++                )
+         else:
+             self.num_computed_tokens[:num_reqs].copy_(
+                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+@@ -2192,6 +2453,11 @@
+             # TODO: Support prompt logprobs.
+             logits_indices = query_start_loc[1:] - 1
+             spec_decode_metadata = None
++            tree_state.set_current(None)
++            # No spec tokens => cannot be the shape the tree FULL graph was
++            # captured for; force PIECEWISE so a coincidentally
++            # uniform-looking batch can never replay the tree graph.
++            self._cf_force_uniform = False if self._cf_tree_fullcg else None
+             num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
+         else:
+             # Get the number of draft tokens for each request.
+@@ -2201,18 +2467,317 @@
+             # For chunked prefills, use -1 as mask rather than 0, as guided
+             # decoding may rollback speculative tokens.
+             num_decode_draft_tokens = np.full(num_reqs, -1, dtype=np.int32)
+-            for (
+-                req_id,
+-                draft_token_ids,
+-            ) in scheduler_output.scheduled_spec_decode_tokens.items():
+-                req_idx = self.input_batch.req_id_to_index[req_id]
+-                draft_len = len(draft_token_ids)
+-                num_draft_tokens[req_idx] = draft_len
+-                if num_scheduled_tokens[req_idx] == draft_len + 1:
+-                    num_decode_draft_tokens[req_idx] = draft_len
++            _use_tree = tree_state.tree_enabled()
++            tree_parents_gpu = None
++            _gpu_tree_discard = None
++            if _use_tree:
++                # ---- CF_ASYNC_SPEC: the CANONICAL step, which needs NO host parents ----
++                # Decided entirely from host-resident scheduler metadata, BEFORE anything
++                # touches the registry, so it can be evaluated without blocking on the
++                # in-flight draft.  Every condition of the `_graphable` predicate below
++                # that does not itself depend on the tree is included here, so
++                # canonical => graphable and there is no path that consumes the device
++                # hand-off and then discovers it needed the host copy after all.
++                # `has_gpu_tree()` FIRST and outside everything else: with CF_ASYNC_SPEC
++                # off there is never a hand-off, and the default path must not pay for a
++                # duplicate scan of `scheduled_spec_decode_tokens` plus two numpy
++                # reductions (measured at ~1% of 4B throughput when it did).
++                if tree_state.has_gpu_tree() and self._cf_tree_fullcg:
++                    _Nc = self.num_spec_tokens - 1
++                    _sst = scheduler_output.scheduled_spec_decode_tokens
++                    _ntc = num_reqs * (_Nc + 1)
++                    _pm0 = getattr(
++                        self.cudagraph_dispatcher, "_bs_to_padded_graph_size", ()
++                    )
++                    if (
++                        _Nc > 0
++                        and 0 < num_reqs <= self.max_num_reqs
++                        and len(_sst) == num_reqs
++                        and int(total_num_scheduled_tokens) == _ntc
++                        and _ntc < len(_pm0)
++                        and _pm0[_ntc] == _ntc
++                        and all(len(v) == _Nc for v in _sst.values())
++                        and bool((num_scheduled_tokens[:num_reqs] == _Nc + 1).all())
++                    ):
++                        _g = tree_state.take_gpu_tree(
++                            self.input_batch.req_ids, num_reqs, _Nc
++                        )
++                        if _g is not None:
++                            tree_parents_gpu, _gpu_tree_discard = _g
++                if tree_parents_gpu is None:
++                    # Not canonical (prefill, batch change, a shape we did not draft, or
++                    # simply CF_ASYNC_SPEC off).  Fall back to the registry, which means
++                    # blocking on the draft -- correct, just not overlapped.
++                    tree_state.join_pending()
++                else:
++                    # Committed to the device hand-off: drop the host staging WITHOUT
++                    # synchronising.  Safe because the staging D2H and the next step's
++                    # are issued on the same side stream, so they cannot overlap.
++                    _gpu_tree_discard()
++            _per_req_tree: dict[int, tuple[list[int], list[int]]] = {}
++            if tree_parents_gpu is not None:
++                # Shape is known a priori: every request carries the canonical
++                # keep x depth tree, so the per-request dict walk is pure overhead.
++                num_draft_tokens[:] = self.num_spec_tokens - 1
++                num_decode_draft_tokens[:] = self.num_spec_tokens - 1
++            else:
++                for (
++                    req_id,
++                    draft_token_ids,
++                ) in scheduler_output.scheduled_spec_decode_tokens.items():
++                    req_idx = self.input_batch.req_id_to_index[req_id]
++                    draft_len = len(draft_token_ids)
++                    num_draft_tokens[req_idx] = draft_len
++                    if num_scheduled_tokens[req_idx] == draft_len + 1:
++                        num_decode_draft_tokens[req_idx] = draft_len
++                    if _use_tree:
++                        _t = tree_state.lookup(req_id, draft_token_ids)
++                        if _t is not None:
++                            _per_req_tree[req_idx] = _t
++            tree_parents_np = tree_depths_np = None
++            tree_branching = False
++            _tree_fallback = False
++            _tree_maxd = 0
++            if tree_parents_gpu is not None:
++                # Node DEPTHS are a constant of the tree shape (level-major BFS), never
++                # step data, so they stay on the host with no hand-off at all.  The
++                # proposer emits exactly keep x depth nodes in that order on every step;
++                # `_cf_tree_fullcg` already asserted keep * depth == N.
++                tree_depths_np = self._cf_static_depths(num_reqs)
++                _tree_maxd = self._cf_tree_maxd
++                # Asserting `branching` is safe even for a tree that happens to be a
++                # chain: the ancestor mask IS the causal mask there, so the tree fix-up
++                # is a mathematical no-op (see `force_tree_attn`).
++                tree_branching = True
++            elif _use_tree and num_draft_tokens.sum() > 0:
++                _pp: list[np.ndarray] = []
++                _dd: list[np.ndarray] = []
++                for r in range(num_reqs):
++                    n = int(num_draft_tokens[r])
++                    if n == 0:
++                        continue
++                    ent = _per_req_tree.get(r)
++                    if ent is None or len(ent[0]) != n:
++                        # stale / missing tree -> fall back to chain semantics.
++                        # This branch is what makes the step GRAPH-INCOMPATIBLE:
++                        # the chain's maxd is n (15 at a 16-node tree) instead of
++                        # the tree's depth, and maxd is a runtime kernel argument
++                        # of the GDN scan plus the width of `chain` -- both baked
++                        # into a captured graph.  Rather than capture a second
++                        # bucket for a case that should be rare (and pay a 4x
++                        # longer ancestor walk on every step by pinning
++                        # chain_w = n + 1), flag it and let the dispatcher below
++                        # force this step back onto PIECEWISE.
++                        _tree_fallback = True
++                        p = np.arange(-1, n - 1, dtype=np.int32)
++                        d = np.arange(n, dtype=np.int32)
++                    else:
++                        p = np.asarray(ent[0], dtype=np.int32)
++                        d = np.asarray(ent[1], dtype=np.int32)
++                        if not np.array_equal(p, np.arange(-1, n - 1)):
++                            tree_branching = True
++                    _pp.append(p)
++                    _dd.append(d)
++                if _pp:
++                    tree_parents_np = np.concatenate(_pp).astype(np.int32)
++                    tree_depths_np = np.concatenate(_dd).astype(np.int32)
++                    # GDN row depth is 1 + node depth (query row 0 is the last
++                    # committed token), so this is the layout's `maxd`.
++                    _tree_maxd = 1 + int(tree_depths_np.max())
+             spec_decode_metadata = self._calc_spec_decode_metadata(
+-                num_draft_tokens, cu_num_tokens
++                num_draft_tokens,
++                cu_num_tokens,
++                tree_parents_np,
++                tree_depths_np,
++                tree_branching,
++                tree_parents_gpu=tree_parents_gpu,
++            )
++            if tree_branching:
++                # SUBTLEST PART OF TREE VERIFY: siblings must share a RoPE
++                # position (= their depth) but occupy DISTINCT KV slots.
++                # `compute_slot_mapping` above already consumed the strictly
++                # incrementing flat positions (so slots stay unique); now
++                # rewrite the positions the model sees to depth-based ones.
++                # Written as a per-row DELTA, not an absolute position.  `self.positions`
++                # for tree row `start + 1 + i` is already
++                # `num_computed_tokens[r] + (1 + i)` (its query_pos is 1 + i), and the
++                # target is `num_computed_tokens[r] + (1 + depth[i])`, so the correction is
++                # `depth[i] - i` -- a pure function of the TREE SHAPE with no dependence on
++                # `num_computed_tokens` at all.
++                # This matters beyond tidiness: under ASYNC SCHEDULING the host's
++                # `num_computed_tokens_cpu` is the scheduler's OPTIMISTIC value (every
++                # draft assumed accepted) and only the GPU copy has been corrected, so the
++                # old absolute form put every sibling at a position that ran ahead of the
++                # true context by the previous step's rejected-token count.  In synchronous
++                # mode the two forms are identical (CPU == GPU).
++                _off = 0
++                _rows: list[int] = []
++                _dpos: list[int] = []
++                for r in range(num_reqs):
++                    n = int(num_draft_tokens[r])
++                    if n == 0:
++                        continue
++                    d = tree_depths_np[_off : _off + n]
++                    _off += n
++                    if int(num_scheduled_tokens[r]) != n + 1:
++                        continue
++                    start = int(cu_num_tokens[r]) - (n + 1)
++                    for i in range(n):
++                        if int(d[i]) != i:
++                            _rows.append(start + 1 + i)
++                            _dpos.append(int(d[i]) - i)
++                if _rows:
++                    # `torch.tensor(python_list, device=cuda)` allocates PAGEABLE host
++                    # memory and copies it synchronously -- 2 host syncs per step at the
++                    # very START of the step, which drains the previous step's queue.
++                    # Stage through a persistent PINNED buffer instead so the H2D is async.
++                    _ri = self._cf_h2d("tree_pos_rows", _rows)
++                    _rv = self._cf_h2d("tree_pos_dlt", _dpos)
++                    self.positions[:total_num_scheduled_tokens].index_add_(0, _ri, _rv)
++                    # M-RoPE / XD-RoPE models read a SEPARATE positions tensor;
++                    # rewriting only `self.positions` silently leaves siblings on
++                    # strictly-incrementing RoPE positions.
++                    if self.uses_mrope:
++                        _t = self.mrope_positions.gpu[:, :total_num_scheduled_tokens]
++                        _t.index_add_(
++                            1, _ri, _rv.unsqueeze(0).expand(_t.shape[0], -1).to(_t.dtype)
++                        )
++                    if self.uses_xdrope_dim > 0:
++                        _t = self.xdrope_positions.gpu[:, :total_num_scheduled_tokens]
++                        _t.index_add_(
++                            1, _ri, _rv.unsqueeze(0).expand(_t.shape[0], -1).to(_t.dtype)
++                        )
++            # ---- TREE-AWARE CUDAGRAPH DISPATCH -----------------------------
++            # A FULL decode graph is only valid for the ONE shape it was
++            # captured against: S requests, N nodes each, N+1 query rows, the
++            # canonical tree depth, and every plumbing tensor living at the
++            # persistent addresses the graph baked in.  Everything below is host
++            # data already in hand, so the predicate is free.
++            _graphable = False
++            _pad_map = getattr(
++                self.cudagraph_dispatcher, "_bs_to_padded_graph_size", ()
+             )
++            if self._cf_tree_fullcg and (
++                tree_parents_np is not None or tree_parents_gpu is not None
++            ):
++                _N = self.num_spec_tokens - 1
++                _nt = num_reqs * (_N + 1)
++                _graphable = (
++                    tree_branching
++                    and not _tree_fallback
++                    and _N > 0
++                    and num_reqs > 0
++                    and bool((num_draft_tokens == _N).all())
++                    and bool((num_scheduled_tokens[:num_reqs] == _N + 1).all())
++                    and int(total_num_scheduled_tokens) == _nt
++                    and _tree_maxd == self._cf_tree_maxd
++                    and num_reqs <= self.max_num_reqs
++                    # the captured FULL descriptors are exactly the unpadded
++                    # multiples of (N+1); anything that would be token-padded
++                    # replays a graph built for a DIFFERENT number of requests
++                    and _nt < len(_pad_map)
++                    and _pad_map[_nt] == _nt
++                )
++            # `force_uniform_decode=False` is the safety net that makes a
++            # non-graphable tree step LOUD (a PIECEWISE run) instead of silently
++            # replaying a graph of the wrong shape.  In tree mode nothing but a
++            # tree step can ever satisfy `uniform_decode_query_len`, so forcing
++            # it off for every other step costs nothing.
++            self._cf_force_uniform = None if not self._cf_tree_fullcg else _graphable
++            # The canonical predicate is by construction a SUPERSET of everything
++            # `_graphable` tests, so a device hand-off that reached this point and is not
++            # graphable means the two have drifted apart.  Fail loudly: silently taking
++            # the PIECEWISE path here would need host parents we deliberately dropped.
++            assert tree_parents_gpu is None or _graphable, (
++                "CF_ASYNC_SPEC: canonical tree step is not graphable -- the canonical "
++                "predicate in _prepare_inputs has drifted from the _graphable predicate"
++            )
++            if _graphable and tree_parents_gpu is not None:
++                _ts = tree_state.get_static_step(
++                    S=num_reqs,
++                    N=self.num_spec_tokens - 1,
++                    device=self.device,
++                    max_ctx=self._cf_tree_max_ctx,
++                )
++                tree_state.fill_static_step_gpu(
++                    _ts,
++                    parents_gpu_2d=tree_parents_gpu,
++                    depths_np=tree_depths_np,
++                    ctx_lens_gpu=(self.num_computed_tokens[:num_reqs] + 1).to(
++                        torch.int32
++                    ),
++                    maxd=_tree_maxd,
++                    device=self.device,
++                )
++                tree_state.set_current(_ts)
++            elif _graphable:
++                _ts = tree_state.get_static_step(
++                    S=num_reqs,
++                    N=self.num_spec_tokens - 1,
++                    device=self.device,
++                    max_ctx=self._cf_tree_max_ctx,
++                )
++                tree_state.fill_static_step(
++                    _ts,
++                    parents_np=tree_parents_np,
++                    depths_np=tree_depths_np,
++                    ctx_lens_np=(
++                        self.input_batch.num_computed_tokens_cpu[:num_reqs] + 1
++                    ),
++                    maxd=_tree_maxd,
++                    device=self.device,
++                    parents_gpu=spec_decode_metadata.tree_parents,
++                    depths_gpu=spec_decode_metadata.tree_node_depths,
++                    # Async spec: the host's num_computed_tokens is the scheduler's
++                    # optimistic value; only the GPU copy has been corrected above.
++                    ctx_lens_gpu=(
++                        (self.num_computed_tokens[:num_reqs] + 1).to(torch.int32)
++                        if self.use_async_spec_decode
++                        else None
++                    ),
++                )
++                if tree_state.fullcg_check():
++                    tree_state.check_static_step(
++                        _ts,
++                        num_reqs=num_reqs,
++                        num_scheduled_tokens=num_scheduled_tokens,
++                        cu_num_tokens=cu_num_tokens,
++                        num_computed_tokens=self.input_batch.num_computed_tokens_cpu,
++                        device=self.device,
++                    )
++                tree_state.set_current(_ts)
++            elif tree_parents_np is not None:
++                _ts = tree_state.TreeStep(
++                    parents_np=tree_parents_np,
++                    depths_np=tree_depths_np,
++                    num_draft_tokens=num_draft_tokens.copy(),
++                    branching=tree_branching,
++                    parents_gpu=spec_decode_metadata.tree_parents,
++                    depths_gpu=spec_decode_metadata.tree_node_depths,
++                    max_nodes=int(num_draft_tokens.max()),
++                )
++                tree_state.build_attn_plumbing(
++                    _ts,
++                    num_reqs=num_reqs,
++                    num_scheduled_tokens=num_scheduled_tokens,
++                    cu_num_tokens=cu_num_tokens,
++                    num_computed_tokens=self.input_batch.num_computed_tokens_cpu,
++                    device=self.device,
++                )
++                if self.use_async_spec_decode and _ts.ctx_lens is not None:
++                    # See the graphable branch: the host copy is optimistic under async.
++                    _ts.ctx_lens.copy_(
++                        (
++                            self.num_computed_tokens.index_select(
++                                0, _ts.spec_req_idx
++                            )
++                            + 1
++                        ).to(torch.int32),
++                        non_blocking=True,
++                    )
++                tree_state.set_current(_ts)
++            else:
++                tree_state.set_current(None)
+             logits_indices = spec_decode_metadata.logits_indices
+             num_sampled_tokens = num_draft_tokens + 1
+             # For DECODE only cuda graph of some attention backends (e.g., GDN).
+@@ -2799,6 +3364,10 @@
+         self,
+         num_draft_tokens: np.ndarray,
+         cu_num_scheduled_tokens: np.ndarray,
++        tree_parents_np: np.ndarray | None = None,
++        tree_depths_np: np.ndarray | None = None,
++        tree_branching: bool = False,
++        tree_parents_gpu: torch.Tensor | None = None,
+     ) -> SpecDecodeMetadata:
+         # Inputs:
+         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
+@@ -2837,19 +3406,39 @@
+             num_draft_tokens, self._arange_scratch, cumsum_dtype=np.int32
+         )
+         # [0, 0, 0, 5, 5, 9]
+-        target_logits_indices = np.repeat(
++        row_base = np.repeat(
+             cu_num_sampled_tokens - num_sampled_tokens, num_draft_tokens
+         )
+-        # [0, 1, 2, 5, 6, 9]
+-        target_logits_indices += self._arange_scratch[: cu_num_draft_tokens[-1]]
++        # node_rows[i] = logits row of draft node i itself (base + 1 + i)
++        node_rows = row_base + 1 + self._arange_scratch[: cu_num_draft_tokens[-1]]
++        target_logits_indices_gpu = None
++        if tree_parents_gpu is not None:
++            # CF_ASYNC_SPEC: same arithmetic as the numpy branch below, done on the
++            # device.  `row_base` is a function of `num_draft_tokens` only, so it is still
++            # host data; the PARENTS never come back from the GPU.
++            target_logits_indices = np.ascontiguousarray(row_base + 1)
++            target_logits_indices_gpu = self._cf_h2d(
++                "tree_tgt_base", target_logits_indices
++            ).to(torch.int32) + tree_parents_gpu.reshape(-1).to(torch.int32)
++        elif tree_parents_np is None:
++            # [0, 1, 2, 5, 6, 9]  -- chain: predictor of node i is node i-1
++            target_logits_indices = (
++                row_base + self._arange_scratch[: cu_num_draft_tokens[-1]]
++            )
++        else:
++            # tree: the predictor of node i is its PARENT's row (root -> base)
++            target_logits_indices = row_base + 1 + tree_parents_np
++        target_logits_indices = np.ascontiguousarray(target_logits_indices)
+ 
+         cu_num_draft_tokens = async_tensor_h2d(cu_num_draft_tokens, device=self.device)
+         cu_num_sampled_tokens = async_tensor_h2d(
+             cu_num_sampled_tokens, device=self.device
+         )
+         logits_indices = async_tensor_h2d(logits_indices, device=self.device)
+-        target_logits_indices = async_tensor_h2d(
+-            target_logits_indices, device=self.device
++        target_logits_indices = (
++            target_logits_indices_gpu
++            if target_logits_indices_gpu is not None
++            else async_tensor_h2d(target_logits_indices, device=self.device)
+         )
+         bonus_logits_indices = async_tensor_h2d(
+             bonus_logits_indices, device=self.device
+@@ -2857,8 +3446,27 @@
+ 
+         # Compute the draft token ids.
+         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
++        node_rows_t = async_tensor_h2d(
++            np.ascontiguousarray(node_rows), device=self.device
++        )
+         draft_token_ids = self.input_ids.gpu[logits_indices]
+-        draft_token_ids = draft_token_ids[target_logits_indices + 1]
++        draft_token_ids = draft_token_ids[node_rows_t]
++
++        tree_parents_t = None
++        tree_depths_t = None
++        if tree_parents_gpu is not None:
++            # Already on the device -- this is the whole point of the async path.
++            tree_parents_t = tree_parents_gpu.reshape(-1).to(torch.int32)
++        elif tree_parents_np is not None:
++            tree_parents_t = async_tensor_h2d(
++                np.ascontiguousarray(tree_parents_np.astype(np.int32)),
++                device=self.device,
++            )
++            if tree_depths_np is not None:
++                tree_depths_t = async_tensor_h2d(
++                    np.ascontiguousarray(tree_depths_np.astype(np.int32)),
++                    device=self.device,
++                )
+ 
+         return SpecDecodeMetadata(
+             draft_token_ids=draft_token_ids,
+@@ -2868,6 +3476,11 @@
+             target_logits_indices=target_logits_indices,
+             bonus_logits_indices=bonus_logits_indices,
+             logits_indices=logits_indices,
++            tree_parents=tree_parents_t,
++            tree_node_depths=tree_depths_t,
++            tree_parents_np=tree_parents_np,
++            tree_depths_np=tree_depths_np,
++            tree_branching=bool(tree_branching),
+         )
+ 
+     def _prepare_kv_sharing_fast_prefill(
+@@ -4179,6 +4792,10 @@
+                 max_num_scheduled_tokens=max_num_scheduled_tokens,
+                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
++                # Tree verify: `_prepare_inputs` decided whether THIS step is
++                # replayable against the captured FULL tree graph.  None outside
++                # CF_TREE_FULLCG, so stock dispatch is untouched.
++                force_uniform_decode=self._cf_force_uniform,
+             )
+ 
+             logger.debug(
+@@ -4491,6 +5108,7 @@
+         with record_function_or_nullcontext("gpu_model_runner: sample"):
+             sampler_output = self._sample(logits, spec_decode_metadata)
+ 
++        self._tree_postprocess(slot_mappings)
+         self._update_states_after_model_execute(
+             sampler_output.sampled_token_ids, scheduler_output
+         )
+@@ -4789,6 +5407,44 @@
+             self.input_batch.num_tokens_no_spec[i] = pos + 1
+         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+ 
++    def _cf_static_depths(self, num_reqs: int) -> np.ndarray:
++        """Node depths of the canonical keep x depth tree, tiled over ``num_reqs``.
++
++        Level-major BFS, so ``depth[i] = i // keep`` -- a constant of the SHAPE, which is
++        why CF_ASYNC_SPEC never has to ship depths back from the device.  Cached because
++        it is recomputed on every step of a steady-state run.
++        """
++        cache = getattr(self, "_cf_depths_cache", None)
++        if cache is None:
++            cache = self._cf_depths_cache = {}
++        d = cache.get(num_reqs)
++        if d is None:
++            keep, maxd = self._cf_tree_keep, self._cf_tree_maxd
++            one = np.repeat(np.arange(maxd, dtype=np.int32), keep)
++            d = cache[num_reqs] = np.tile(one, num_reqs)
++        return d
++
++    def _cf_h2d(self, key: str, vals: list) -> torch.Tensor:
++        """int64 host list -> GPU with no host sync (persistent pinned staging buffer)."""
++        import numpy as _np
++
++        arr = _np.asarray(vals, dtype=_np.int64)
++        n = arr.shape[0]
++        store = getattr(self, "_cf_pin", None)
++        if store is None:
++            store = self._cf_pin = {}
++        ent = store.get(key)
++        if ent is None or ent[0].shape[0] < n:
++            cap = max(n, 1024)
++            ent = store[key] = (
++                torch.empty(cap, dtype=torch.int64, pin_memory=True),
++                torch.empty(cap, dtype=torch.int64, device=self.device),
++            )
++        cpu, gpu = ent
++        cpu[:n].copy_(torch.from_numpy(arr))
++        gpu[:n].copy_(cpu[:n], non_blocking=True)
++        return gpu[:n]
++
+     def take_draft_token_ids(self) -> DraftTokenIds | None:
+         if not self.num_spec_tokens or not self._draft_token_req_ids:
+             return None
+@@ -6722,6 +7378,56 @@
+         if num_warmups is None:
+             num_warmups = self.compilation_config.cudagraph_num_of_warmups
+         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
++        # TREE VERIFY: the attention fix-up and the tree GDN kernels are gated on
++        # `tree_state.CURRENT`.  With CURRENT None (the default during capture)
++        # they are simply NOT TRACED, so the captured decode graph silently runs
++        # stock chain attention/GDN over a tree layout -- the exact silent
++        # failure that made CF_TREE_FULLCG a timing probe rather than a working
++        # path.  Install the PERSISTENT step (the same object, and therefore the
++        # same tensor addresses, that every replay will refill) for the duration
++        # of the warmups and the capture.
++        _cf_tree_prev = tree_state.get_current()
++        _cf_tree_installed = False
++        if (
++            self._cf_tree_fullcg
++            and cudagraph_runtime_mode == CUDAGraphMode.FULL
++            and desc.uniform
++        ):
++            _S = desc.num_tokens // self.uniform_decode_query_len
++            _N = self.num_spec_tokens - 1
++            _cts = tree_state.get_static_step(
++                S=_S, N=_N, device=self.device, max_ctx=self._cf_tree_max_ctx
++            )
++            tree_state.synthetic_fill(
++                _cts,
++                keep=self._cf_tree_keep,
++                depth=self._cf_tree_maxd,
++                device=self.device,
++            )
++            tree_state.set_current(_cts)
++            _cf_tree_installed = True
++        try:
++            self._warmup_and_capture_inner(
++                desc,
++                cudagraph_runtime_mode,
++                profile_seq_lens,
++                allow_microbatching,
++                num_warmups,
++                force_attention,
++            )
++        finally:
++            if _cf_tree_installed:
++                tree_state.set_current(_cf_tree_prev)
++
++    def _warmup_and_capture_inner(
++        self,
++        desc: BatchDescriptor,
++        cudagraph_runtime_mode: CUDAGraphMode,
++        profile_seq_lens: int | None,
++        allow_microbatching: bool,
++        num_warmups: int,
++        force_attention: bool,
++    ):
+         for _ in range(num_warmups):
+             self._dummy_run(
+                 desc.num_tokens,
+--- a/vllm/v1/spec_decode/tree_state.py
++++ b/vllm/v1/spec_decode/tree_state.py
+@@ -0,0 +1,684 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Tree speculative decoding support (chained-flow fork of vLLM 0.25.1).
++
++Stock vLLM verifies a LINEAR CHAIN of draft tokens.  This module carries the
++extra per-step state needed to verify a draft TREE in a single forward pass:
++
++  * a proposer-side registry mapping ``req_id -> (tokens, parents, depths)``
++    (the ``custom_class`` proposer hook only returns a flat token list, so the
++    tree shape travels out of band and is re-validated against the tokens the
++    scheduler actually scheduled);
++  * a per-step ``TreeStep`` object holding the flattened tree layout for the
++    current ``execute_model`` call, read by the attention backends and by the
++    rejection sampler.
++
++Everything is inert unless ``VLLM_SPEC_TREE=1``.
++"""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass, field
++
++import numpy as np
++import torch
++
++
++def tree_enabled() -> bool:
++    return os.environ.get("VLLM_SPEC_TREE", "0") == "1"
++
++
++def force_tree_attn() -> bool:
++    """Run the tree attention fix-up even for chain-shaped trees.
++
++    For a chain the ancestor mask IS the causal mask, so the fix-up is a no-op
++    mathematically; forcing it on is how we prove the decomposition is exact.
++    """
++    return os.environ.get("VLLM_SPEC_TREE_ATTN_FORCE", "0") == "1"
++
++
++def attn_off() -> bool:
++    """Debug: skip the tree attention fix-up (isolation only)."""
++    return os.environ.get("VLLM_SPEC_TREE_ATTN_OFF", "0") == "1"
++
++
++def force_tree_gdn() -> bool:
++    """Run the tree GDN kernels even for chain-shaped trees (equivalence test)."""
++    return os.environ.get("VLLM_SPEC_TREE_GDN_FORCE", "0") == "1"
++
++
++# ---------------------------------------------------------------------------
++# Proposer -> model-runner side channel
++# ---------------------------------------------------------------------------
++# req_id -> (tokens tuple, parents list[int] (-1 for root), depths list[int])
++_REGISTRY: dict[str, tuple[tuple[int, ...], list[int], list[int]]] = {}
++
++
++def register(req_id: str, tokens, parents, depths) -> None:
++    _REGISTRY[str(req_id)] = (tuple(int(t) for t in tokens), list(parents), list(depths))
++
++
++# CF_ASYNC_SPEC: under vLLM async scheduling the scheduler never sees the draft token
++# VALUES -- ``AsyncScheduler`` pads every running request with ``-1`` placeholders and the
++# worker scatters the real ids into ``input_ids`` on the GPU.  So the token-equality check
++# below would fail on every step and every tree would silently degrade to chain semantics
++# (accept ~1.0).  Length agreement is the part that still carries information there: a
++# scheduler truncation still shows up as a short list.
++PLACEHOLDER_TOKENS = False
++
++# CF_ASYNC_SPEC: proposer-installed callback that joins the in-flight draft and publishes
++# this step's tree shape into the registry.  It is invoked from `_prepare_inputs` at the
++# LAST possible moment -- immediately before the registry is read -- because it blocks on
++# the GPU, and every host instruction placed after that block is GPU idle time.
++PENDING_JOIN = None
++
++
++def join_pending() -> None:
++    if PENDING_JOIN is not None:
++        PENDING_JOIN()
++
++
++# ---------------------------------------------------------------------------
++# CF_ASYNC_SPEC: the GPU-RESIDENT tree hand-off (this is what deletes the join)
++# ---------------------------------------------------------------------------
++# The join above exists for one reason: `_prepare_inputs` needs the tree PARENTS on the
++# host to build the ancestor mask, the GDN `chain` and `target_logits_indices`.  It blocks
++# on the in-flight draft, and every host instruction after it -- the rest of the tree
++# metadata, the cudagraph dispatch, the forward launch -- then runs against a DRAINED GPU.
++# Measured at 4B: ~1.45 ms/step of pure GPU idle.
++#
++# `_GPU_TREE` is the way out.  The draft cudagraph already produced the parents ON THE
++# DEVICE (`ch[:, N:]`); everything `_prepare_inputs` derives from them is index arithmetic
++# and can be derived there too.  Publishing that tensor lets the CANONICAL steady-state
++# step skip the registry, skip the join, and let the whole of `_prepare_inputs` overlap
++# step N's GPU work.
++#
++# Consume-once by construction: a stale hand-off is worse than none (it would describe the
++# PREVIOUS step's tree), so `take_gpu_tree` clears the slot and the identity of the batch
++# is re-checked on every read.
++_GPU_TREE: dict | None = None
++
++
++def publish_gpu_tree(*, parents, req_ids, n: int, discard) -> None:
++    """Called by the proposer once the draft is enqueued.
++
++    ``parents`` is [num_rows, n] on the device, row-aligned to ``req_ids`` (which are the
++    input-batch req_ids AT DRAFT TIME).  ``discard`` drops the proposer's pending host
++    staging without synchronising, for the steps that end up taking this path.
++    """
++    global _GPU_TREE
++    _GPU_TREE = {
++        "parents": parents,
++        "req_ids": list(req_ids),
++        "n": int(n),
++        "discard": discard,
++    }
++
++
++def has_gpu_tree() -> bool:
++    """Cheap gate so the canonical predicate costs a single None check when the device
++    hand-off is not in use at all (CF_ASYNC_SPEC off).  Without it, every SYNCHRONOUS step
++    pays for a duplicate scan of `scheduled_spec_decode_tokens` plus two numpy reductions
++    -- measured at ~1% of 4B throughput, i.e. a real regression on the default path."""
++    return _GPU_TREE is not None
++
++
++def take_gpu_tree(req_ids, num_reqs: int, n: int):
++    """Return the device parents iff they describe EXACTLY this step's batch.
++
++    The input batch can condense between steps (a finished request moves a live one down
++    to a lower index), which silently re-maps every row.  Identity is therefore checked on
++    the req_id strings, not on the row count -- host data, so it costs no sync.
++    """
++    global _GPU_TREE
++    g = _GPU_TREE
++    _GPU_TREE = None
++    if g is None or g["n"] != n:
++        return None
++    r = g["req_ids"]
++    if len(r) != num_reqs:
++        return None
++    for a, b in zip(r, req_ids):
++        if a != b:
++            return None
++    p = g["parents"]
++    if p.shape[0] != num_reqs or p.shape[1] != n:
++        return None
++    return p, g["discard"]
++
++
++def drop_gpu_tree() -> None:
++    global _GPU_TREE
++    _GPU_TREE = None
++
++
++def device_walk(parents_nodes: torch.Tensor, N: int, K: int, out: torch.Tensor):
++    """Ancestor walk in ROW space, entirely on the device.
++
++    ``parents_nodes`` is [S, N] with -1 for a tree root.  Query row 0 of a request is the
++    previously committed token and row ``1 + i`` is node ``i``; a root's parent is row 0
++    and row 0's parent is itself, so the walk never escapes the request (this is exactly
++    the clamping ``tree_gdn._layout_np`` does on the host).
++
++    Writes ``out[s, t, k] = parent^k(t)`` (row-local) and returns the [S, N+1, K] view.
++    One gather per level -- K-1 kernels for the whole table, and the SAME table serves both
++    the GDN `chain` and the attention ancestor mask.
++    """
++    S = parents_nodes.shape[0]
++    dev = parents_nodes.device
++    # row-space parent table: rp[0] = 0 (self), rp[1+i] = 0 if root else 1 + parents[i]
++    rp = torch.empty((S, N + 1), dtype=torch.long, device=dev)
++    rp[:, 0] = 0
++    p = parents_nodes.long()
++    rp[:, 1:] = torch.where(p < 0, torch.zeros_like(p), p + 1)
++    cur = torch.arange(N + 1, device=dev, dtype=torch.long).expand(S, N + 1)
++    w = out[:, :, :K]
++    w[:, :, 0] = cur
++    for k in range(1, K):
++        cur = rp.gather(1, cur)
++        w[:, :, k] = cur
++    return w
++
++
++def lookup(req_id: str, tokens) -> tuple[list[int], list[int]] | None:
++    """Return (parents, depths) if a registered tree matches ``tokens`` exactly.
++
++    The scheduler may truncate/drop speculative tokens (chunked prefill, guided
++    decoding rollback).  If the tokens do not match what we registered, the tree
++    shape is stale and the caller must fall back to chain semantics.
++    """
++    ent = _REGISTRY.get(str(req_id))
++    if ent is None:
++        return None
++    toks, parents, depths = ent
++    if len(toks) != len(tokens):
++        return None
++    if not PLACEHOLDER_TOKENS:
++        for a, b in zip(toks, tokens):
++            if int(a) != int(b):
++                return None
++    return parents, depths
++
++
++def drop(req_ids) -> None:
++    live = set(str(r) for r in req_ids)
++    for k in list(_REGISTRY):
++        if k not in live:
++            _REGISTRY.pop(k, None)
++
++
++def clear_registry() -> None:
++    """Invalidate every registered tree.
++
++    Used when the caller knows the registry cannot describe the CURRENT step -- an empty
++    registry makes `lookup` return None, which takes the documented stale-tree fallback
++    (slower, PIECEWISE) instead of silently verifying a tree against the wrong shape.
++    """
++    _REGISTRY.clear()
++
++
++# ---------------------------------------------------------------------------
++# Per-step state
++# ---------------------------------------------------------------------------
++@dataclass
++class TreeStep:
++    """Flattened tree layout for the current execute_model call."""
++
++    # per draft token (flat, concatenated over requests, BFS order per request)
++    parents_np: np.ndarray  # local node parent index, -1 for the root
++    depths_np: np.ndarray  # local node depth (root == 0)
++    num_draft_tokens: np.ndarray  # [num_reqs]
++    # request indices (into the input batch) that carry a *branching* tree
++    branching: bool = False
++    # filled in by the model runner once known
++    parents_gpu: torch.Tensor | None = None
++    depths_gpu: torch.Tensor | None = None
++    # token-row index (into the flat query buffer) of each draft node
++    node_rows_np: np.ndarray | None = None
++    # [num_reqs] number of tree nodes; 0 for non-spec requests
++    # accepted path (node indices) filled by the rejection sampler
++    accepted_path: torch.Tensor | None = None
++    accepted_len: torch.Tensor | None = None
++    # attention plumbing
++    spec_req_idx: torch.Tensor | None = None
++    ctx_lens: torch.Tensor | None = None
++    cu_q: torch.Tensor | None = None
++    tree_token_idx: torch.Tensor | None = None
++    anc_mask: torch.Tensor | None = None
++    max_nodes: int = 0
++    extras: dict = field(default_factory=dict)
++
++
++def build_attn_plumbing(
++    ts: "TreeStep",
++    *,
++    num_reqs: int,
++    num_scheduled_tokens: np.ndarray,
++    cu_num_tokens: np.ndarray,
++    num_computed_tokens: np.ndarray,
++    device: torch.device,
++) -> None:
++    """Precompute everything the full-attention tree fix-up needs.
++
++    Full attention over a tree = attention over the shared PREFIX (paged KV,
++    every node sees all of it) merged (log-sum-exp) with a tiny dense attention
++    over the request's own tree nodes under an ANCESTOR mask.  This routine
++    builds the index / mask tensors for the second part and the varlen
++    descriptors for the first.
++    """
++    parents, depths = ts.parents_np, ts.depths_np
++    nd = ts.num_draft_tokens
++    off = 0
++    req_idx: list[int] = []
++    node_rows: list[np.ndarray] = []
++    ctx_lens: list[int] = []
++    anc: list[np.ndarray] = []
++    nmax = 0
++    for r in range(num_reqs):
++        n = int(nd[r])
++        if n == 0:
++            continue
++        p = parents[off : off + n]
++        off += n
++        if int(num_scheduled_tokens[r]) != n + 1:
++            # chunked prefill + spec: leave to the stock (chain) path
++            continue
++        start = int(cu_num_tokens[r]) - (n + 1)
++        req_idx.append(r)
++        node_rows.append(np.arange(start + 1, start + 1 + n, dtype=np.int64))
++        # prefix = everything up to and including the last committed token
++        ctx_lens.append(int(num_computed_tokens[r]) + 1)
++        a = np.zeros((n, n), dtype=bool)
++        for i in range(n):
++            j = i
++            while j >= 0:
++                a[i, j] = True
++                j = int(p[j])
++        anc.append(a)
++        nmax = max(nmax, n)
++    if not req_idx:
++        return
++    S = len(req_idx)
++    counts = np.array([len(x) for x in node_rows], dtype=np.int32)
++    idx_pad = np.zeros((S, nmax), dtype=np.int64)
++    valid = np.zeros((S, nmax), dtype=bool)
++    mask = np.zeros((S, nmax, nmax), dtype=bool)
++    for s in range(S):
++        n = int(counts[s])
++        idx_pad[s, :n] = node_rows[s]
++        idx_pad[s, n:] = node_rows[s][0]
++        valid[s, :n] = True
++        mask[s, :n, :n] = anc[s]
++        for i in range(n, nmax):  # padded rows attend to themselves only
++            mask[s, i, 0] = True
++    cu = np.zeros(S + 1, dtype=np.int32)
++    np.cumsum(counts, out=cu[1:])
++
++    def h2d(a, dtype):
++        return torch.from_numpy(np.ascontiguousarray(a)).to(
++            device=device, dtype=dtype, non_blocking=True
++        )
++
++    ts.spec_req_idx = h2d(np.array(req_idx, dtype=np.int64), torch.int64)
++    ts.tree_token_idx = h2d(np.concatenate(node_rows), torch.int64)
++    ts.ctx_lens = h2d(np.array(ctx_lens, dtype=np.int32), torch.int32)
++    ts.cu_q = h2d(cu, torch.int32)
++    ts.anc_mask = h2d(mask, torch.bool)
++    ts.extras["idx_pad"] = h2d(idx_pad, torch.int64)
++    ts.extras["valid_pad"] = h2d(valid, torch.bool)
++    # PADDED-ROW COMPACTION INDEX.  `_tree_attention_fixup` used to compact its
++    # [S*nmax, ...] results with BOOLEAN MASK indexing (`x[valid_pad.view(-1)]`),
++    # whose output shape is data-dependent and therefore forces a D2H
++    # synchronization -- TWICE PER ATTENTION LAYER, i.e. 2 x n_attn_layers host
++    # syncs inside every verify forward.  The valid positions are already known
++    # HERE, on the host, so publish them as an int index and let the fixup use
++    # `index_select` (static shape, no sync).
++    ts.extras["valid_idx"] = h2d(np.flatnonzero(valid.reshape(-1)), torch.int64)
++    # The attention fix-up masks with `~anc_mask`; negating it per attention layer is
++    # n_attn_layers wasted launches on a host-bound path.  Ship the negation.
++    ts.extras["not_anc"] = h2d(~mask, torch.bool)
++    ts.extras["counts"] = counts
++    ts.extras["nmax"] = nmax
++    ts.extras["max_ctx"] = int(max(ctx_lens))
++    ts.extras["num_spec"] = S
++    ts.extras["spec_req_np"] = np.array(req_idx, dtype=np.int64)
++
++
++# ---------------------------------------------------------------------------
++# PERSISTENT (cudagraph-safe) step state -- CF_TREE_FULLCG
++# ---------------------------------------------------------------------------
++# Everything above allocates fresh tensors every step.  That is fine for the
++# PIECEWISE path (the python re-runs and re-reads them) but fatal under a FULL
++# cudagraph, which bakes the ADDRESS of every tensor its kernels touch: a graph
++# captured against step 1's plumbing would keep reading step 1's (freed, reused)
++# memory on every replay -- silently wrong, no crash, and it shows up first as an
++# accept drop.
++#
++# So for the one batch shape the graph is captured for -- S requests, each with
++# exactly N tree nodes and N+1 scheduled query rows -- the whole plumbing is a
++# module-level singleton, allocated once and REFILLED IN PLACE.
++#
++# STATIC-SHAPE INVENTORY (constant given (S, N), never refilled):
++#   spec_req_idx = arange(S)          (graphable => every request is a spec req)
++#   tree_token_idx / idx_pad          (row r*(N+1)+1 .. r*(N+1)+N)
++#   valid_idx = arange(S*N), valid_pad = all True, cu_q = arange(S+1)*N
++#   nmax = N, num_spec = S, counts = N
++#   max_ctx  -- a COMPILE-TIME CONSTANT baked into the FlashAttention launch, so
++#               it must be an UPPER BOUND (max_model_len).  The true per-request
++#               lengths still come from the `ctx_lens` tensor.
++# PER-STEP (refilled through pinned staging):  not_anc [S,N,N], ctx_lens [S].
++_STATIC_STEPS: dict[tuple, TreeStep] = {}
++
++
++def fullcg_check() -> bool:
++    """CF_TREE_FULLCG_CHECK=1: re-derive the plumbing the dynamic way on every
++    live step and assert the static buffers match, so staleness is LOUD."""
++    return os.environ.get("CF_TREE_FULLCG_CHECK", "0") == "1"
++
++
++def get_static_step(
++    *, S: int, N: int, device: torch.device, max_ctx: int
++) -> TreeStep:
++    key = (int(S), int(N), str(device))
++    ts = _STATIC_STEPS.get(key)
++    if ts is not None:
++        return ts
++    # Allocate OUTSIDE inference mode.  A tensor born inside `inference_mode`
++    # is an "inference tensor" and may never be mutated outside it -- but these
++    # buffers are refilled from both `_prepare_inputs` (inference mode) and
++    # `_warmup_and_capture` (not).
++    with torch.inference_mode(False):
++        return _alloc_static_step(key, S, N, device, max_ctx)
++
++
++def _alloc_static_step(key, S: int, N: int, device, max_ctx: int) -> TreeStep:
++    rows = (
++        np.arange(S, dtype=np.int64)[:, None] * (N + 1)
++        + 1
++        + np.arange(N, dtype=np.int64)[None, :]
++    )  # [S, N]
++
++    def h2d(a, dtype):
++        return torch.from_numpy(np.ascontiguousarray(a)).to(device=device, dtype=dtype)
++
++    ts = TreeStep(
++        parents_np=np.zeros(S * N, dtype=np.int32),
++        depths_np=np.zeros(S * N, dtype=np.int32),
++        num_draft_tokens=np.full(S, N, dtype=np.int32),
++        branching=True,
++        max_nodes=N,
++    )
++    ts.spec_req_idx = h2d(np.arange(S), torch.int64)
++    ts.tree_token_idx = h2d(rows.reshape(-1), torch.int64)
++    ts.cu_q = h2d(np.arange(S + 1) * N, torch.int32)
++    ts.ctx_lens = torch.zeros(S, dtype=torch.int32, device=device)
++    # `anc_mask` is DEAD after the hoist -- only extras["not_anc"] is read -- so
++    # the static step deliberately leaves it None.
++    ts.anc_mask = None
++    ts.extras["idx_pad"] = h2d(rows, torch.int64)
++    ts.extras["valid_pad"] = torch.ones((S, N), dtype=torch.bool, device=device)
++    ts.extras["valid_idx"] = h2d(np.arange(S * N), torch.int64)
++    ts.extras["not_anc"] = torch.zeros((S, N, N), dtype=torch.bool, device=device)
++    ts.extras["counts"] = np.full(S, N, dtype=np.int32)
++    ts.extras["nmax"] = N
++    ts.extras["num_spec"] = S
++    ts.extras["max_ctx"] = int(max_ctx)
++    ts.extras["spec_req_np"] = np.arange(S, dtype=np.int64)
++    ts.extras["static"] = True
++    ts.extras["_pin_not_anc"] = torch.empty(
++        (S, N, N), dtype=torch.bool, pin_memory=True
++    )
++    ts.extras["_pin_ctx"] = torch.empty(S, dtype=torch.int32, pin_memory=True)
++    # CF_ASYNC_SPEC device-resident scratch for `fill_static_step_gpu`.  Allocated HERE,
++    # inside the caller's `inference_mode(False)`, for the same reason the rest of the
++    # persistent step is: a tensor born inside inference mode may never be mutated outside
++    # it, and these are refilled from both `_prepare_inputs` (inference) and the capture
++    # path (not).  Sized for the worst-case chain length so one buffer covers any maxd.
++    ts.extras["_walk"] = torch.empty((S, N + 1, N + 1), dtype=torch.long, device=device)
++    ts.extras["_anc_buf"] = torch.empty((S, N, N + 1), dtype=torch.bool, device=device)
++    _STATIC_STEPS[key] = ts
++    return ts
++
++
++def fill_static_step(
++    ts: TreeStep,
++    *,
++    parents_np: np.ndarray,
++    depths_np: np.ndarray,
++    ctx_lens_np: np.ndarray,
++    maxd: int,
++    device: torch.device,
++    parents_gpu: torch.Tensor | None = None,
++    depths_gpu: torch.Tensor | None = None,
++    ctx_lens_gpu: torch.Tensor | None = None,
++) -> None:
++    """Refill the persistent step IN PLACE (host->device, no sync, no alloc).
++
++    ``ctx_lens_gpu`` overrides ``ctx_lens_np``.  Under ASYNC SCHEDULING the host's
++    ``num_computed_tokens_cpu`` is the scheduler's OPTIMISTIC value (all drafts assumed
++    accepted); only the GPU copy has been walked back by the previous step's rejections.
++    The tree attention fix-up uses ``ctx_lens`` as the paged-KV prefix length, so taking it
++    from the host there would make every node attend past the real end of its context.
++    """
++    from vllm.v1.spec_decode import tree_gdn as _tg
++
++    S = ts.extras["num_spec"]
++    N = ts.extras["nmax"]
++    # --- ancestor mask -----------------------------------------------------
++    anc = np.zeros((S, N, N), dtype=bool)
++    for s in range(S):
++        p = parents_np[s * N : (s + 1) * N]
++        for i in range(N):
++            j = i
++            while j >= 0:
++                anc[s, i, j] = True
++                j = int(p[j])
++    pin = ts.extras["_pin_not_anc"]
++    pin.copy_(torch.from_numpy(~anc))
++    ts.extras["not_anc"].copy_(pin, non_blocking=True)
++    if ctx_lens_gpu is not None:
++        ts.ctx_lens.copy_(ctx_lens_gpu[: ts.ctx_lens.shape[0]], non_blocking=True)
++    else:
++        pc = ts.extras["_pin_ctx"]
++        pc.copy_(torch.from_numpy(np.ascontiguousarray(ctx_lens_np, dtype=np.int32)))
++        ts.ctx_lens.copy_(pc, non_blocking=True)
++    # --- host-side fields read outside the graph ---------------------------
++    ts.parents_np = parents_np
++    ts.depths_np = depths_np
++    ts.parents_gpu = parents_gpu
++    ts.depths_gpu = depths_gpu
++    ts.branching = True
++    ts.accepted_path = None
++    ts.accepted_len = None
++    ts.extras.pop("gdn_next_accepted", None)
++    ts.extras.pop("accepted_path_cpu", None)
++    ts.extras.pop("accepted_len_cpu", None)
++    # --- GDN layout: build/fill the singleton and stash it where the GDN
++    # layer's `extras.get("gdn_layout")` will find it (no call-site edit).
++    lay = _tg.get_static_layout(S=S, N=N, maxd=maxd, device=device)
++    _tg.fill_static_layout(
++        lay,
++        parents_np=parents_np,
++        depths_np=depths_np,
++        num_draft_tokens=ts.num_draft_tokens,
++        spec_req_order=ts.extras["spec_req_np"],
++    )
++    ts.extras["gdn_layout"] = lay
++
++
++def fill_static_step_gpu(
++    ts: TreeStep,
++    *,
++    parents_gpu_2d: torch.Tensor,
++    depths_np: np.ndarray,
++    ctx_lens_gpu: torch.Tensor,
++    maxd: int,
++    device: torch.device,
++) -> None:
++    """`fill_static_step` with NO host dependency on the tree shape.
++
++    Everything the step needs from the parents -- the ancestor mask and the GDN `chain` --
++    is derived on the device from ONE walk table, so the draft never has to come back to
++    the host and `_prepare_inputs` never has to block on it.  ``depths_np`` is still a host
++    array, but it is a CONSTANT of the tree shape (level-major BFS: ``depth[i] = i // keep``),
++    not step data.
++
++    Kernel count is ~16 launches for the whole thing.  That is not a saving over the numpy
++    version -- it is roughly a wash -- and it is not the point: the point is that these
++    launches can be issued while step N is still running on the GPU, which the host walk
++    could not.
++    """
++    from vllm.v1.spec_decode import tree_gdn as _tg
++
++    S = ts.extras["num_spec"]
++    N = ts.extras["nmax"]
++    assert parents_gpu_2d.shape == (S, N), (
++        f"tree GPU parents {tuple(parents_gpu_2d.shape)} != ({S}, {N})"
++    )
++    chain_w = max(maxd, 3) + 1
++    # One walk table serves both consumers: row-space, [S, N+1, chain_w].
++    w = device_walk(parents_gpu_2d, N, chain_w, ts.extras["_walk"])
++
++    # --- ancestor mask, from the walk --------------------------------------
++    # Rows 1..N are the nodes.  A walk entry of 0 means "past the root", so it is routed to
++    # a trash column instead of being clamped onto node 0 (which would mark a bogus
++    # ancestor).  `maxd` columns is exactly the longest possible chain.
++    v = w[:, 1:, :maxd]                                   # [S, N, maxd] row ids
++    idx = torch.where(v > 0, v - 1, torch.full_like(v, N))
++    buf = ts.extras["_anc_buf"]
++    buf.zero_()
++    buf.scatter_(2, idx, True)
++    torch.logical_not(buf[:, :, :N], out=ts.extras["not_anc"])
++
++    ts.ctx_lens.copy_(ctx_lens_gpu[: ts.ctx_lens.shape[0]], non_blocking=True)
++
++    # --- host-side fields --------------------------------------------------
++    # `parents_np` is deliberately None: there IS no host copy on this path, and anything
++    # that silently fell back to reading it would be reading a stale step.
++    ts.parents_np = None
++    ts.depths_np = depths_np
++    ts.parents_gpu = parents_gpu_2d.reshape(-1)
++    ts.depths_gpu = None
++    ts.branching = True
++    ts.accepted_path = None
++    ts.accepted_len = None
++    ts.extras.pop("gdn_next_accepted", None)
++    ts.extras.pop("accepted_path_cpu", None)
++    ts.extras.pop("accepted_len_cpu", None)
++
++    # --- GDN layout --------------------------------------------------------
++    # `chain` is the SAME walk, made global: row t of request s is s*(N+1) + t.
++    lay = _tg.get_static_layout(S=S, N=N, maxd=maxd, device=device)
++    base = (
++        torch.arange(S, device=device, dtype=torch.long).unsqueeze(1) * (N + 1)
++    ).unsqueeze(2)
++    lay.chain.copy_((w + base).reshape(S * (N + 1), chain_w))
++    _tg.fill_static_layout_gpu(lay, depths_np=depths_np)
++    ts.extras["gdn_layout"] = lay
++
++
++def check_static_step(
++    ts: TreeStep,
++    *,
++    num_reqs: int,
++    num_scheduled_tokens: np.ndarray,
++    cu_num_tokens: np.ndarray,
++    num_computed_tokens: np.ndarray,
++    device: torch.device,
++) -> None:
++    """CF_TREE_FULLCG_CHECK=1 -- assert the persistent buffers equal what the
++    dynamic (PIECEWISE) path would have produced for THIS step."""
++    from vllm.v1.spec_decode import tree_gdn as _tg
++
++    assert ts.parents_np is not None, (
++        "[tree-fullcg-check] this step was filled by `fill_static_step_gpu`, which keeps "
++        "no host copy of the parents. Run the check with CF_ASYNC_SPEC=0."
++    )
++
++    ref = TreeStep(
++        parents_np=ts.parents_np,
++        depths_np=ts.depths_np,
++        num_draft_tokens=ts.num_draft_tokens,
++        branching=True,
++        max_nodes=int(ts.num_draft_tokens.max()),
++    )
++    build_attn_plumbing(
++        ref,
++        num_reqs=num_reqs,
++        num_scheduled_tokens=num_scheduled_tokens,
++        cu_num_tokens=cu_num_tokens,
++        num_computed_tokens=num_computed_tokens,
++        device=device,
++    )
++    for name, a, b in (
++        ("spec_req_idx", ts.spec_req_idx, ref.spec_req_idx),
++        ("tree_token_idx", ts.tree_token_idx, ref.tree_token_idx),
++        ("ctx_lens", ts.ctx_lens, ref.ctx_lens),
++        ("cu_q", ts.cu_q, ref.cu_q),
++        ("idx_pad", ts.extras["idx_pad"], ref.extras["idx_pad"]),
++        ("valid_idx", ts.extras["valid_idx"], ref.extras["valid_idx"]),
++        ("valid_pad", ts.extras["valid_pad"], ref.extras["valid_pad"]),
++        ("not_anc", ts.extras["not_anc"], ref.extras["not_anc"]),
++    ):
++        assert torch.equal(a, b), f"[tree-fullcg-check] {name} mismatch"
++    assert ts.extras["nmax"] == ref.extras["nmax"], "[tree-fullcg-check] nmax"
++    assert ts.extras["num_spec"] == ref.extras["num_spec"], "[tree-fullcg-check] S"
++    assert ts.extras["max_ctx"] >= ref.extras["max_ctx"], (
++        f"[tree-fullcg-check] max_ctx {ts.extras['max_ctx']} is not an upper "
++        f"bound for {ref.extras['max_ctx']}"
++    )
++    rlay = _tg.build_gdn_layout(
++        parents_np=ts.parents_np,
++        depths_np=ts.depths_np,
++        num_draft_tokens=ts.num_draft_tokens,
++        spec_req_order=ts.extras["spec_req_np"],
++        device=device,
++    )
++    slay = ts.extras["gdn_layout"]
++    for name in ("chain", "depth", "seq", "loc"):
++        assert torch.equal(getattr(slay, name), getattr(rlay, name)), (
++            f"[tree-fullcg-check] gdn_layout.{name} mismatch"
++        )
++    assert slay.maxd == rlay.maxd and slay.num_rows == rlay.num_rows, (
++        "[tree-fullcg-check] gdn_layout maxd/num_rows mismatch"
++    )
++    assert slay.hoist is None, "[tree-fullcg-check] stale hoist cache"
++
++
++def synthetic_fill(ts: TreeStep, *, keep: int, depth: int, device: torch.device) -> None:
++    """Fill the persistent step with a shape-valid dummy tree, for CAPTURE.
++
++    Values are irrelevant to a capture (only shapes, addresses and the
++    host-constant kernel arguments are baked); what matters is that the tree is
++    BRANCHING, has the right node count, and has the same ``maxd`` as every
++    graphable step -- ``maxd`` is a runtime kernel argument of the GDN scan and
++    the chain width is a tensor shape, so both must match at replay.
++    """
++    S = ts.extras["num_spec"]
++    N = ts.extras["nmax"]
++    assert keep * depth == N, f"tree shape {keep}x{depth} != {N} nodes"
++    depths = np.array([d for d in range(depth) for _ in range(keep)], dtype=np.int32)
++    parents = np.empty(N, dtype=np.int32)
++    for i in range(N):
++        lvl, slot = i // keep, i % keep
++        parents[i] = -1 if lvl == 0 else (lvl - 1) * keep + slot
++    fill_static_step(
++        ts,
++        parents_np=np.tile(parents, S),
++        depths_np=np.tile(depths, S),
++        ctx_lens_np=np.ones(S, dtype=np.int32),
++        maxd=depth,
++        device=device,
++    )
++
++
++CURRENT: TreeStep | None = None
++
++
++def set_current(step: TreeStep | None) -> None:
++    global CURRENT
++    CURRENT = step
++
++
++def get_current() -> TreeStep | None:
++    return CURRENT
+--- a/vllm/v1/spec_decode/tree_gdn_verify.py
++++ b/vllm/v1/spec_decode/tree_gdn_verify.py
+@@ -0,0 +1,144 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CF_GDN_CUDA=1: raw-CUDA, bit-exact drop-in for the Triton `_tree_gdn_kernel`.
++
++See ``tree_gdn_verify.cu`` for the arithmetic-order archaeology.  Both launches on
++the CF_GDN_DEFER path route through here -- the verify pass (all rows, output
++only) and the deferred finalize (accepted-leaf rows, state only) -- because they
++are the same kernel with different constexpr flags.
++
++Bit-exact against Triton at the 41-node shipping shape: 0 differing elements in
++``o`` and 0 in the written state, for every (BV, warps) combination.  Guard that
++with ``CF_GDN_CUDA_CHECK=1``, which runs the Triton kernel alongside and tallies
++mismatching elements in a device counter (no host sync, so it survives cudagraph
++replay).
++
++Tunables: ``CF_GDN_CUDA_BV`` (v-rows per warp, default 16 -- 32 costs 255
++registers and 8 costs redundant k-side work), ``CF_GDN_CUDA_WARPS`` (warps per
++block, default 1).
++"""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++import torch
++
++_ENABLED: bool | None = None
++_MOD = None
++_SRC = Path(__file__).resolve().parent / "tree_gdn_verify.cu"
++_BV = int(os.environ.get("CF_GDN_CUDA_BV", "0") or 0) or 16
++_WARPS = int(os.environ.get("CF_GDN_CUDA_WARPS", "0") or 0) or 1
++_CHECK = os.environ.get("CF_GDN_CUDA_CHECK", "0") == "1"
++# Which of the two launches the CUDA kernel serves.  They have OPPOSITE winners
++# and the reason is grid shape, not code quality: the verify pass launches
++# NV*HV*T warps (10k+) and Triton edges it there, while the finalize launches
++# NV*HV*S -- 128 warps at batch 1, far too few to hide anything -- where the CUDA
++# kernel's lower per-warp latency wins by ~2.3 us/layer at every size measured.
++_DO_VERIFY = os.environ.get("CF_GDN_CUDA_VERIFY", "1") == "1"
++_DO_FINAL = os.environ.get("CF_GDN_CUDA_FINALIZE", "1") == "1"
++_DBG = os.environ.get("CF_GDN_CUDA_DEBUG", "0") == "1"
++_CHK = None
++
++
++def _load():
++    global _MOD
++    if _MOD is None:
++        from torch.utils.cpp_extension import load
++
++        os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
++        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
++        # NO -use_fast_math: it would swap the accurate logf the softplus needs.
++        _MOD = load(
++            name="cf_tree_gdn_verify",
++            sources=[str(_SRC)],
++            extra_cuda_cflags=["-O3", "-lineinfo", "--expt-relaxed-constexpr"],
++            verbose=False,
++        )
++    return _MOD
++
++
++def enabled() -> bool:
++    global _ENABLED
++    if _ENABLED is None:
++        _ENABLED = os.environ.get("CF_GDN_CUDA", "0") == "1"
++        if _ENABLED:
++            _load()
++    return _ENABLED
++
++
++def route(is_verify: bool) -> bool:
++    """True if the CUDA kernel should serve this launch."""
++    return _DO_VERIFY if is_verify else _DO_FINAL
++
++
++def check_mode() -> bool:
++    """CF_GDN_CUDA_CHECK=1 -- tally the ENABLED geometry (CF_GDN_BV and/or the
++    CUDA kernel) against the reference Triton BV=32 arithmetic.  Not CUDA-specific
++    despite the name; the name is kept because the bench harness already prints
++    this counter and that harness is shared with other agents."""
++    return _CHECK
++
++
++def tally(got, ref) -> None:
++    global _CHK
++    if _CHK is None:
++        _CHK = torch.zeros(4, dtype=torch.int64, device=got.device)
++    bad = got != ref
++    _CHK[0] += bad.sum()
++    _CHK[1] += got.numel()
++    _CHK[2] += bad.any().to(torch.int64)
++    _CHK[3] += 1
++
++
++def check_counters():
++    """[mismatching elements, elements, calls with any mismatch, calls]"""
++    return None if _CHK is None else _CHK.tolist()
++
++
++_WHY = 0
++
++
++def supported(e: dict, meta) -> bool:
++    global _WHY
++    def no(r):
++        global _WHY
++        if _WHY < 4 and os.environ.get("CF_GDN_CUDA_DEBUG") == "1":
++            _WHY += 1
++            print(f"[cf-gdn-cuda] fallback: {r}", flush=True)
++        return False
++    if e["K"] != 128 or e["V"] % _BV or e["V"] > 128:
++        return no(f'shape K={e["K"]} V={e["V"]}')
++    if e["q"].dtype not in (torch.float16, torch.bfloat16):
++        return no(f'q dtype {e["q"].dtype}')
++    if e["state"].dtype not in (torch.float32, torch.bfloat16):
++        return no(f'state dtype {e["state"].dtype}')
++    for nm, t in (("q", e["q"]), ("k", e["k"]), ("v", e["v"])):
++        if not t.is_contiguous():
++            return no(f"{nm} not contiguous")
++    if meta.chain.dtype != torch.int32 or meta.depth.dtype != torch.int32:
++        return no("chain/depth dtype")
++    if meta.out_slot.dtype != torch.int32 or meta.init_slot.dtype != torch.int32:
++        return no("slot dtype")
++    if e["state"].stride(-1) != 1:
++        return no("state stride")
++    return True
++
++
++def run(e: dict, *, rows, n_rows: int, write_out: bool, write_state: bool) -> None:
++    meta = e["meta"]
++    global _DBG
++    if _DBG:
++        _DBG = False
++        print(
++            f"[cf-gdn-cuda] live: BV={_BV} warps={_WARPS} rows={n_rows} "
++            f"maxd={meta.maxd} HV={e['HV']} V={e['V']} state={e['state'].dtype}",
++            flush=True,
++        )
++    _load().gdn_verify(
++        e["A_log"], e["dt_bias"], e["a"], e["b"], e["q"], e["k"], e["v"], e["o"],
++        e["state"], meta.chain, meta.depth, meta.out_slot, meta.init_slot, rows,
++        float(e["scale"]), int(n_rows), int(meta.maxd), int(e["H"]),
++        int(e["HV"]), int(e["V"]), int(_BV), int(_WARPS), bool(write_out),
++        bool(write_state),
++    )
+--- a/vllm/v1/spec_decode/tree_gdn_factor.py
++++ b/vllm/v1/spec_decode/tree_gdn_factor.py
+@@ -0,0 +1,160 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CF_GDN_FACTOR=1: shared-root factorisation of the tree GDN recurrence.
++
++See ``tree_gdn_factor.cu`` for the algebra.  The short version: every node's
++recurrent state is the request's INITIAL state decayed plus at most ``depth``
++rank-1 terms, and the initial state is shared by all 41 nodes -- so the whole
++layer needs to read it ONCE (2.00 MiB) instead of once per node (82 MiB), and
++needs to write no state at all.
++
++REQUIRES CF_GDN_DEFER=1.  This kernel deliberately produces only ``o``; the one
++recurrent state that survives verification (the accepted leaf's) is materialised
++after sampling by the ORIGINAL Triton kernel, so the state carried into the next
++step stays bit-exact whatever this kernel does to the logits.
++
++NOT BIT-EXACT, BY CONSTRUCTION.  Unlike the fused tree-attention kernel -- which
++is a resummation of the same expression and could therefore be made exact -- this
++is a different expression for the same real number.  Expect ~1 ulp drift and
++expect it to move tokens; ``CF_GDN_FACTOR_CHECK=1`` tallies mismatching output
++elements against the Triton kernel on the device (no host sync, so it works under
++cudagraph replay) and the 7-domain sweep reports what it does to the text.
++"""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++import torch
++
++_ENABLED: bool | None = None
++_MOD = None
++_SRC = Path(__file__).resolve().parent / "tree_gdn_factor.cu"
++_DBG = os.environ.get("CF_GDN_FACTOR_DEBUG", "0") == "1"
++_CHECK = os.environ.get("CF_GDN_FACTOR_CHECK", "0") == "1"
++_BV = int(os.environ.get("CF_GDN_FACTOR_BV", "0") or 0) or 32
++_CHK = None
++
++
++def _load():
++    global _MOD
++    if _MOD is None:
++        from torch.utils.cpp_extension import load
++
++        os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
++        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
++        _MOD = load(
++            name="cf_tree_gdn_factor",
++            sources=[str(_SRC)],
++            extra_cuda_cflags=["-O3", "-lineinfo", "--expt-relaxed-constexpr"],
++            verbose=False,
++        )
++    return _MOD
++
++
++def enabled() -> bool:
++    """Built at model-load time, never inside a cudagraph capture."""
++    global _ENABLED
++    if _ENABLED is None:
++        _ENABLED = os.environ.get("CF_GDN_FACTOR", "0") == "1"
++        if _ENABLED:
++            _load()
++    return _ENABLED
++
++
++def check_mode() -> bool:
++    return _CHECK
++
++
++def tally(got: torch.Tensor, ref: torch.Tensor) -> None:
++    global _CHK
++    if _CHK is None:
++        _CHK = torch.zeros(4, dtype=torch.int64, device=got.device)
++    both_nan = torch.isnan(got.float()) & torch.isnan(ref.float())
++    bad = (got != ref) & ~both_nan
++    _CHK[0] += bad.sum()
++    _CHK[1] += got.numel()
++    _CHK[2] += bad.any().to(torch.int64)
++    _CHK[3] += 1
++
++
++def check_counters():
++    """[mismatching elements, elements, calls with any mismatch, calls]"""
++    return None if _CHK is None else _CHK.tolist()
++
++
++def supported(*, layout, meta, q, k, v, o, state, Kd, Vd) -> bool:
++    if layout is None:
++        return False
++    rs = getattr(layout, "row_start", None)
++    rc = getattr(layout, "row_count", None)
++    if rs is None or rc is None:
++        return False
++    if Kd != 128 or Vd % _BV or Vd > 128:
++        return False
++    if q.dtype not in (torch.float16, torch.bfloat16) or state.dtype != torch.float32:
++        return False
++    if layout.maxd > 8 or int(layout.n_max) > 64:
++        return False
++    for t in (q, k, v, o):
++        if not t.is_contiguous():
++            return False
++    if not (meta.chain.dtype == torch.int32 and meta.depth.dtype == torch.int32):
++        return False
++    if meta.init_slot.dtype != torch.int32:
++        return False
++    sm = _load().gdn_factor_smem(int(layout.n_max), _BV, int(layout.maxd))
++    return sm <= 160 * 1024
++
++
++def run(
++    *,
++    A_log,
++    dt_bias,
++    a,
++    b,
++    q,
++    k,
++    v,
++    o,
++    state,
++    meta,
++    layout,
++    scale,
++    H,
++    HV,
++    Vd,
++) -> None:
++    global _DBG
++    if _DBG:
++        _DBG = False
++        print(
++            f"[cf-gdn-factor] live: S={layout.row_start.numel()} "
++            f"n_max={int(layout.n_max)} maxd={layout.maxd} H={H} HV={HV} "
++            f"V={Vd} BV={_BV} dtype={q.dtype} "
++            f"smem={_load().gdn_factor_smem(int(layout.n_max), _BV, int(layout.maxd))}B",
++            flush=True,
++        )
++    _load().gdn_factor(
++        A_log,
++        dt_bias,
++        a,
++        b,
++        q,
++        k,
++        v,
++        o,
++        state,
++        meta.chain,
++        meta.depth,
++        meta.init_slot,
++        layout.row_start32,
++        layout.row_count,
++        float(scale),
++        int(layout.maxd),
++        int(layout.n_max),
++        int(H),
++        int(HV),
++        int(Vd),
++        int(_BV),
++    )
+--- a/vllm/v1/spec_decode/tree_attn_fused.py
++++ b/vllm/v1/spec_decode/tree_attn_fused.py
+@@ -0,0 +1,326 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CF_TREE_FUSED_ATTN=1: one hand-written CUDA kernel for the tree-attention
++fix-up's suffix half + the log-sum-exp merge.  See ``tree_attn_fused.cu``.
++
++WHY.  ``_tree_attention_fixup`` (flash_attn.py) computes the exact tree result
++as ``prefix (paged FA) (+lse) suffix (dense N x N, ancestor-masked)``.  The
++prefix half is a single FlashAttention launch, but the suffix half was a chain
++of ~16 eager torch ops -- three ``index_select``s, two ``repeat_interleave``s,
++an fp32 ``einsum``, ``masked_fill_``, ``amax``, ``exp``, ``sum``, ``log``,
++``div``, a second fp32 ``einsum``, two compaction ``index_select``s,
++``merge_attn_states`` and ``index_copy_`` -- ONCE PER FULL-ATTENTION LAYER.
++
++At the shipping tree the tensors involved are minuscule ([1, H, 40, 40] scores
++-- note the tree is CF_K - 1 = 40 NODES, not 41; 41 is CF_K, which counts the
++spare mamba state column), so every one of those launches is pure overhead:
++measured on 4B / batch 1 the whole fix-up costs 604 us per forward (11251.5 us
++with it, 10647.9 us with VLLM_SPEC_TREE_ATTN_OFF=1) of which only 87 us is the
++FlashAttention prefix call.  The rest is ~112 tiny kernel launches per step.
++
++This kernel does the whole suffix + merge in ONE launch per layer (8 per 4B/9B
++forward, 16 per 27B -- the layers are separated by GDN layers and MLPs so they
++cannot be merged further) and writes straight into ``output`` at the tree rows.
++Measured on the shipping shape (S=1, N=40, D=256, fp16, warps=4, gk=8):
++
++              eager chain   this kernel   per forward saved
++  4B / 9B     59.0 us/layer   5.33 us/layer   8 x 53.7 = 430 us
++  27B         61.9 us/layer   5.74 us/layer  16 x 56.2 = 899 us
++
++End to end, 7-domain batch-1 sweep, CF_MAXTOK=256: 4B 125.0 -> 130.4 tok/s,
++9B 81.7 -> 82.6, 27B 38.4 -> 39.3.
++
++SCOPE.  Only the FULL-cudagraph *static* tree step is handled (S requests x
++exactly N nodes, no padded rows) -- that is the shipping shape and it is what
++703/711 steps dispatch to.  Anything else falls back to the eager path, and so
++does any head_size the kernel is not instantiated for; ``fused_suffix_merge``
++returns False in that case and the caller runs the eager chain.
++
++NUMERICS.  The kernel is BIT-EXACT against ``_tree_suffix_eager`` at ALL THREE
++model sizes -- in-situ ``CF_TFA_CHECK=1`` over a full 7-domain sweep gives
++mismatching_elements = 0 at 4B (1.05e9 elements, 5728 calls), 9B (9.96e8, 5384)
++and 27B (2.80e9, 10016), covering H = 16 and H = 24 and every cudagraph-warmup
++batch S = 1..12.  Token ids are byte-identical to a flags-OFF run on 7/7 domains
++at 4B and 9B and on 6/7 at 27B -- and the 27B domain that differs (poff=2) ALSO
++differs between two flags-OFF runs of identical configuration, i.e. it is
++run-to-run nondeterminism in the surrounding pipeline, not this kernel.  (Same
++family as the known poff=3 artifact, where accept moves 2.448 <-> 2.471 at an
++identical token count.)  Exactness did not come for free; each of these was
++measured to matter, and each one, when wrong, put ~1 ulp on ~0.01% of elements
++and flipped real tokens:
++
++  * q.k^T is fp32-IEEE, never a tensor-core fp16/tf32 dot (the cheap dot is
++    ~8 us/layer faster but doubles the drift and changes the text), AND it is a
++    STRICTLY SEQUENTIAL FFMA chain over the head dim, because that is what
++    cuBLAS SGEMM does for this shape.  A warp-parallel dot with a cross-lane
++    tree is ~3x cheaper and disagrees on ~1 element in 10^4.
++  * the denominator reproduces ATen's ``sum(dim=-1)`` reduction (block width 32,
++    shfl-down tree), not a left-to-right sum.
++  * the merge reproduces the CUSTOM CUDA OP that
++    ``vllm/v1/attention/ops/merge_attn_states.py`` dispatches to on CUDA -- NOT
++    ``triton_merge_attn_states.py``, whose arithmetic differs.
++
++Bit-exactness is a property of the SHAPE, not a theorem: cuBLAS picks its SGEMM
++tiling per problem size, so a change of tree size can move the q.k^T
++accumulation order out from under the sequential chain.  Swept offline, N =
++8..128 x {fp16, bf16} x H in {16, 24}, head sizes 64/128/256: EVERY N <= 127 is
++exact and N == 128 alone is not (cuBLAS switches tiling at exactly m=n=128).
++``fused_suffix_merge`` therefore refuses N >= 128 outright rather than running
++an inexact fast path.  Re-run ``CF_TFA_CHECK=1`` whenever the tree shape, the
++model or the torch/cuBLAS version changes -- a reduction-order change shows up
++as a nonzero counter long before it shows up as a wrong token.
++
++SPEED OF LIGHT.  This kernel is LATENCY-bound and cannot be anything else: the
++grid is H*N warps (640 at 4B/9B, 960 at 27B) against 188 SMs x 4 schedulers, so
++ncu measures 0.21-0.32 waves/SM -- the launch does not fill the machine ONCE,
++about one warp per scheduler, nothing resident to cover a miss.  Consequently
++issue-slot utilisation is 13-17%, warps-active 8-10% of peak, and the dominant
++stall is long_scoreboard at ~4 cycles per issued instruction.  Against the
++compulsory working set (1.15 MB at 4B/9B, 1.64 MB at 27B, L2-resident) the
++L2 roofline is 38/55 ns and DRAM is 0.72/1.03 us, versus 5.33/5.74 us achieved:
++~1% of the L2 roofline and ~14-18% of DRAM.  Those rooflines are not reachable
++here -- the floor is the ~1.0 us graph-launch cost plus one L2 round trip for
++the prologue (together 1.64/1.84 us, measured by ablation) plus the 256-deep
++SEQUENTIAL FFMA chain (421 ns) that bit-exactness forbids parallelising.  Stage
++costs at 27B: prologue+store 1.84 us, q.k^T dot 3.68 us, denominator ~0, P.V
++0.17 us, merge 0.05 us.  ptxas: 40-128 registers, 0 spill bytes and 0 stack
++frame across all 48 instantiations.
++
++TUNABLES (env, all optional): ``CF_TFA_WARPS`` warps per block (default 4 --
++measured best at BOTH H=16 and H=24), ``CF_TFA_GK`` ancestor columns held in
++registers for P.V (default 8; GK also sets the q.k^T prefetch depth CH),
++``CF_TFA_DEBUG=1`` one-shot shape print, ``CF_TFA_FORCE_FALLBACK=1`` A/A control,
++``CF_TFA_CAPTURE=1`` (with ``CF_TFA_CHECK=1``) dumps the inputs of the first
++mismatching call per shape to ``CF_TFA_CAPTURE_DIR`` for offline replay.
++"""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++import torch
++
++_ENABLED: bool | None = None
++_DBG = os.environ.get("CF_TFA_DEBUG", "0") == "1"
++_MOD = None
++_SRC = Path(__file__).resolve().parent / "tree_attn_fused.cu"
++
++# head_size -> instantiated; anything else falls back to eager
++_SUPPORTED_D = (64, 128, 256)
++
++
++def _load():
++    """Build/load the extension.  Called from ``enabled()`` so the (cached)
++    ninja build happens at model-load time, never inside a CUDA-graph capture."""
++    global _MOD
++    if _MOD is None:
++        from torch.utils.cpp_extension import load
++
++        os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
++        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
++        _MOD = load(
++            name="cf_tree_attn_fused",
++            sources=[str(_SRC)],
++            extra_cuda_cflags=["-O3", "-lineinfo", "--expt-relaxed-constexpr"],
++            verbose=False,
++        )
++    return _MOD
++
++
++def enabled() -> bool:
++    global _ENABLED
++    if _ENABLED is None:
++        _ENABLED = os.environ.get("CF_TREE_FUSED_ATTN", "0") == "1"
++        if _ENABLED:
++            _load()
++    return _ENABLED
++
++
++_CHK = None
++_CHECK_MODE = int(os.environ.get("CF_TFA_CHECK", "0") or 0)
++_FALLBACK = os.environ.get("CF_TFA_FORCE_FALLBACK") == "1"
++# 4 warps/block measured best at BOTH shipping shapes (4B/9B H=16 and 27B H=24);
++# occupancy preference does not transfer between kernels, so this is measured,
++# not inherited -- see the warps x CH grid in the module docstring.
++_WARPS = int(os.environ.get("CF_TFA_WARPS", "0") or 0) or 4
++_GK = int(os.environ.get("CF_TFA_GK", "0") or 0) or 8
++
++
++def check_mode() -> int:
++    """CF_TFA_CHECK: 1 = run the eager tail alongside the kernel and tally
++    mismatching output elements in a device counter -- no host sync, so it works
++    under cudagraph REPLAY, which is the only way to see the shipping static
++    step (its python never runs again after capture).  2 = eager tail only, an
++    A/A control that must reproduce the flag-OFF tokens exactly."""
++    return _CHECK_MODE
++
++
++_CHK_BY: dict = {}
++_CAPTURE = os.environ.get("CF_TFA_CAPTURE", "0") == "1"
++_CAP: dict = {}
++_CAP_DIR = os.environ.get("CF_TFA_CAPTURE_DIR", "/tmp/cf_tfa_capture")
++
++
++def tally(got: torch.Tensor, ref: torch.Tensor, key: str = "") -> None:
++    """Tally mismatching elements.  ``key`` gives a per-shape breakdown: a
++    single global counter cannot say WHICH of the shapes a run dispatches
++    (verify tree, cudagraph-warmup batches) is the one that diverges."""
++    global _CHK
++    if _CHK is None:
++        _CHK = torch.zeros(4, dtype=torch.int64, device=got.device)
++    both_nan = torch.isnan(got.float()) & torch.isnan(ref.float())
++    bad = (got != ref) & ~both_nan
++    nbad = bad.sum()
++    anyb = bad.any()
++    _CHK[0] += nbad
++    _CHK[1] += got.numel()
++    _CHK[2] += anyb.to(torch.int64)
++    _CHK[3] += 1
++    if key:
++        c = _CHK_BY.get(key)
++        if c is None:
++            # allocated on the first (eager, pre-capture) call for this shape
++            c = _CHK_BY[key] = torch.zeros(4, dtype=torch.int64, device=got.device)
++        c[0] += nbad
++        c[1] += got.numel()
++        c[2] += anyb.to(torch.int64)
++        c[3] += 1
++
++
++def capturing() -> bool:
++    return _CAPTURE
++
++
++def capture(anyb: torch.Tensor, tensors: dict, key: str) -> None:
++    """CF_TFA_CAPTURE=1: snapshot the inputs of the FIRST mismatching call into
++    persistent device buffers, entirely with device-side ops so it is legal
++    inside a captured cudagraph (a host-side `if` would freeze the decision at
++    capture time and never fire on replay).  Buffers are PER SHAPE -- a run
++    dispatches several (the shipping step plus every cudagraph-warmup batch) and
++    one buffer set cannot hold them.  Dumped at exit."""
++    if not _CAP:
++        import atexit
++
++        atexit.register(_dump)
++    buf = _CAP.get(key)
++    if buf is None:
++        buf = _CAP[key] = {
++            "_seen": torch.zeros((), dtype=torch.int64, device=anyb.device)
++        }
++    seen = buf["_seen"]
++    first = (seen == 0) & anyb
++    seen += first.to(torch.int64)
++    for name, src in tensors.items():
++        dst = buf.get(name)
++        if dst is None:
++            dst = buf[name] = torch.zeros_like(src)
++        dst.copy_(torch.where(first, src, dst))
++
++
++def _dump() -> None:
++    if not _CAP:
++        return
++    os.makedirs(_CAP_DIR, exist_ok=True)
++    for key, buf in _CAP.items():
++        if int(buf["_seen"]) == 0:
++            continue
++        path = os.path.join(_CAP_DIR, f"first_mismatch_{key}.pt")
++        torch.save({k: v.cpu() for k, v in buf.items()}, path)
++        print(f"[cf-tfa] captured first-mismatch inputs -> {path}", flush=True)
++
++
++def _label(c: list) -> dict:
++    return {
++        "mismatching_elements": c[0],
++        "elements": c[1],
++        "calls_with_a_mismatch": c[2],
++        "calls": c[3],
++    }
++
++
++def check_counters():
++    """Returns a LABELLED dict, deliberately.  This used to return the bare
++    4-list ``[mismatching elements, elements, calls with a mismatch, calls]``,
++    and the caller prints it verbatim under the banner "mismatching output
++    elements: ..."; a 27B run reading ``[0, 2811494400, 0, 10048]`` off that
++    line was written up as "10,048 mismatching of 2,811,494,400", which is the
++    CALL COUNT against the element count -- the run had zero mismatches.  That
++    misreading cost a full root-cause investigation, so the field names now
++    travel with the numbers."""
++    if _CHK is None:
++        return None
++    if _CHK_BY:
++        for k in sorted(_CHK_BY):
++            print(f"[cf-tfa-check]   {k}: {_label(_CHK_BY[k].tolist())}", flush=True)
++    return _label(_CHK.tolist())
++
++
++
++def fused_suffix_merge(
++    *,
++    query: torch.Tensor,
++    key: torch.Tensor,
++    value: torch.Tensor,
++    output: torch.Tensor,
++    prefix_out: torch.Tensor,
++    prefix_lse: torch.Tensor,
++    idx_pad: torch.Tensor,
++    not_anc: torch.Tensor,
++    scale: float,
++    S: int,
++    N: int,
++) -> bool:
++    """Returns False if this shape is not handled -- caller must fall back."""
++    D = query.shape[2]
++    if _FALLBACK:
++        return False  # A/A control: everything else identical, eager tail runs
++    if D not in _SUPPORTED_D or query.dtype not in (torch.bfloat16, torch.float16):
++        return False
++    # vectorised 4/8/16-byte lane loads: the head must be contiguous and every
++    # row/head stride a whole number of vectors.
++    vpt = D // 32
++    for t in (query, key, value, output, prefix_out):
++        if t.stride(2) != 1 or t.stride(0) % vpt or t.stride(1) % vpt:
++            return False
++    # the kernel indexes these with a packed layout
++    if (
++        prefix_lse.dtype != torch.float32
++        or prefix_lse.stride() != (S * N, 1)
++        or not idx_pad.is_contiguous()
++        or idx_pad.dtype != torch.int64
++        or not not_anc.is_contiguous()
++    ):
++        return False
++    # N >= 128 falls back to eager, for TWO separate reasons:
++    #  * N > 128 does not fit the MAXW=4-word ancestor bitmask at all;
++    #  * N == 128 fits, but is NOT bit-exact.  cuBLAS switches SGEMM tiling at
++    #    exactly m=n=128, so the reference q.k^T stops being the strictly
++    #    sequential FFMA chain this kernel reproduces.  Swept N = 8..128 x
++    #    {fp16, bf16} x H in {16, 24}: every N <= 127 is exact over 39 M
++    #    elements per size, and N == 128 alone mismatches (181 elements).
++    #    An inexact fast path is worse than no fast path, so 128 is refused.
++    if N >= 128:
++        return False
++    warps, gk = _WARPS, _GK
++    global _DBG
++    if _DBG:
++        _DBG = False
++        print(f"[cf-tfa] CUDA kernel live: S={S} N={N} H={query.shape[1]} "
++              f"HKV={key.shape[1]} D={D} dtype={query.dtype} warps={warps} "
++              f"gk={gk}", flush=True)
++    _load().suffix_merge(
++        query,
++        key,
++        value,
++        output,
++        prefix_out,
++        prefix_lse,
++        idx_pad,
++        not_anc,
++        float(scale),
++        int(S),
++        int(N),
++        warps,
++        gk,
++    )
++    return True
+--- a/vllm/v1/spec_decode/tree_gdn.py
++++ b/vllm/v1/spec_decode/tree_gdn.py
+@@ -0,0 +1,1082 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Tree-aware Gated-DeltaNet (conv1d + recurrence) for spec-decode tree verify.
++
++Stock vLLM's GDN spec-decode kernels assume the drafted tokens form a linear
++CHAIN: the recurrence carries one register block across ``for i_t in range(T)``
++with no parent indirection, and the conv1d keeps a single sliding window per
++request.  Sibling tree nodes at adjacent flat offsets would therefore pollute
++each other's state.
++
++Both are fixed here by making every node read its PARENT's state instead of the
++previous flat token, exactly as in the chained-flow offline harness
++(``chained_flow.vllm_tree.tree_ssm``).  Two facts make this cheap inside vLLM:
++
++  * vLLM already allocates ``num_speculative_tokens + 1`` mamba state slots per
++    spec request (``gdn_attn.py``: ``block_table[:, :num_spec+1]``) and selects
++    the live one with a per-request integer.  Those slots are exactly the
++    per-node state slots a tree needs -- no new allocation.
++  * The recurrence is written PATH-PARALLEL (one program per (node, head,
++    v-block), each walking its own root->node path from the request's initial
++    state) rather than depth-serial, so there is no intra-kernel ordering
++    requirement and no read/write race on the initial slot.
++
++Slot assignment: with ``num_speculative_tokens = tree_nodes + 1`` there are
++``tree_nodes + 2`` slot columns for ``tree_nodes + 1`` query rows, so the row
++that would otherwise land on the request's *initial* column is shifted by one
++(``_colmap``); the initial state is therefore never overwritten while other
++programs are still reading it.
++"""
++
++from __future__ import annotations
++
++import weakref
++
++import numpy as np
++import torch
++
++from vllm.triton_utils import tl, triton
++
++
++# --------------------------------------------------------------------------- #
++#  conv1d over a tree                                                          #
++# --------------------------------------------------------------------------- #
++@triton.jit(do_not_specialize=["T"])
++def _tree_conv_kernel(
++    x_ptr,  # [T, dim]
++    w_ptr,  # [dim, width]
++    bias_ptr,
++    conv_state_ptr,  # [num_slots, dim, state_len]
++    chain_ptr,  # [T, MAXD+1] int32, chain[t,0]=t, clamped at the request root
++    depth_ptr,  # [T] int32
++    out_slot_ptr,  # [T] int32 absolute conv-state slot to write
++    init_slot_ptr,  # [T] int32 absolute conv-state slot holding the history
++    o_ptr,  # [T, dim]
++    T,
++    dim: tl.constexpr,
++    stride_x_tok: tl.int64,
++    stride_w_dim: tl.constexpr,
++    stride_state_slot: tl.int64,
++    stride_state_dim: tl.constexpr,
++    stride_state_tok: tl.constexpr,
++    stride_chain: tl.constexpr,
++    stride_o_tok: tl.int64,
++    HAS_BIAS: tl.constexpr,
++    SILU: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++):
++    t = tl.program_id(1)
++    if t >= T:
++        return
++    feats = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
++    mw = feats < dim
++
++    w0 = tl.load(w_ptr + feats * stride_w_dim + 0, mw, 0.0)
++    w1 = tl.load(w_ptr + feats * stride_w_dim + 1, mw, 0.0)
++    w2 = tl.load(w_ptr + feats * stride_w_dim + 2, mw, 0.0)
++    w3 = tl.load(w_ptr + feats * stride_w_dim + 3, mw, 0.0)
++    if HAS_BIAS:
++        acc = tl.load(bias_ptr + feats, mw, 0.0).to(tl.float32)
++    else:
++        acc = tl.zeros([BLOCK_N], tl.float32)
++
++    d = tl.load(depth_ptr + t)
++    hbase = (
++        conv_state_ptr
++        + tl.load(init_slot_ptr + t).to(tl.int64) * stride_state_slot
++        + feats * stride_state_dim
++    )
++    h0 = tl.load(hbase + 0 * stride_state_tok, mw, 0.0)
++    h1 = tl.load(hbase + 1 * stride_state_tok, mw, 0.0)
++    h2 = tl.load(hbase + 2 * stride_state_tok, mw, 0.0)
++
++    a1 = tl.load(chain_ptr + t * stride_chain + 1).to(tl.int64)
++    a2 = tl.load(chain_ptr + t * stride_chain + 2).to(tl.int64)
++    a3 = tl.load(chain_ptr + t * stride_chain + 3).to(tl.int64)
++    g0 = tl.load(x_ptr + t * stride_x_tok + feats, mw, 0.0)
++    xa1 = tl.load(x_ptr + a1 * stride_x_tok + feats, mw, 0.0)
++    xa2 = tl.load(x_ptr + a2 * stride_x_tok + feats, mw, 0.0)
++    xa3 = tl.load(x_ptr + a3 * stride_x_tok + feats, mw, 0.0)
++    # g(k) = token k steps back along this node's path; fall back to history
++    g1 = tl.where(d >= 1, xa1, h2)
++    g2 = tl.where(d >= 2, xa2, tl.where(d >= 1, h2, h1))
++    g3 = tl.where(d >= 3, xa3, tl.where(d >= 2, h2, tl.where(d >= 1, h1, h0)))
++
++    acc += g3 * w0
++    acc += g2 * w1
++    acc += g1 * w2
++    acc += g0 * w3
++    if SILU:
++        acc = acc / (1 + tl.exp(-acc))
++    tl.store(o_ptr + t * stride_o_tok + feats, acc, mask=mw)
++
++    obase = (
++        conv_state_ptr
++        + tl.load(out_slot_ptr + t).to(tl.int64) * stride_state_slot
++        + feats * stride_state_dim
++    )
++    tl.store(obase + 0 * stride_state_tok, g2, mask=mw)
++    tl.store(obase + 1 * stride_state_tok, g1, mask=mw)
++    tl.store(obase + 2 * stride_state_tok, g0, mask=mw)
++
++
++@torch.inference_mode()
++def tree_causal_conv1d(x, conv_state, weight, bias, meta, activation="silu"):
++    """x: [T, dim] pre-conv.  Returns [T, dim] post-conv (+ silu)."""
++    T, dim = x.shape
++    assert weight.shape[1] == 4, "tree conv currently assumes conv width 4"
++    o = torch.empty_like(x)
++    BLOCK_N = 256
++    _tree_conv_kernel[(triton.cdiv(dim, BLOCK_N), T)](
++        x,
++        weight,
++        bias if bias is not None else x,
++        conv_state,
++        meta.chain,
++        meta.depth,
++        meta.out_slot,
++        meta.init_slot,
++        o,
++        T,
++        dim,
++        x.stride(0),
++        weight.stride(0),
++        conv_state.stride(0),
++        conv_state.stride(1),
++        conv_state.stride(2),
++        meta.chain.stride(0),
++        o.stride(0),
++        bias is not None,
++        activation == "silu",
++        BLOCK_N,
++        num_warps=4,
++        num_stages=1,
++    )
++    return o
++
++
++# --------------------------------------------------------------------------- #
++#  gated delta recurrence over a tree (path-parallel)                          #
++# --------------------------------------------------------------------------- #
++@triton.jit(do_not_specialize=["T", "MAXD"])
++def _tree_gdn_kernel(
++    A_log,
++    a,
++    b,
++    dt_bias,
++    q,
++    k,
++    v,
++    o,
++    state,  # [num_slots, HV, V, K]
++    chain,  # [T, MAXD+1]
++    depth,  # [T]
++    out_slot,  # [T]
++    init_slot,  # [T]
++    rows,  # [T] optional query-row indirection (deferred state pass)
++    scale,
++    T,
++    MAXD,
++    H: tl.constexpr,
++    HV: tl.constexpr,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    BK: tl.constexpr,
++    BV: tl.constexpr,
++    stride_state_slot: tl.int64,
++    stride_chain: tl.constexpr,
++    THRESHOLD: tl.constexpr,
++    USE_QK_L2NORM: tl.constexpr,
++    USE_ROWS: tl.constexpr,
++    WRITE_OUT: tl.constexpr,
++    WRITE_STATE: tl.constexpr,
++):
++    i_v, i_hv, t = tl.program_id(0), tl.program_id(1), tl.program_id(2)
++    if t >= T:
++        return
++    if USE_ROWS:
++        t = tl.load(rows + t).to(tl.int32)
++    i_h = i_hv // (HV // H)
++    o_k = tl.arange(0, BK)
++    o_v = i_v * BV + tl.arange(0, BV)
++    mask_k = o_k < K
++    mask_v = o_v < V
++    mask_h = mask_v[:, None] & mask_k[None, :]
++
++    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
++    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
++
++    p_h0 = (
++        state
++        + tl.load(init_slot + t).to(tl.int64) * stride_state_slot
++        + i_hv * V * K
++        + o_v[:, None] * K
++        + o_k[None, :]
++    )
++    b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
++
++    d_t = tl.load(depth + t)
++    # walk root -> node: apply ancestors from the deepest offset down to 0
++    for kk in range(MAXD, -1, -1):
++        active = kk <= d_t
++        idx = tl.where(active, kk, 0)
++        anc = tl.load(chain + t * stride_chain + idx).to(tl.int64)
++        b_k = tl.load(k + (anc * H + i_h) * K + o_k, mask=mask_k, other=0).to(
++            tl.float32
++        )
++        b_v = tl.load(v + (anc * HV + i_hv) * V + o_v, mask=mask_v, other=0).to(
++            tl.float32
++        )
++        if USE_QK_L2NORM:
++            b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
++        x = tl.load(a + anc * HV + i_hv).to(tl.float32) + dt_bias_val
++        softplus_x = tl.where(x <= THRESHOLD, tl.log(1 + tl.exp(x)), x)
++        b_g = -tl.exp(A_log_val) * softplus_x
++        b_beta = tl.sigmoid(tl.load(b + anc * HV + i_hv).to(tl.float32))
++        h2 = b_h * tl.exp(b_g)
++        v2 = b_v - tl.sum(h2 * b_k[None, :], 1)
++        v2 = v2 * b_beta
++        h2 = h2 + v2[:, None] * b_k[None, :]
++        b_h = tl.where(active, h2, b_h)
++
++    if WRITE_OUT:
++        b_q = tl.load(q + (t * H + i_h) * K + o_k, mask=mask_k, other=0).to(tl.float32)
++        if USE_QK_L2NORM:
++            b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
++        b_q = b_q * scale
++        b_o = tl.sum(b_h * b_q[None, :], 1)
++        p_o = o + (t * HV + i_hv) * V + o_v
++        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
++
++    if WRITE_STATE:
++        p_ht = (
++            state
++            + tl.load(out_slot + t).to(tl.int64) * stride_state_slot
++            + i_hv * V * K
++            + o_v[:, None] * K
++            + o_k[None, :]
++        )
++        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
++
++
++# --------------------------------------------------------------------------- #
++#  CF_GDN_DEFER: don't write the per-node recurrent state during verify         #
++# --------------------------------------------------------------------------- #
++# TRAFFIC.  The recurrent state is [HV, V, K] fp32 = 32*128*128*4 = 2.00 MiB PER
++# SLOT, and tree verify uses one slot per NODE.  At the 41-node shipping shape
++# that is 41 x 24 GDN layers x (read + write) = 3.84 GiB of fp32 state traffic
++# per forward -- against a model whose entire fp16 weight set is 8.41 GiB.  The
++# WRITE half (1.92 GiB, and unlike the read it is 41 DISTINCT 2 MiB regions, so
++# it cannot be served from L2 and it evicts everything the following GEMMs want)
++# is pure waste: verification keeps exactly ONE node's state, the accepted leaf's,
++# and which one that is isn't known until after the forward has been sampled.
++#
++# So under CF_GDN_DEFER=1 the verify launch computes `o` and drops `b_h` on the
++# floor (WRITE_STATE=False), and `_tree_postprocess` re-runs the SAME kernel for
++# the S accepted-leaf rows only (USE_ROWS=True, WRITE_OUT=False), materialising
++# 1 slot per request instead of 41.
++#
++# BIT-EXACTNESS.  This is the target model's own math, so nothing here is allowed
++# to move a ulp.  Nothing does: the arithmetic that produces `b_h` and `b_o` is
++# character-for-character the code that ran before -- the only change is two
++# constexpr guards around the two final `tl.store`s -- and the deferred pass
++# re-executes that same op sequence on the same inputs, so the state it writes is
++# the same bits the first pass would have written.
++#
++# STALENESS TRAP.  The verify forward is a FULL cudagraph (CF_TREE_FULLCG=1), so
++# on a replay step the layer's python never runs and the stash below is whatever
++# CAPTURE put there -- which is correct, because a replay writes its intermediates
++# into exactly the addresses capture recorded.  But ~1% of steps dispatch
++# PIECEWISE and DO run the python, allocating fresh tensors.  Stashing those and
++# then reading them back on a later REPLAY step would be a use-after-free.  Hence
++# two stashes: `_STASH_GRAPH` (written while capturing, permanently valid) and
++# `_STASH_EAGER` (written by live python, valid for exactly ONE postprocess, then
++# invalidated).  `_tree_postprocess` prefers the eager stash when it is armed.
++#
++# MEMORY TRAP (the second one).  A stash entry pins this layer's k/v/a/b.  Under
++# capture those are CUDAGRAPH-POOL allocations, and pinning them stops a later
++# capture from reusing the pool blocks -- so keying the stash by `id(layout)`,
++# with a fresh layout object per step, grew the graph pool by one full set of GDN
++# activations PER CAPTURED STEP (measured at 4B: the cudagraph memory estimate
++# went 0.548 -> 0.519 of the budget, KV cache 31291 -> 28846 tokens; at 27B it was
++# a hard OOM before the KV cache was even allocated).  So the graph stash is keyed
++# WEAKLY on the layout: the persistent static layout keeps its entries alive for
++# as long as it is itself alive, and the per-step dynamic layouts drop theirs the
++# moment the step is over.
++_DEFER: bool | None = None
++_DEFER_MAXROWS = 64
++_STASH_GRAPH: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
++_STASH_EAGER: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
++_EAGER_LAYOUT = None
++_DBG_N = 0
++_EAGER_ARMED = False
++
++
++def defer_state() -> bool:
++    """CF_GDN_DEFER=1: skip the per-node state write in the verify forward."""
++    global _DEFER, _DEFER_MAXROWS
++    if _DEFER is None:
++        import os as _os
++
++        _DEFER = _os.environ.get("CF_GDN_DEFER", "0") == "1"
++        _DEFER_MAXROWS = int(_os.environ.get("CF_GDN_DEFER_MAXROWS", "0") or 0) or 64
++    return _DEFER
++
++
++_REF_BV = 32  # the shipping geometry; the CHECK reference
++_TRITON_BV: int | None = None
++
++
++def _triton_bv() -> int:
++    global _TRITON_BV
++    if _TRITON_BV is None:
++        import os as _os
++
++        _TRITON_BV = int(_os.environ.get("CF_GDN_BV", "0") or 0) or 32
++    return _TRITON_BV
++
++
++def defer_rows(T: int) -> bool:
++    """Row-count gate.  A stash entry pins this layer's k/v for as long as it
++    lives, and under capture those are cudagraph-pool blocks -- so deferring at
++    EVERY captured batch size would grow the pool by one set of GDN activations
++    per captured shape (measured: KV cache 31291 -> 29227 tokens at 4B, OOM at
++    27B).  vLLM captures S = 1..12 requests, i.e. T = 41..492 rows, but the
++    shipping config is batch 1; capping at 64 rows keeps the retention to a single
++    shape (~12 MiB at 4B) and leaves every larger shape on the original path,
++    where the state write happens in the verify pass exactly as before."""
++    return defer_state() and T <= _DEFER_MAXROWS
++
++
++def step_reset() -> None:
++    """Drop the eager stash at the START of a step.
++
++    MEMORY.  A stash entry pins this layer's q/k/v/a/b for as long as it lives.
++    `_tree_postprocess` normally consumes and clears it within the same step, but
++    the memory-PROFILING forward never reaches postprocess -- so without this the
++    profiler saw ~24 (4B) / 48 (27B) layers' worth of activations still reachable,
++    under-reported the free memory, and shrank the KV cache (measured: 31291 ->
++    28846 tokens at 4B, and a hard OOM at 27B).  Both callers run on the host once
++    per step, before the forward.
++    """
++    global _EAGER_ARMED, _EAGER_LAYOUT
++    _STASH_EAGER.clear()
++    _EAGER_ARMED = False
++    _EAGER_LAYOUT = None
++
++
++def _stash(entry: dict) -> None:
++    global _EAGER_ARMED
++    # KEY.  Per (layer, layout): `state.data_ptr()` alone is NOT unique per layer
++    # (vLLM hands several GDN layers views into one mamba cache allocation), and a
++    # capture at a second tree shape would otherwise evict the first shape's
++    # entries -- which is exactly what leaves states unwritten at replay.
++    global _EAGER_LAYOUT
++    lay = entry["layout"]
++    # `o` is dead in the deferred pass (WRITE_OUT=False); pointing it at `state`
++    # keeps a whole [T,HV,V] activation per layer from being pinned by the stash.
++    entry = dict(entry, o=entry["state"])
++    capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
++    stash = _STASH_GRAPH if capturing else _STASH_EAGER
++    per_layer = stash.get(lay)
++    if per_layer is None:
++        per_layer = {}
++        stash[lay] = per_layer
++    per_layer[entry["layer_key"]] = entry
++    if not capturing:
++        _EAGER_ARMED = True
++        _EAGER_LAYOUT = lay
++
++
++def _launch(
++    e: dict, *, rows, n_rows: int, write_out: bool, write_state: bool
++) -> None:
++    meta = e["meta"]
++    # CF_GDN_CUDA: raw-CUDA drop-in, BIT-EXACT (verified element-for-element in
++    # both `o` and the written state).  Same kernel serves both launches.
++    from vllm.v1.spec_decode import tree_gdn_verify as _cu
++
++    use_cuda = (
++        _cu.enabled()
++        and _cu.route(rows is None)   # rows is None => the verify pass
++        and _cu.supported(e, meta)
++    )
++
++    def _go():
++        if use_cuda:
++            _cu.run(e, rows=rows, n_rows=n_rows, write_out=write_out,
++                    write_state=write_state)
++        else:
++            _launch_triton(e, rows=rows, n_rows=n_rows, write_out=write_out,
++                           write_state=write_state)
++
++    # CF_GDN_CUDA_CHECK: device-side element tally of WHATEVER geometry/kernel is
++    # enabled against the untouched reference arithmetic -- the Triton kernel at
++    # BV=32, i.e. exactly what shipped before any of this.  It therefore validates
++    # CF_GDN_BV just as well as CF_GDN_CUDA, and it runs under cudagraph replay
++    # because nothing here reads a predicate back to the host.
++    if _cu.check_mode() and (use_cuda or e["BV"] != _REF_BV):
++        ref_e = dict(e, BV=_REF_BV, NV=triton.cdiv(e["V"], _REF_BV))
++        if write_out:
++            ref_o = torch.empty_like(e["o"])
++            _launch_triton(dict(ref_e, o=ref_o), rows=rows, n_rows=n_rows,
++                           write_out=True, write_state=False)
++        if write_state and rows is not None:
++            # Snapshot ONLY the destination slots (one per request), not the whole
++            # multi-GiB mamba cache: run the reference, save what it wrote, put the
++            # slot back, then run the real kernel and diff.
++            dst = meta.out_slot.index_select(0, rows.to(torch.int64)).to(torch.int64)
++            before = e["state"].index_select(0, dst).clone()
++            _launch_triton(ref_e, rows=rows, n_rows=n_rows, write_out=False,
++                           write_state=True)
++            ref_s = e["state"].index_select(0, dst).clone()
++            e["state"].index_copy_(0, dst, before)
++        _go()
++        if write_out:
++            _cu.tally(e["o"], ref_o)
++        if write_state and rows is not None:
++            _cu.tally(e["state"].index_select(0, dst), ref_s)
++        return
++    _go()
++
++
++def _launch_triton(
++    e: dict, *, rows, n_rows: int, write_out: bool, write_state: bool
++) -> None:
++    meta = e["meta"]
++    _tree_gdn_kernel[(e["NV"], e["HV"], n_rows)](
++        e["A_log"],
++        e["a"],
++        e["b"],
++        e["dt_bias"],
++        e["q"],
++        e["k"],
++        e["v"],
++        e["o"],
++        e["state"],
++        meta.chain,
++        meta.depth,
++        meta.out_slot,
++        meta.init_slot,
++        rows if rows is not None else e["o"],
++        e["scale"],
++        n_rows,
++        meta.maxd,
++        e["H"],
++        e["HV"],
++        e["K"],
++        e["V"],
++        e["BK"],
++        e["BV"],
++        e["state"].stride(0),
++        meta.chain.stride(0),
++        20.0,
++        e["use_qk_l2norm"],
++        rows is not None,
++        write_out,
++        write_state,
++        num_warps=1,
++        num_stages=1,
++    )
++
++
++@torch.inference_mode()
++def disarm_deferred() -> int:
++    """Postprocess could not identify an accepted leaf for the live layout.
++
++    If live python stashed anything this step it must still be flushed -- writing
++    every node's state is wasteful but correct, and silently dropping it would
++    leave the next step reading a rejected sibling's state.
++    """
++    if not _EAGER_ARMED:
++        return 0
++    return finalize_deferred(None)
++
++
++@torch.inference_mode()
++def finalize_deferred(rows: torch.Tensor | None, layout=None) -> int:
++    """Materialise the deferred recurrent state.
++
++    ``rows`` holds the global query row of each request's ACCEPTED LEAF; passing
++    ``None`` falls back to writing every node's state (correct, just as expensive
++    as not deferring at all) and exists so a step that somehow reaches
++    postprocess without an accepted path can never leave stale state behind.
++    """
++    global _EAGER_ARMED
++    eager = _EAGER_ARMED
++    stash = _STASH_EAGER if eager else _STASH_GRAPH
++    _EAGER_ARMED = False
++    if layout is None:
++        layout = _EAGER_LAYOUT if eager else None
++    entries = stash.get(layout, {}) if layout is not None else {}
++    n = 0
++    for e in entries.values():
++        if rows is None:
++            _launch(
++                e, rows=None, n_rows=e["T"], write_out=False, write_state=True
++            )
++        else:
++            _launch(
++                e,
++                rows=rows,
++                n_rows=int(rows.numel()),
++                write_out=False,
++                write_state=True,
++            )
++        n += 1
++    if eager:
++        _STASH_EAGER.clear()
++    global _DBG_N
++    if _DBG_N < 6 and __import__("os").environ.get("CF_GDN_DEFER_DEBUG") == "1":
++        _DBG_N += 1
++        # `.tolist()` is a host sync -- debug flag only.
++        print(
++            f"[gdn-defer] finalize: stash={'eager' if eager else 'graph'} "
++            f"layouts={len(stash)} entries={len(entries)} launched={n} "
++            f"rows={None if rows is None else rows.tolist()}",
++            flush=True,
++        )
++    return n
++
++
++@torch.inference_mode()
++def tree_gated_delta_rule_update(
++    A_log,
++    a,
++    b,
++    dt_bias,
++    q,
++    k,
++    v,
++    state,
++    meta,
++    scale=None,
++    use_qk_l2norm=True,
++    layout=None,
++    layer_key=None,
++):
++    """q,k: [1,T,H,K]  v: [1,T,HV,V]  a,b: [T,HV].  Returns o: [T,HV,V]."""
++    T = q.shape[1]
++    H, Kd = q.shape[2], q.shape[3]
++    HV, Vd = v.shape[2], v.shape[3]
++    if scale is None:
++        scale = Kd**-0.5
++    BK = triton.next_power_of_2(Kd)
++    # CF_GDN_BV: v-rows per program.  Triton's layout for the [BV,BK] state tile
++    # is sizePerThread=[1,4] x threadsPerWarp=[1,32], so a thread holds 4*BV live
++    # floats -- BV=32 costs 210 registers and caps the kernel at 8 warps/SM
++    # (measured occupancy 15.35%).  The reduction runs along K, which BV does not
++    # touch, so shrinking BV is BIT-EXACT: verified 0 differing elements, and
++    # worth 69.98 -> 48.59 us/layer at BV=16.  Default keeps the original 32.
++    BV = min(triton.next_power_of_2(Vd), _triton_bv())
++    NV = triton.cdiv(Vd, BV)
++    o = torch.empty(T, HV, Vd, device=q.device, dtype=q.dtype)
++    defer = defer_rows(T)
++    e = {
++        "layer_key": layer_key if layer_key is not None else state.data_ptr(),
++        "layout": layout,
++        "A_log": A_log,
++        "a": a.contiguous(),
++        "b": b.contiguous(),
++        "dt_bias": dt_bias,
++        "q": q.contiguous(),
++        "k": k.contiguous(),
++        "v": v.contiguous(),
++        "o": o,
++        "state": state,
++        "meta": meta,
++        "scale": scale,
++        "T": T,
++        "H": H,
++        "HV": HV,
++        "K": Kd,
++        "V": Vd,
++        "BK": BK,
++        "BV": BV,
++        "NV": NV,
++        "use_qk_l2norm": use_qk_l2norm,
++    }
++    # CF_GDN_FACTOR: the shared-root factorisation replaces the whole
++    # path-parallel scan for the OUTPUT half.  It never writes state, so it is
++    # only legal on top of CF_GDN_DEFER, which materialises the accepted leaf's
++    # state afterwards with the Triton kernel below (bit-exact, unaffected).
++    from vllm.v1.spec_decode import tree_gdn_factor as _fac
++
++    used_factor = False
++    if defer and _fac.enabled():
++        if _fac.supported(
++            layout=layout, meta=meta, q=e["q"], k=e["k"], v=e["v"], o=o,
++            state=state, Kd=Kd, Vd=Vd,
++        ):
++            _fac.run(
++                A_log=A_log, dt_bias=dt_bias, a=e["a"], b=e["b"], q=e["q"],
++                k=e["k"], v=e["v"], o=o, state=state, meta=meta, layout=layout,
++                scale=scale, H=H, HV=HV, Vd=Vd,
++            )
++            used_factor = True
++            if _fac.check_mode():
++                ref = torch.empty_like(o)
++                e2 = dict(e, o=ref)
++                _launch(e2, rows=None, n_rows=T, write_out=True, write_state=False)
++                _fac.tally(o, ref)
++    if not used_factor:
++        _launch(e, rows=None, n_rows=T, write_out=True, write_state=not defer)
++    if defer:
++        _stash(e)
++    return o
++
++
++# --------------------------------------------------------------------------- #
++#  LEVEL-SYNCHRONOUS tree recurrence (O(nodes) work)                           #
++#  The path-parallel kernel above re-walks each node's whole ancestor path, so  #
++#  its work is O(nodes x depth).  Here we launch ONCE PER DEPTH: every node     #
++#  reads its PARENT's already-written state slot and applies exactly its own    #
++#  update.  A level only reads slots written by strictly earlier levels (and    #
++#  out_slot is unique per row and never equals an init slot), so there is no    #
++#  race; same-stream launch order provides the barrier.                         #
++# --------------------------------------------------------------------------- #
++@triton.jit(do_not_specialize=["NROW"])
++def _tree_gdn_level_kernel(
++    A_log, a, b, dt_bias, q, k, v, o, state,
++    rows,          # [NROW] global query-row index of each node at this depth
++    parent_slot,   # [T] state slot holding this row's PARENT state
++    out_slot,      # [T]
++    scale, NROW,
++    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
++    BK: tl.constexpr, BV: tl.constexpr,
++    stride_state_slot: tl.int64,
++    THRESHOLD: tl.constexpr, USE_QK_L2NORM: tl.constexpr,
++):
++    i_v, i_hv, j = tl.program_id(0), tl.program_id(1), tl.program_id(2)
++    if j >= NROW:
++        return
++    t = tl.load(rows + j).to(tl.int64)
++    i_h = i_hv // (HV // H)
++    o_k = tl.arange(0, BK)
++    o_v = i_v * BV + tl.arange(0, BV)
++    mask_k = o_k < K
++    mask_v = o_v < V
++    mask_h = mask_v[:, None] & mask_k[None, :]
++
++    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
++    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
++    p_h0 = (state + tl.load(parent_slot + t).to(tl.int64) * stride_state_slot
++            + i_hv * V * K + o_v[:, None] * K + o_k[None, :])
++    b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
++
++    b_k = tl.load(k + (t * H + i_h) * K + o_k, mask=mask_k, other=0).to(tl.float32)
++    b_v = tl.load(v + (t * HV + i_hv) * V + o_v, mask=mask_v, other=0).to(tl.float32)
++    if USE_QK_L2NORM:
++        b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
++    x = tl.load(a + t * HV + i_hv).to(tl.float32) + dt_bias_val
++    softplus_x = tl.where(x <= THRESHOLD, tl.log(1 + tl.exp(x)), x)
++    b_g = -tl.exp(A_log_val) * softplus_x
++    b_beta = tl.sigmoid(tl.load(b + t * HV + i_hv).to(tl.float32))
++    b_h = b_h * tl.exp(b_g)
++    b_v = b_v - tl.sum(b_h * b_k[None, :], 1)
++    b_v = b_v * b_beta
++    b_h = b_h + b_v[:, None] * b_k[None, :]
++
++    b_q = tl.load(q + (t * H + i_h) * K + o_k, mask=mask_k, other=0).to(tl.float32)
++    if USE_QK_L2NORM:
++        b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
++    b_q = b_q * scale
++    b_o = tl.sum(b_h * b_q[None, :], 1)
++    p_o = o + (t * HV + i_hv) * V + o_v
++    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
++    p_ht = (state + tl.load(out_slot + t).to(tl.int64) * stride_state_slot
++            + i_hv * V * K + o_v[:, None] * K + o_k[None, :])
++    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
++
++
++@torch.inference_mode()
++def tree_gated_delta_rule_update_level(
++    A_log, a, b, dt_bias, q, k, v, state, meta, scale=None, use_qk_l2norm=True
++):
++    """O(nodes) level-synchronous twin of tree_gated_delta_rule_update."""
++    T = q.shape[1]
++    H, Kd = q.shape[2], q.shape[3]
++    HV, Vd = v.shape[2], v.shape[3]
++    if scale is None:
++        scale = Kd**-0.5
++    BK = triton.next_power_of_2(Kd)
++    BV = min(triton.next_power_of_2(Vd), 32)
++    NV = triton.cdiv(Vd, BV)
++    o = torch.empty(T, HV, Vd, device=q.device, dtype=q.dtype)
++    qc, kc, vc, ac, bc = (q.contiguous(), k.contiguous(), v.contiguous(),
++                          a.contiguous(), b.contiguous())
++    for rows in meta.levels:
++        n = rows.numel()
++        if n == 0:
++            continue
++        _tree_gdn_level_kernel[(NV, HV, n)](
++            A_log, ac, bc, dt_bias, qc, kc, vc, o, state,
++            rows, meta.parent_slot, meta.out_slot, scale, n,
++            H, HV, Kd, Vd, BK, BV, state.stride(0), 20.0, use_qk_l2norm,
++            num_warps=1, num_stages=1,
++        )
++    return o
++
++
++# --------------------------------------------------------------------------- #
++#  per-step metadata                                                           #
++# --------------------------------------------------------------------------- #
++class TreeGDNMeta:
++    """Per-layer slot tensors + the layer-independent tree layout."""
++
++    __slots__ = (
++        "chain",
++        "depth",
++        "out_slot",
++        "init_slot",
++        "parent_slot",
++        "levels",
++        "maxd",
++        "num_rows",
++    )
++
++
++class TreeGDNLayout:
++    """Layer-INDEPENDENT part of the tree layout (built once per step).
++
++    NOTE: every GDN layer has its OWN mamba block ids (``spec_state_indices``
++    differs per layer), so only the ancestry/column arithmetic can be shared;
++    the absolute slot ids must be gathered per layer.
++    """
++
++    __slots__ = (
++        "__weakref__",  # the CF_GDN_DEFER stash keys on this object WEAKLY
++        "chain", "depth", "seq", "loc", "maxd", "num_rows", "levels", "hoist",
++        # [S] global query row of each spec request's row 0 (CF_GDN_DEFER),
++        # plus the int32 twins + row counts the CF_GDN_FACTOR kernel indexes with
++        "row_start", "row_start32", "row_count", "n_max",
++        # FULL-cudagraph path only: pinned staging for the per-step refill of the
++        # two ancestry tensors (see `get_static_layout`).
++        "pin_chain", "pin_depth", "static",
++        # CF_ASYNC_SPEC: `depth` is a constant of the tree SHAPE, so the GPU fill path
++        # writes it once instead of every step (see `fill_static_layout_gpu`).
++        "_cf_depth_filled",
++    )
++
++
++def _prewarm_extensions() -> None:
++    """Build the CF_GDN_FACTOR extension HERE, on the host, before any capture.
++
++    Both callers run from `_prepare_inputs` / `synthetic_fill`, i.e. strictly
++    outside the cudagraph capture region -- which is where a first-touch ninja
++    build and a `cudaFuncSetAttribute` belong.
++    """
++    if defer_state():
++        from vllm.v1.spec_decode import tree_gdn_factor as _fac
++        from vllm.v1.spec_decode import tree_gdn_verify as _cu
++
++        _fac.enabled()
++        _cu.enabled()
++
++
++def _layout_np(
++    *,
++    parents_np: np.ndarray,
++    depths_np: np.ndarray,
++    num_draft_tokens: np.ndarray,
++    spec_req_order: np.ndarray,
++):
++    """Host-side flattening shared by the per-step and the persistent layouts.
++
++    Returns ``(par, dep, seq, loc, chain)`` as numpy arrays.  ``chain[t, k]`` is
++    the row reached by walking ``k`` parents up from row ``t`` (clamped at the
++    request root), which is what both triton kernels index.
++    """
++    rows_parent: list[int] = []
++    rows_depth: list[int] = []
++    rows_seq: list[int] = []
++    rows_local: list[int] = []
++    row_start: list[int] = []
++    starts = np.zeros(len(num_draft_tokens) + 1, dtype=np.int64)
++    np.cumsum(num_draft_tokens, out=starts[1:])
++    base = 0
++    for s, r in enumerate(spec_req_order):
++        row_start.append(base)
++        r = int(r)
++        n = int(num_draft_tokens[r])
++        off = int(starts[r])
++        p = parents_np[off : off + n]
++        d = depths_np[off : off + n]
++        rows_parent.append(-1)
++        rows_depth.append(0)
++        rows_seq.append(s)
++        rows_local.append(0)
++        for i in range(n):
++            rows_parent.append(base + (0 if int(p[i]) < 0 else 1 + int(p[i])))
++            rows_depth.append(1 + int(d[i]))
++            rows_seq.append(s)
++            rows_local.append(1 + i)
++        base += n + 1
++    T = len(rows_parent)
++    par = np.asarray(rows_parent, dtype=np.int64)
++    dep = np.asarray(rows_depth, dtype=np.int64)
++    maxd = int(dep.max())
++
++    self_idx = np.arange(T, dtype=np.int64)
++    par_idx = np.where(par < 0, self_idx, par)
++    # width >= 4: the width-4 conv1d kernel always reads chain[:, 0..3]
++    chain_w = max(maxd, 3) + 1
++    chain = np.empty((T, chain_w), dtype=np.int32)
++    chain[:, 0] = self_idx
++    cur = self_idx
++    for kk in range(1, chain_w):
++        cur = par_idx[cur]
++        chain[:, kk] = cur
++    return (
++        par,
++        dep,
++        np.asarray(rows_seq, dtype=np.int64),
++        np.asarray(rows_local, dtype=np.int64),
++        chain,
++        maxd,
++        np.asarray(row_start, dtype=np.int64),
++    )
++
++
++# --------------------------------------------------------------------------- #
++#  PERSISTENT layout for the FULL-cudagraph tree path                          #
++# --------------------------------------------------------------------------- #
++# A cudagraph bakes the ADDRESS of every tensor its kernels read.  The per-step
++# `build_gdn_layout` allocates fresh tensors, so a graph captured against one
++# step's layout would read freed/reused memory on every later replay -- silently
++# wrong, no crash.  Under CF_TREE_FULLCG the layout is therefore a module-level
++# singleton keyed on (S, N, maxd, device), allocated once and REFILLED IN PLACE.
++#
++# `seq` and `loc` are pure functions of (S, N) and never change.  `depth` and
++# `chain` depend on the tree shape and are refilled from numpy through pinned
++# staging buffers (T is 17 at batch 1 -- the cost is noise).
++_LAYOUT_CACHE: dict[tuple, TreeGDNLayout] = {}
++
++
++def get_static_layout(
++    *, S: int, N: int, maxd: int, device: torch.device
++) -> TreeGDNLayout:
++    _prewarm_extensions()
++    key = (int(S), int(N), int(maxd), str(device))
++    lay = _LAYOUT_CACHE.get(key)
++    if lay is not None:
++        return lay
++    # See `tree_state.get_static_step`: allocate outside inference mode so the
++    # buffers stay refillable from both the capture path and the step path.
++    with torch.inference_mode(False):
++        return _alloc_static_layout(key, S, N, maxd, device)
++
++
++def _alloc_static_layout(key, S: int, N: int, maxd: int, device) -> TreeGDNLayout:
++    T = S * (N + 1)
++    chain_w = max(maxd, 3) + 1
++    lay = TreeGDNLayout()
++    lay.static = True
++    lay.chain = torch.zeros((T, chain_w), dtype=torch.int32, device=device)
++    lay.depth = torch.zeros(T, dtype=torch.int32, device=device)
++    lay.seq = torch.from_numpy(
++        np.repeat(np.arange(S, dtype=np.int64), N + 1)
++    ).to(device)
++    lay.loc = torch.from_numpy(
++        np.tile(np.arange(N + 1, dtype=np.int64), S)
++    ).to(device)
++    lay.maxd = maxd
++    lay.num_rows = T
++    lay.levels = []  # only the (UNUSED) level-synchronous kernel reads these
++    lay.hoist = None
++    rs = np.arange(S, dtype=np.int64) * (N + 1)
++    lay.row_start = torch.from_numpy(rs).to(device)
++    lay.row_start32 = torch.from_numpy(rs.astype(np.int32)).to(device)
++    lay.row_count = torch.full((S,), N + 1, dtype=torch.int32, device=device)
++    lay.n_max = N + 1
++    lay.pin_chain = torch.empty((T, chain_w), dtype=torch.int32, pin_memory=True)
++    lay.pin_depth = torch.empty(T, dtype=torch.int32, pin_memory=True)
++    lay._cf_depth_filled = False
++    _LAYOUT_CACHE[key] = lay
++    return lay
++
++
++def fill_static_layout(
++    lay: TreeGDNLayout,
++    *,
++    parents_np: np.ndarray,
++    depths_np: np.ndarray,
++    num_draft_tokens: np.ndarray,
++    spec_req_order: np.ndarray,
++) -> None:
++    """Refill a persistent layout IN PLACE for the current step."""
++    _, dep, _, _, chain, maxd, _ = _layout_np(
++        parents_np=parents_np,
++        depths_np=depths_np,
++        num_draft_tokens=num_draft_tokens,
++        spec_req_order=spec_req_order,
++    )
++    assert maxd == lay.maxd, f"tree GDN static layout maxd {maxd} != {lay.maxd}"
++    assert chain.shape == tuple(lay.chain.shape), (
++        f"tree GDN static layout chain {chain.shape} != {tuple(lay.chain.shape)}"
++    )
++    lay.pin_chain.copy_(torch.from_numpy(chain))
++    lay.pin_depth.copy_(torch.from_numpy(dep.astype(np.int32)))
++    lay.chain.copy_(lay.pin_chain, non_blocking=True)
++    lay.depth.copy_(lay.pin_depth, non_blocking=True)
++    # TRAP: `layer_meta` caches the layer-independent slot arithmetic on
++    # `lay.hoist`.  With a PERSISTENT layout that cache would otherwise survive
++    # across steps and every eager/PIECEWISE step after the first would reuse
++    # step 1's slot tensors.  Clearing is also correct under capture: the hoist
++    # ops execute during capture and re-execute at replay into the same
++    # addresses, so the graph recomputes them from the persistent
++    # `num_accepted` buffer.
++    lay.hoist = None
++    step_reset()
++
++
++def fill_static_layout_gpu(lay: TreeGDNLayout, *, depths_np: np.ndarray) -> None:
++    """Finish a persistent layout whose ``chain`` was already written ON THE DEVICE.
++
++    ``depth`` is ``1 + node depth`` with a leading 0 for the committed query row -- a pure
++    function of the tree SHAPE, so it is constant across steps and is filled exactly once.
++    ``chain`` is the only genuinely per-step field, and `tree_state.fill_static_step_gpu`
++    has already copied it in from the device walk, so there is nothing here that needs the
++    parents on the host.
++    """
++    if not getattr(lay, "_cf_depth_filled", False):
++        S = lay.row_start.shape[0]
++        N = lay.num_rows // S - 1
++        d = np.zeros((S, N + 1), dtype=np.int32)
++        d[:, 1:] = 1 + np.asarray(depths_np, dtype=np.int32).reshape(S, N)
++        lay.pin_depth.copy_(torch.from_numpy(d.reshape(-1)))
++        lay.depth.copy_(lay.pin_depth, non_blocking=True)
++        lay._cf_depth_filled = True
++    # Same trap as `fill_static_layout`: the layer-independent slot arithmetic cached on
++    # `lay.hoist` must not survive into the next step.
++    lay.hoist = None
++    step_reset()
++
++
++def build_gdn_layout(
++    *,
++    parents_np: np.ndarray,
++    depths_np: np.ndarray,
++    num_draft_tokens: np.ndarray,
++    spec_req_order: np.ndarray,
++    device: torch.device,
++) -> TreeGDNLayout:
++    """Flatten the per-request trees into the query-row layout the kernels use.
++
++    Query row 0 of a request is the previously committed token; row ``1 + i`` is
++    tree node ``i``.  Ancestry: row 0 -> the request's initial state, row
++    ``1 + i`` -> row 0 when node ``i`` is a tree root, else row
++    ``1 + parents[i]``.
++    """
++    _prewarm_extensions()
++    step_reset()
++    par, dep, seq, loc, chain, maxd, row_start = _layout_np(
++        parents_np=parents_np,
++        depths_np=depths_np,
++        num_draft_tokens=num_draft_tokens,
++        spec_req_order=spec_req_order,
++    )
++    T = par.shape[0]
++
++    lay = TreeGDNLayout()
++    lay.static = False
++    lay.hoist = None
++    lay.pin_chain = lay.pin_depth = None
++    lay.chain = torch.from_numpy(chain).to(device, non_blocking=True)
++    lay.depth = torch.from_numpy(dep.astype(np.int32)).to(device, non_blocking=True)
++    lay.seq = torch.from_numpy(seq).to(device, non_blocking=True)
++    lay.loc = torch.from_numpy(loc).to(device, non_blocking=True)
++    lay.maxd = maxd
++    lay.num_rows = T
++    lay.row_start = torch.from_numpy(row_start).to(device, non_blocking=True)
++    _rcnt = np.diff(np.append(row_start, T)).astype(np.int32)
++    lay.row_start32 = torch.from_numpy(row_start.astype(np.int32)).to(
++        device, non_blocking=True
++    )
++    lay.row_count = torch.from_numpy(_rcnt).to(device, non_blocking=True)
++    lay.n_max = int(_rcnt.max())
++    # row indices grouped by depth, for the level-synchronous scan
++    lay.levels = [
++        torch.from_numpy(np.nonzero(dep == d)[0].astype(np.int32)).to(
++            device, non_blocking=True
++        )
++        for d in range(maxd + 1)
++    ]
++    return lay
++
++
++def layer_meta(
++    lay: TreeGDNLayout,
++    state_indices: torch.Tensor,  # [num_spec, num_spec_cfg + 1] THIS LAYER's slots
++    num_accepted: torch.Tensor,  # [num_spec] initial column + 1
++) -> TreeGDNMeta:
++    """Resolve per-layer absolute state slots (pure GPU, no host sync).
++
++    Column remap: the request's *initial* column is skipped so a node never
++    clobbers the state its siblings are still reading (``_colmap``).
++    """
++    # HOT PATH: this runs once per GDN layer (28 on Qwen3.5-4B, more on 27B) on every
++    # tree step, and the tree verify forward has no full cudagraph -- so every op here
++    # is host dispatch on the critical path.  Everything except the two slot gathers is
++    # LAYER-INDEPENDENT (`num_accepted` is the same buffer for every layer), so it is
++    # computed once and cached on the per-step layout object.  The two survivors use a
++    # flat index_select instead of 2-D advanced indexing (1 kernel instead of ~3).
++    # Values are unchanged; verify with CF_GDN_META_CHECK=1.
++    W = int(state_indices.shape[1])
++    h = getattr(lay, "hoist", None)
++    if h is None or h[0] != W:
++        ic = num_accepted.to(torch.int64) - 1  # [S]
++        ic_row = ic[lay.seq]  # [T]
++        col = torch.where(lay.loc < ic_row, lay.loc, lay.loc + 1)
++        h = (
++            W,
++            lay.seq * W + col,  # flat index of each row's OUT state slot
++            lay.seq * W + ic_row,  # flat index of each row's INIT state slot
++            lay.chain[:, 1].to(torch.int64),  # parent row (chain[:, 1])
++            lay.depth == 0,  # depth-0 rows start from the INIT slot
++        )
++        lay.hoist = h
++    _, flat_out, flat_init, parent_row, is_root = h
++    si = state_indices.reshape(-1)
++    out_slot = si.index_select(0, flat_out).to(torch.int32)
++    init_slot = si.index_select(0, flat_init).to(torch.int32)
++    m = TreeGDNMeta()
++    m.chain = lay.chain
++    m.depth = lay.depth
++    m.maxd = lay.maxd
++    m.num_rows = lay.num_rows
++    m.out_slot = out_slot
++    m.init_slot = init_slot
++    # parent's state slot: depth-0 rows start from the request's initial slot,
++    # deeper rows from the slot their PARENT row wrote (chain[:,1] = parent row)
++    m.parent_slot = torch.where(
++        is_root, init_slot, out_slot.index_select(0, parent_row)
++    )
++    m.levels = lay.levels
++    import os as _os
++
++    if _os.environ.get("CF_GDN_META_CHECK", "0") == "1" and not (
++        # `torch.equal` reads a predicate back to the host; that is illegal
++        # while a cudagraph is capturing (and pointless -- capture traces ops,
++        # it does not produce values).
++        torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
++    ):
++        # equivalence gate against the pre-hoist formulation
++        _ic = num_accepted.to(torch.int64) - 1
++        _ic_row = _ic[lay.seq]
++        _col = torch.where(lay.loc < _ic_row, lay.loc, lay.loc + 1)
++        _out = state_indices[lay.seq, _col].to(torch.int32)
++        _init = state_indices[lay.seq, _ic_row].to(torch.int32)
++        _par = torch.where(
++            lay.depth == 0, _init, _out[lay.chain[:, 1].to(torch.int64)]
++        ).to(torch.int32)
++        assert torch.equal(m.out_slot, _out), "tree GDN hoist: out_slot mismatch"
++        assert torch.equal(m.init_slot, _init), "tree GDN hoist: init_slot mismatch"
++        assert torch.equal(m.parent_slot, _par), "tree GDN hoist: parent_slot mismatch"
++    return m
++
++
++def next_init_column(
++    loc_leaf: torch.Tensor, init_col: torch.Tensor
++) -> torch.Tensor:
++    """Column that will hold the carried-forward state (same remap as above)."""
++    return torch.where(loc_leaf < init_col, loc_leaf, loc_leaf + 1)

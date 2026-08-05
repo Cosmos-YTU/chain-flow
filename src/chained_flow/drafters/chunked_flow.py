@@ -274,7 +274,45 @@ class HiddenKVFlowExpert(nn.Module):
         seq_len = prev_len + current_len
         return torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=device), diagonal=1)
 
-    def forward(
+    @property
+    def _cf_fused_off(self) -> bool:
+        off = self.__dict__.get("_cf_fused_off_cached")
+        if off is None:
+            from chained_flow import cuda_block
+            off = not cuda_block.enabled()
+            self.__dict__["_cf_fused_off_cached"] = off
+        return off
+
+    def _cf_fused_runner(self, x: torch.Tensor, context_hidden: torch.Tensor):
+        """Fused-CUDA block runner, or None to stay on the PyTorch path.
+
+        Only engages for the shape family the kernel is instantiated for (fp16, batch 1,
+        D in {640, 1024}, 8 heads, ffn x6, S in {4,8}, C<=16); anything else silently falls
+        back.  ``can_run`` also rejects a (S, C) whose shared-memory footprint does not fit."""
+        from chained_flow import cuda_block
+
+        if not cuda_block.enabled():
+            return None
+        if not (x.is_cuda and x.dtype == torch.float16 and x.shape[0] == 1
+                and x.shape[1] in cuda_block.SUPPORTED_S):
+            return None
+        static_ok = getattr(self, "_cf_static_ok", None)
+        if static_ok is None:
+            b0 = self.blocks[0]
+            static_ok = (
+                self.hidden_size in cuda_block.SUPPORTED_D
+                and b0.ffn[1].out_features // self.hidden_size in cuda_block.SUPPORTED_FM
+                and b0.ffn[1].out_features % self.hidden_size == 0
+                and b0.self_attn.num_heads == cuda_block.NUM_HEADS
+                and b0.self_attn._qkv_same_embed_dim
+            )
+            self._cf_static_ok = static_ok
+        if not static_ok:
+            return None
+        fb = cuda_block.attach(self)            # None if the extension would not build
+        return fb if fb is not None and fb.can_run(x.shape[1], context_hidden.shape[1]) else None
+
+    def pre_blocks(
         self,
         *,
         context_hidden: torch.Tensor,
@@ -283,7 +321,12 @@ class HiddenKVFlowExpert(nn.Module):
         tau: torch.Tensor,
         chunk_start: int,
         anchor: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ):
+        """Everything before the block stack -> (x, attn_mask, current_len).
+
+        Split out of ``forward`` (which is still the only caller on the default path) so
+        ``CF_CUDA_PAIR`` can build BOTH chunks' block-stack inputs before issuing either
+        stack -- see cuda_block.run_pair."""
         if context_hidden.ndim != 3 or previous_hidden.ndim != 3 or current_h_tau.ndim != 3:
             raise ValueError("all hidden inputs must have shape [B, L, D]")
         batch = current_h_tau.shape[0]
@@ -316,10 +359,41 @@ class HiddenKVFlowExpert(nn.Module):
             x = x + self.anchor_mlp(anchor.to(x.dtype)).unsqueeze(1)   # conditions every block
 
         attn_mask = self._draft_attention_mask(prev_len=prev_len, current_len=current_len, device=x.device)
-        for block in self.blocks:
-            x = block(x, context_hidden, attn_mask=attn_mask)
-        current_out = x[:, -current_len:, :]
-        return self.out_proj(self.out_norm(current_out))
+        return x, attn_mask, current_len
+
+    def post_blocks(self, x: torch.Tensor, current_len: int) -> torch.Tensor:
+        """Everything after the block stack: keep the current chunk's rows and project out."""
+        return self.out_proj(self.out_norm(x[:, -current_len:, :]))
+
+    def forward(
+        self,
+        *,
+        context_hidden: torch.Tensor,
+        previous_hidden: torch.Tensor,
+        current_h_tau: torch.Tensor,
+        tau: torch.Tensor,
+        chunk_start: int,
+        anchor: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x, attn_mask, current_len = self.pre_blocks(
+            context_hidden=context_hidden, previous_hidden=previous_hidden,
+            current_h_tau=current_h_tau, tau=tau, chunk_start=chunk_start, anchor=anchor)
+        # CF_CUDA_BLOCK=1 runs the whole block stack as ONE hand-written CUDA kernel instead of the
+        # ~24 tiny kernels per block PyTorch emits (see chained_flow.cuda_block). Off by default.
+        # The enabled() check is resolved ONCE at construction, not here: a local import plus
+        # env lookups inside this torch.compile'd forward graph-breaks on EVERY call, which
+        # costs the compiled drafter even when the kernel is off.
+        fused = None if self._cf_fused_off else self._cf_fused_runner(x, context_hidden)
+        if fused is not None:
+            # Dynamo must NOT trace into the extension: under vLLM the drafter runs inside
+            # torch.inference_mode(), and AOT functionalization tries to version-track the
+            # kernel's out-tensors -- "Inference tensors do not track version counter".
+            # Tracing it also perturbed Inductor's autotune on the surrounding graph.
+            x = torch._dynamo.disable(fused.forward)(x, context_hidden, attn_mask)
+        else:
+            for block in self.blocks:
+                x = block(x, context_hidden, attn_mask=attn_mask)
+        return self.post_blocks(x, current_len)
 
 class CrossAttentionFlowExpert(nn.Module):
     def __init__(

@@ -1,6 +1,12 @@
 """One mode per process (CF_MODE=base|spec) — avoids cudagraph-pool corruption from two LLMs."""
 import os, sys, time, json
-sys.path.insert(0, "/home/shadeform/chained-flow/src")
+# Only fall back to the source tree when chained-flow is NOT installed. Prepending it
+# unconditionally would shadow an installed package and quietly invalidate the one thing a
+# pristine-venv run is meant to prove -- that the WHEEL works, `vllm.general_plugins` entry
+# point and all.
+import importlib.util
+if importlib.util.find_spec("chained_flow") is None:
+    sys.path.insert(0, "/home/shadeform/chained-flow/src")
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 from vllm import LLM, SamplingParams
 
@@ -62,10 +68,20 @@ sp = SamplingParams(temperature=_T, max_tokens=int(os.environ.get("CF_MAXTOK","6
 
 kw = dict(model=MODEL, gpu_memory_utilization=GMU, max_model_len=2048, dtype="float16",
           enforce_eager=os.environ.get("CF_EAGER","0")=="1", max_num_seqs=64)
+# CF_SSM_DTYPE=bfloat16 halves the recurrent-state cache (Qwen3.5 ships fp32).
+_sd = os.environ.get("CF_SSM_DTYPE")
+if _sd:
+    kw["mamba_ssm_cache_dtype"] = _sd
 if MODE == "spec":
     kw["speculative_config"] = {"method": "custom_class",
                                 "model": "chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer",
                                 "num_speculative_tokens": K}
+# CF_ASYNC_SCHED: vLLM auto-decides async_scheduling (config/vllm.py:992-1040) and gives the
+# BASE arm a feature custom_class spec is FORCED to give up (:1003). Leaving it auto makes every
+# base-vs-spec ratio understate the spec arm. See docs/BENCHMARKING.md.
+_as = os.environ.get('CF_ASYNC_SCHED')
+if _as is not None:
+    kw['async_scheduling'] = _as == '1'
 llm = LLM(**kw)
 
 
@@ -74,7 +90,14 @@ def _acc_counters():
     try:
         from chained_flow.vllm_plugin.flow_proposer import _STASH
         p = _STASH.get("proposer")
-        return (p._t.get("acc_tok", 0), p._t.get("acc_req", 0)) if p is not None else (0, 0)
+        if p is None:
+            return (0, 0)
+        if getattr(p, "async_spec", False):
+            # CF_ASYNC_SPEC: the CPU token lists are empty every step, so the counters are
+            # accumulated on the GPU and drained here (once per prompt set, not per step).
+            g = getattr(p, "_acc_gpu", None)
+            return (0, 0) if g is None else tuple(int(x) for x in g.tolist())
+        return (p._t.get("acc_tok", 0), p._t.get("acc_req", 0))
     except Exception as e:
         print(f"[cf-warn] accept counters unavailable: {e!r}", flush=True)
         return (0, 0)
@@ -109,6 +132,16 @@ if _tp is not None:
     _f = f"/tmp/cf_trace_{MODE}{os.environ.get('CF_TAG','')}.json"
     _tp.export_chrome_trace(_f)
     print(f"[cf-trace] wrote {_f}", flush=True)
+if os.environ.get("CF_GDN_CUDA_CHECK") == "1":
+    from vllm.v1.spec_decode import tree_gdn_verify as _gv
+    print(f"[cf-gdn-cuda-check] mismatching elements: {_gv.check_counters()}", flush=True)
+if os.environ.get("CF_GDN_FACTOR_CHECK") == "1":
+    from vllm.v1.spec_decode import tree_gdn_factor as _gf
+    print(f"[cf-gdn-factor-check] mismatching output elements: {_gf.check_counters()}",
+          flush=True)
+if os.environ.get("CF_TFA_CHECK") == "1":
+    from vllm.v1.spec_decode import tree_attn_fused as _tfa
+    print(f"[cf-tfa-check] mismatching output elements: {_tfa.check_counters()}", flush=True)
 res = dict(sets[0], mode=MODE, sets=sets)
 json.dump(res, open(f"/tmp/cf_native_{MODE}{os.environ.get('CF_TAG','')}.json", "w"))
 _m = sum(s["tokens"] for s in sets) / sum(s["secs"] for s in sets)
