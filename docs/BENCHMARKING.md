@@ -213,6 +213,38 @@ chained-flow installed as a wheel, GPU 6, batch 1, 7 domains, `maxtok` 256, pool
 | **chain, entry point ON** | **157.8** | **1.13x** | 1.28x |
 | chain, `CF_ASYNC_SPEC=0` (guard untouched) | 148.7 | 1.07x | 1.20x |
 
+**The 4B pooled figures above are contaminated by one domain, and the corrected
+pair is below.** On domain 4 the two chain arms generated *different text* — a
+1-ULP fp16 tie, resolved in opposite directions, see "The domain-4 gap" — so their
+tok/s on that domain is not measuring the same work. Restricted to the six domains
+whose output tokens are **byte-identical between the arms and to base**:
+
+| 4B, six byte-identical domains | tok/s |
+|---|---|
+| **chain, entry point ON** | **171.8** |
+| chain, `CF_ASYNC_SPEC=0` | 152.9 |
+
+Both numbers are true and they are quoted for different purposes. **157.8 / 148.7 is
+what the 7-prompt suite ran**; **171.8 / 152.9 is what the entry point is worth**,
+because it is the only one of the two in which both arms decoded the same tokens.
+Quote the pooled figure for suite-level reporting and the comparable-output figure
+for any claim about the flag, and never mix them.
+
+The same restriction moves the ratios, so both conventions are spelled out here
+rather than left for a reader to recompute and disagree with:
+
+| 4B, pooled over | base async-off | base async-on | chain | deployment | like-for-like |
+|---|---|---|---|---|---|
+| all 7 domains | 123.7 | 139.6 | 157.8 | **1.13x** | 1.28x |
+| 6 comparable domains | 125.2 | 139.6 | 171.8 | **1.23x** | 1.37x |
+
+**The external claim stays on the 7-domain pooled convention (1.13x) until someone
+decides otherwise** — it is the conservative one and it is what the published suite
+measures. Note that domain 4 is a tie lottery for *every* arm, not just ours: across
+the same 7-domain sweep the two **base** arms differ from each other on exactly one
+domain, and it is domain 4. So dropping it makes the base arms comparable too, which
+is why the base async-off figure moves (123.7 → 125.2) while base async-on does not.
+
 | 27B | tok/s | vs base async-on | vs base async-off |
 |---|---|---|---|
 | base, async **off** | 25.8 | | |
@@ -224,10 +256,16 @@ Four things to read off those tables:
 
 * **1.13x deployment at 4B is now a measurement, not an inference**, and it lands
   on the inferred value. 27B is 1.57x, above the ~1.5x expected.
-* **The entry point is worth +6.1%** on the 4B chain arm (157.8 vs 148.7).
-  Without it the fork-free build is 1.07x — not nothing, but not a story either.
-  At 27B it is +3.3% (41.0 vs 39.7), monotone in model size for the same reason
-  the base arm's async prize is: slower steps amortise host overhead better.
+* **The entry point is worth +12.4% on comparable output at 4B** (171.8 vs 152.9,
+  six byte-identical domains), and +6.1% on the raw 7-domain pooled figure
+  (157.8 vs 148.7). The two differ *only* because domain 4's arms decoded
+  different text; the +6.1% understates the flag by half. Without the entry point
+  the fork-free build is 1.07x — not nothing, but not a story either.
+  At 27B it is **+3.3%** (41.0 vs 39.7) and that number needs no correction:
+  **all seven** 27B domains are byte-identical between the arms and to base
+  (checked, not assumed), so the pooled figure and the comparable-output figure
+  are the same measurement there. Monotone in model size for the same reason the
+  base arm's async prize is: slower steps amortise host overhead better.
 * The fork-free synchronous chain (148.7 at 4B) reproduces the **forked** chain's
   148.0. The fork contributes nothing to the chain arm, which is the whole
   premise of shipping it fork-free.
@@ -241,27 +279,114 @@ tok/s** against the 188.9 recorded above, with the startup line reading
 `async_spec(engine async ON, GPU-resident tree)` and every tree flag on. The join
 still installs.
 
-### One unresolved thing, deliberately not smoothed over
+### The domain-4 gap — RESOLVED, and it was never a bug in our code
 
-At 4B, **domain 4** reads accept **1.261** with `CF_ASYNC_SPEC=1` and **1.652**
-with it off, and its throughput moves the same way (111.8 vs 130.6 tok/s). The
-other six domains agree to ~0.01.
+At 4B, **domain 4** read accept **1.261** with `CF_ASYNC_SPEC=1` and **1.652** with
+it off (111.8 vs 130.6 tok/s), while the other six domains agreed to ~0.01. It
+reproduced to the third decimal in a fresh process, so it was not run-to-run noise.
+It was carried here for a day as an unexplained behavioural difference. It is
+neither unexplained nor a difference in the *code path*:
 
-A repeat run in a fresh process reproduced the async arm to the third decimal on
-**every** domain (2.957 / 3.023 / 1.530 / 1.992 / **1.261** / 1.515 / 1.863,
-pooled 157.6 vs 157.8), so this is **not** fp16-tie noise — it is a deterministic
-difference in what the two paths draft on that one domain. What it is not:
+**A single fp16 tie at output token 59 sends the two arms into different text, and
+the two continuations differ enormously in how draftable they are.** Base-mode
+top-2 target logits at that position:
 
-* an early-termination / KV-corruption signature — every domain emitted an
-  **identical token count** under both flags, at both model sizes;
-* a 27B problem — there the two arms' accepts agree to ~0.01 on all seven
-  domains (2.812/3.935/1.576/1.810/1.554/1.631 sync vs
-  2.765/3.952/1.570/1.823/1.550/1.631 async).
+```
+tok   top1        top2        gap       gap/ULP   id1     id2
+ 58   19.31250    18.87500    0.43750     28.00    513     369
+ 59   17.03125    17.01562    0.01562      1.00   1330    1048   <-- exactly 1 ULP
+ 63   18.45312    18.43750    0.01562      1.00     13      11   <-- exactly 1 ULP
+```
 
-The async arm is still much faster overall and remains the default, but the
-domain-4 gap is a real behavioural difference on the 4B chain and has not been
-explained. Do not quote per-domain 4B accept under `CF_ASYNC_SPEC` as though it
-were the sync figure.
+`1330` and `1048` are precisely the two tokens the two arms emit at index 59. Only
+4 of 256 positions in this generation sit within 1 ULP, and two of them land at the
+sentence boundary where the model decides whether to open a `<think>` block:
+
+* the branch taken by sync **and by both base arms** opens
+  `\n\n<think>\nThinking Process:\n\n1.  **Analyze the Request:** ...` — repetitive
+  markdown that quotes the prompt verbatim. Accept **1.845** over its 110 remaining
+  steps.
+* the branch taken by the async arm continues in free prose. Accept **1.291** over
+  its 158 remaining steps.
+
+Up to the branch the arms are **bit-identical**: their emitted-count sequences match
+exactly for the first 45 steps / 53 tokens, at accept **1.178 in both**.
+
+**The flag is not what decides the branch.** Same prompt, same drafter, only the
+listed knob changed:
+
+| variant | `CF_ASYNC_SPEC` | tok/s | accept | token 59 | branch |
+|---|---|---|---|---|---|
+| chain K=5 (x2 processes) | off | 130.7 / 131.4 | 1.652 | 1330 | `<think>` |
+| chain K=5, `CF_CUDA_BLOCK=0` | off | 115.2 | 1.652 | 1330 | `<think>` |
+| chain K=4 / K=6 | off | 129.8 / 122.1 | 1.641 | 1330 | `<think>` |
+| chain K=5 (x2 processes) | **on** | 111.9 / 111.9 | **1.261 / 1.266** | 1048 | prose |
+| chain K=5, `CF_TWOPASS_M=2048` | **on** | 117.0 | **1.286** | 1048 | prose |
+| **chain K=6** | **on** | **136.1** | **1.627** | **1330** | `<think>` |
+
+Accept sorts perfectly by which side of the tie the run landed on and not at all by
+the flag. One extra draft column takes the *async* arm from 1.261 to 1.627 and from
+111.9 to 136.1 tok/s — the fastest of every variant tried.
+
+**What ruled out a plugin bug** (this is the part to reuse; it is the same family as
+the four silent async bugs above, and it is how you tell a real one from this):
+
+* Per-step draft dump scored against the actual output: **`ACCEPTED == ORACLE` on
+  202/202 async steps and 154/154 sync steps.** The number of drafts vLLM accepted
+  equals the number of *our* drafted tokens that matched the emitted text, every
+  step, in both arms. A misaligned, short or stale draft tensor cannot produce that
+  equality — so this single check retires the whole `draft_width` / `self.N` /
+  wrong-width-scatter class of hypothesis. In chain mode
+  `draft_width == K == num_speculative_tokens`, so that change is a no-op there
+  anyway and the `_async_draft_tensor` assert would have fired.
+* The drafter's `k0` equalled the real committed token on **every** step in both
+  arms — no phase error, no one-step lag.
+* vLLM's own hybrid-model bookkeeping is correct under async: `num_accepted_tokens`
+  equalled the previous step's emitted count on every step, **0 violations** of
+  202 / 154, and `num_computed_tokens` is correctly walked back from the
+  `valid_sampled_token_count` we publish. (Worth knowing *why*:
+  `_prepare_inputs` fills `num_accepted_tokens` with 1 under async when
+  `mamba_cache_mode != "align"`, and `update_num_computed_tokens_for_batch_change`
+  then restores it from our published counts. The GDN/causal-conv state shift reads
+  that value, so if we ever stop publishing `valid_sampled_token_count_gpu`
+  correctly it becomes a real hybrid-state corruption. It currently does not.)
+* Whole-sweep output diff, from the benchmark JSONs rather than a probe: at 4B the
+  async and sync chain arms are **byte-identical on 6 of 7 domains, and both are
+  byte-identical to base**. Token 59 of domain 4 is the *only* divergence in 1551
+  tokens. Run the same diff on the two **base** arms and you get the same answer:
+  they differ on exactly one domain, and it is domain 4 (at index 63, the other
+  1-ULP tie). The prompt is a tie lottery for every arm; our arm is not special.
+
+**The tree path and 27B are unaffected — but they are not immune.** 4B tree at
+poff=4 on the fork reads 1.977 (async) vs 1.969 (sync), and all seven 27B chain
+domains are byte-identical between the arms and to base. That is because those arms
+happened to land on the *same* side of the tie, not because a tree or a bigger model
+cannot flip one. A tree changes the verify batch shape, so it rounds differently and
+lands wherever it lands; the next 1-ULP tie in front of a high-contrast branch will
+bite whichever arm it likes.
+
+The async arm remains the default. Do not quote domain-4 4B accept or tok/s as a
+comparison between the flags — the two arms benchmarked different text. Use the
+protocol rule in section 3 to catch the next one automatically.
+
+### The flag report has to survive the engine-core spawn
+
+vLLM starts its engine core in a **spawned subprocess**, and `defaults.apply()` runs in both.
+By the time the child runs, every default the parent wrote is an ordinary environment variable,
+indistinguishable from a caller's request — so the child reported the whole table as `explicit`
+and printed
+
+> `[cf-defaults] CF_CUDA_BLOCK was requested but CANNOT ENGAGE ... Any A/B against it is meaningless.`
+
+about a default it had proposed itself. Three flags shouted that on a plain Quickstart run.
+A banner that fires when nothing is wrong is worse than no banner: it is how the real one stops
+being read. `apply()` now writes the same `CF_DEFAULTS_FROM_SHELL` provenance marker the `--sh`
+emitter uses, so the child can tell our defaults from the caller's requests, and a value the
+caller changes *after* the parent applied it still reads as a request.
+
+The same bug had a second, silent half: an inherited `CF_SHORTLIST` read as explicit, which
+skips the candidate search — in the one process that actually loads the drafter. The
+checkpoint's own `shortlist.pt` could never have won there.
 
 Confirm on any run that it actually engaged. Two lines, both in the engine log:
 
@@ -278,6 +403,132 @@ than logs when the resolved value disagrees with it.
 
 Driver: `vllm/bench_forkfree.sh <size> [maxtok]`, and `CF_PY=<venv>/bin/python`
 selects the vLLM in `bench_cf.sh`.
+
+### The published number was not the number a `pip install` produced
+
+Two flags were doing work that the benchmark had and the shipped package did not.
+Neither showed up as a failure; both showed up as a smaller ratio, which is the
+hardest kind of difference to notice.
+
+1. **The shortlist was a path into this repo.** `CF_SHORTLIST` defaulted to
+   `<repo>/out/flow/shortlist_q3527b.pt`, which no wheel contains, and
+   `bench_forkfree.sh` *set it explicitly*. So every measurement here ran the
+   62,642-row head and every pip user ran the full 248,320-row one — worth
+   **145.7 vs 157.8 tok/s (1.04x vs 1.13x)** at 4B in the clean room. The list is
+   keyed by token id, so it is a property of the Qwen3.5 *vocabulary*, not of a
+   model or a checkpoint: 250 KB as int32, one file for 4B/9B/27B. It now ships
+   inside the wheel (`chained_flow/data/shortlist_qwen3_5.pt`) and is the default.
+2. **`CF_COMPILE` was hard-coded to 1 in `bench_cf.sh`'s spec arms** and defaulted
+   to 0 in the proposer, and it was not in the defaults table, so it never appeared
+   on the `[cf-defaults]` line. A pip user was on an uncompiled flow net (9.79 vs
+   5.26 ms per draft at 27B) with nothing anywhere saying so. It is now a
+   capability-gated default like everything else, and **`bench_cf.sh` no longer
+   sets it** — if the script sets it, the table cannot report on it.
+
+Measured 2026-08-05 on **GPU 6** (GPU 5, the usual one, was occupied by a foreign
+job), pristine vLLM 0.25.1, chained-flow installed as a wheel, batch 1, 7 domains,
+`maxtok` 256, pooled. The chain arm ran with **no CF_* environment variables set
+at all** beyond `CF_DRAFTER_DIR` — i.e. exactly what `pip install` gives you:
+
+| 4B | tok/s | vs base async-on |
+|---|---|---|
+| base, async **on** (vLLM's default) | 140.3 | |
+| **chain, fresh install, no env vars** | **157.5** | **1.12x** |
+| chain, `CF_SHORTLIST=` (full head) | 148.5 | 1.06x |
+
+157.5 against the 157.8 reference, and it now needs no environment. The shortlist
+is worth **+6.1%** pooled on this box.
+
+27B, same conditions, also with no environment variables — this is the run that
+exercises the packaged list's **vocab guard** at a second model size (the guard
+compares the recorded `vocab_size=248320` against the loaded `lm_head`, and 4B /
+9B / 27B share it):
+
+| 27B | tok/s | vs base async-on |
+|---|---|---|
+| base, async **on** | 26.2 | |
+| **chain, fresh install, no env vars** | **41.0** | **1.57x** |
+
+Both reproduce the recorded figures exactly (26.2 / 41.0).
+
+Same run restricted to the six domains whose output tokens are byte-identical to
+base (domain 4 is the 1-ULP tie lottery described below, and it flipped exactly as
+before — first divergence at index 59):
+
+| 4B, six byte-identical domains | tok/s |
+|---|---|
+| base | 140.4 |
+| **chain, fresh install** | **171.3** (1.22x) |
+
+**Accept did not move.** The packaged list and the repo list are the same ids, and
+the A/B says so at the level that matters: outputs **bit-identical on all 7
+domains**, per-domain accept identical on 6 of 7 (2.9565 / 3.0233 / 1.5299 /
+1.9922 / 1.4971 / 1.8633) and the seventh differing by 0.0049 — one request-step,
+which is the known `CF_ASYNC_SPEC` counter-drain artifact and not a behavioural
+difference, since the two runs emitted the same tokens.
+
+Regression arms on the fork, same day, same GPU, `CF_TREE_KEEP=8 CF_TREE_DEPTH=5`:
+**4B tree 187.9** (reference 188.9, inside the documented ±0.5% spread) and
+**27B tree 46.6** (reference 46.6, exact). Tree per-domain accept
+3.450 / 3.824 / 2.144 / 2.520 / 2.106 / 1.882 / 2.364 against the recorded
+3.526 / 3.821 / 2.154 / 2.520 / 2.098 / 1.882 / 2.358 — every domain within 0.01
+except the 67-token domain 0, where one request-step is worth 0.05.
+
+### The shortlist is guarded, not trusted
+
+A shortlist is a list of integers. Point it at a model with a different
+vocabulary and every id names a different token: the list is not suboptimal, it
+is nonsense, and the only symptom is a quietly lower accept. The old loader
+clamped ids into range (`sl[sl < V]`) and carried on, which is that failure mode
+exactly. The payload now records the `vocab_size` it was built against,
+`chained_flow.shortlist.check` **refuses** a mismatch, and the fallback is the
+full head with the reason printed — slower, never wrong. Resolution order is
+`CF_SHORTLIST` (explicit, and `CF_SHORTLIST=` means "full head, deliberately"),
+then `<drafter checkpoint>/shortlist.pt` (now actually reachable: it is in the
+HF `allow_patterns` and is resolved *after* the snapshot download, so the
+documented "drop it next to the checkpoint" works for a repo id), then a source
+checkout's `out/flow/`, then the packaged list. The `[cf-defaults]` line names
+which one won and its row count, read off the built head rather than off the env
+var.
+
+### The K x prompt-length sweep (the K+1 cudagraph collision)
+
+A prompt of exactly `num_speculative_tokens + 1` tokens satisfies vLLM's
+*shape-only* uniform-decode test, so a **prefill** is dispatched to the FULL
+decode cudagraph; on a hybrid model that graph holds the recurrent GDN step
+instead of the chunked prefill scan and the request is corrupt from token 0.
+`flow_proposer._install_uniform_decode_guard` makes the test about phase instead.
+The collision sits on the `plen == K+1` diagonal, so the regression test has to
+sweep both axes rather than benchmark one shape:
+
+```bash
+./vllm/bench_prefill_guard.sh 4b            # K in {3..8} x plen 1..32, vs base
+```
+
+Result, 2026-08-05, GPU 6, pristine vLLM 0.25.1 + the wheel, 4B, greedy, 32 output
+tokens per cell: **160 of 160 cells byte-identical to base, 0 degenerate**, and the
+`plen == K+1` diagonal is indistinguishable from every other cell.
+
+Two traps this harness has to avoid, both of which produced a wrong verdict first:
+
+* **Prompts must be built from raw token ids.** Tokenizing text and hoping for
+  `K+1` tokens misses the only cell that matters.
+* **Base degenerates on its own at `plen == 1`** — a single token with nothing to
+  condition on, and it repeats id 0, which is *exactly* the corruption signature.
+  Judged absolutely, the sweep reported FAIL on every K. Degeneracy is evidence
+  only where base did not do it too. (Same family as the fp16-tie rule in section
+  3: compare against base, never against an absolute.)
+
+**The sweep also found a second defect**, which is what a sweep is for: at `K=8`
+against a `draft_length=8` drafter the engine started, loaded, and then died on the
+first decode step with `draft is (32, 7) but 8 columns were declared to vLLM` — a
+shape assertion about an internal buffer, minutes after the mistake, naming
+neither the knob nor the value. A chain emits `draft_length - 1` tokens (depth 0
+reconstructs the already-committed token), exactly like the tree, and the tree had
+a clear `ValueError` for it while the chain had none. It does now:
+`num_speculative_tokens=8 but this drafter can only emit 7 chain tokens`. K=8 is
+therefore reported as REFUSED rather than run, and 3..7 are the sweep's K axis on
+this drafter.
 
 ---
 
@@ -319,6 +570,21 @@ worse than recorded. Compare like with like.
   domains with no flags set at all. Prefer a within-process device-side element tally,
   which cancels per-process kernel selection exactly; compare token equality against
   **base**, never against another spec run.
+- **Diff the OUTPUT TOKENS before comparing accept or tok/s across arms. Exclude or
+  flag any domain whose outputs diverge.** This is the companion rule to the one
+  above, and it is the one that costs you numbers rather than confidence. Two arms
+  that decoded different text did not measure the same work, so *nothing* downstream
+  of the divergence is comparable — not accept, not tok/s, not the pooled figure they
+  feed. One 1-ULP flip anywhere in a generation is enough: at 4B domain 4 a flip at
+  token 59 (gap = 0.015625, exactly 1 ULP) put one arm in a repetitive `<think>` block
+  and the other in free prose, and dragged the *pooled* 7-domain entry-point figure
+  from +12.4% down to +6.1% — an artifact that looked for a day like a fifth silent
+  async bug. Practically: the harness already saves every set's token ids to
+  `/tmp/cf_native_<mode><tag>.json`, so the check is a few lines against those files
+  and costs no GPU time. Report the pooled figure over the domains that match, say
+  how many were dropped and why, and treat a *new* divergence as a bug to investigate
+  rather than a domain to drop. We have now been bitten by fp16 ties three separate
+  times; this rule is the one that would have caught all three cheaply.
 - **`CF_CUDA_BLOCK=1` is nondeterministic outside cudagraph capture** (2.70% of tree
   nodes flip run-to-run). Offline bit-exactness checks must run with it OFF or against
   a control.

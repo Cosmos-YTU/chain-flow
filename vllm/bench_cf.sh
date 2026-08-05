@@ -82,10 +82,16 @@ case "$ARM" in
   # it runs on unmodified vLLM. CF_ASYNC_SPEC now applies here too -- the async CONTRACT is
   # generic and only the TREE-SHAPE hand-off needed the fork -- so the chain arm gets the
   # +10.5%/+5.5%/+1.6% that used to belong to the base arm alone. See `_cf_async_engine` below.
-  chain) export CF_MODE=spec CF_COMPILE=1 CF_CUDAGRAPH=1 CF_K=5; _cf_async_engine ;;
+  # CF_COMPILE is NO LONGER set here. It was hard-coded to 1 in both spec arms while the
+  # proposer defaulted it to 0, so every published number came from a torch.compile'd flow net
+  # that a pip user did not get and no line in the log mentioned. It is now a capability-gated
+  # default (defaults.py, gate: an inductor backend exists) and appears on the [cf-defaults]
+  # line like every other flag -- which also means this script must NOT set it, or the benchmark
+  # goes back to measuring a path the table cannot report on.
+  chain) export CF_MODE=spec CF_CUDAGRAPH=1 CF_K=5; _cf_async_engine ;;
   # CF_TREE_FULLCG=1 makes a tree step dispatch to vLLM's FULL decode cudagraph
   # instead of PIECEWISE (bit-exact; set it to 0 to reproduce the PIECEWISE path).
-  tree)  export CF_MODE=spec CF_COMPILE=1 CF_CUDAGRAPH=1 VLLM_SPEC_TREE=1
+  tree)  export CF_MODE=spec CF_CUDAGRAPH=1 VLLM_SPEC_TREE=1
          # shape is caller-overridable (default 4x4=16 nodes). CF_K must be nodes+1: the spare
          # mamba state column. Previously these were `export`ed unconditionally, silently
          # overriding a caller-supplied shape -- same trap as CF_DRAFTER_DIR.

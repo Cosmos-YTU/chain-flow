@@ -59,6 +59,83 @@ def _install_hidden_state_hook() -> None:
     GPUModelRunner._cf_hooked = True
 
 
+def _install_uniform_decode_guard() -> None:
+    """Stop vLLM from mistaking a PREFILL of exactly ``num_speculative_tokens + 1`` tokens
+    for a uniform spec-decode batch.
+
+    THE BUG (upstream vLLM, not this proposer -- stock `method="ngram"` reproduces it
+    byte-for-byte).  `GPUModelRunner._is_uniform_decode` is::
+
+        max_num_scheduled_tokens == 1 + num_speculative_tokens
+        and num_tokens == max_num_scheduled_tokens * num_reqs
+
+    which is a statement about SHAPE ONLY.  A single request prefilling exactly K+1 prompt
+    tokens schedules K+1 tokens in one row and satisfies it exactly, so the dispatcher hands
+    the batch to the **FULL (decode) cudagraph** instead of PIECEWISE -- `uniform=True` in the
+    BatchDescriptor.  The attention METADATA is still built correctly (`num_prefills=1`), but
+    a FULL graph has the kernel selection baked in at capture time, and on a HYBRID model
+    (Qwen3.5 = GDN linear-attention + full attention) prefill and decode are different
+    kernels: the captured graph holds the recurrent/spec-decode gated-delta-rule step, not
+    the chunked prefill scan.  Replaying it computes the wrong linear-attention output AND
+    leaves a wrong recurrent state, so the request is corrupt from its very first token and
+    the generation degenerates (measured: repeated token id 0).
+
+    K-dependence is the signature: the collision is at prompt length K+1 for every K, which
+    is exactly what `uniform_decode_query_len = 1 + num_speculative_tokens` predicts.  Our
+    7-domain benchmark cannot see it because those prompts are long -- but the README
+    Quickstart prompt is 6 tokens and the default K is 5.
+
+    THE FIX.  `uniform_decode` must be a statement about PHASE, not shape.  A row is still
+    in prefill iff it has not yet computed its whole prompt (`num_computed_tokens <
+    num_prompt_tokens`); that is exactly the vLLM-side condition for "this step runs prompt
+    tokens through the model", it covers chunked-prefill chunks that happen to be K+1 long,
+    and it covers the mixed case (a K+1 prefill batched with real spec decodes, where
+    `num_tokens == max * num_reqs` also holds).  When any such row is present we pass
+    `force_uniform_decode=False`, which is the SAME public lever vLLM already uses at its
+    cudagraph-CAPTURE call site to stop a capture batch from being misread as a uniform
+    decode.  Speculation is NOT disabled: only this one step's cudagraph mode changes, from
+    FULL to PIECEWISE, which is what every other prompt length already does.
+
+    `force_uniform_decode is not None` is left alone, which is what makes this a strict
+    no-op on the two paths that already decide for themselves: vLLM's own cudagraph capture,
+    and the fork's `CF_TREE_FULLCG` tree dispatch, which passes `_cf_force_uniform` on EVERY
+    step (`_graphable`, a genuine tree-decode predicate).  That is also why the TREE arm was
+    never exposed to this bug -- measured, not assumed.
+
+    MEASURED: 0 dispatch decisions changed over the whole 7-domain sweep at 4B chain
+    (1120 steps) and 4B/27B tree (776/689 steps); outputs bit-identical, pooled tok/s
+    unchanged.  CF_PREFILL_GUARD=0 disables the patch.
+    """
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    if getattr(GPUModelRunner, "_cf_uniform_guard", False):
+        return
+    if os.environ.get("CF_PREFILL_GUARD", "1") == "0":
+        return
+    orig = getattr(GPUModelRunner, "_determine_batch_execution_and_padding", None)
+    if orig is None:
+        # A vLLM that dispatches cudagraphs somewhere else entirely: say so rather than
+        # silently shipping the corruption.
+        print("[chained-flow] WARNING: this vLLM has no "
+              "_determine_batch_execution_and_padding; the prefill/uniform-decode guard is "
+              "NOT installed. A prompt of exactly num_speculative_tokens+1 tokens may "
+              "produce garbage on hybrid models.", flush=True)
+        return
+
+    def patched(self, *a, **kw):
+        if kw.get("force_uniform_decode") is None:
+            ib = self.input_batch
+            n = int(kw.get("num_reqs", ib.num_reqs))
+            # numpy views, no device sync: `num_computed_tokens_cpu` is the KV the request
+            # already has, `num_prompt_tokens` the length of its prompt.
+            if bool((ib.num_computed_tokens_cpu[:n] < ib.num_prompt_tokens[:n]).any()):
+                kw["force_uniform_decode"] = False
+        return orig(self, *a, **kw)
+
+    GPUModelRunner._determine_batch_execution_and_padding = patched
+    GPUModelRunner._cf_uniform_guard = True
+
+
 def _install_early_hook() -> None:
     """CF_DRAFT_EARLY: issue the draft on a SIDE STREAM the moment the tree verify has been
     enqueued, instead of after `_bookkeeping_sync`.
@@ -252,6 +329,10 @@ def _install_async_hooks(tree: bool) -> None:
 class FlowDrafterProposer:
     def __init__(self, vllm_config):
         _install_hidden_state_hook()
+        # Must be installed before the first forward (this runs during engine init, so it
+        # is) -- see the docstring: without it a prompt of exactly K+1 tokens is dispatched
+        # to the FULL decode cudagraph and the request is corrupt from token 0.
+        _install_uniform_decode_guard()
         spec = vllm_config.speculative_config
         self.tree = os.environ.get("VLLM_SPEC_TREE", "0") == "1"
         # Tree mode needs ONE spare mamba state column so a node never
@@ -297,8 +378,13 @@ class FlowDrafterProposer:
         if not os.path.isdir(self.ckd):
             # a HF repo id (e.g. selimaktas/Flow-Drafter-Qwen3.5-27B-v2): run the PUBLISHED weights
             from huggingface_hub import snapshot_download
+            # `shortlist.pt` is in the allow-list so that a drafter repo which ships one is
+            # actually picked up.  Documenting "drop shortlist.pt next to the checkpoint" while
+            # never downloading it -- and then testing `os.path.isdir` on a repo id, which is
+            # never true -- made that instruction unreachable for the documented usage.
             self.ckd = snapshot_download(
-                self.ckd, allow_patterns=["model.safetensors", "chained_flow_tree_config.json"])
+                self.ckd, allow_patterns=["model.safetensors", "chained_flow_tree_config.json",
+                                          "shortlist.pt"])
             print(f"[chained-flow] drafter from HF hub -> {self.ckd}", flush=True)
         self.shortlist_path = os.environ.get("CF_SHORTLIST")
         self.drafter = None
@@ -316,7 +402,8 @@ class FlowDrafterProposer:
         # knob 2: torch.compile the flow net (predict_hidden). Measured 9.79 -> 5.26 ms (1.86x) at 27B.
         # "-no-cudagraphs" so inductor does not also try to own graph capture — we capture the whole
         # draft ourselves in _capture(); the compiled callable is replayed inside that graph.
-        self.compile = os.environ.get("CF_COMPILE", "0") == "1"
+        # The VALUE is resolved in the defaults block below (it is a gated default now, see
+        # `defaults.finalize_compile`); only the mode is read here.
         self.compile_mode = os.environ.get("CF_COMPILE_MODE", "max-autotune-no-cudagraphs")
         # ---- the capability-gated DEFAULTS (chained_flow.defaults) ----------------------
         # Every flag below now reads a value that `defaults.apply()` has already proposed at
@@ -328,6 +415,11 @@ class FlowDrafterProposer:
         from chained_flow import defaults as _cfd
         _cfd.apply()
         self.fuse_path = _cfd.truthy(os.environ.get("CF_FUSE_PATH"))
+        # CF_COMPILE: proposed by the table, GATED in `_build` (finalize_compile) before the
+        # wrap happens.  It used to default to 0 here while bench_cf.sh's chain and tree arms
+        # hard-coded 1, so every published number came from a path no pip user was on and no
+        # line in the log mentioned it.
+        self.compile = _cfd.truthy(os.environ.get("CF_COMPILE"))
         # CF_TWOPASS_M: two-pass candidate head (see _candidates). 0 = OFF (one-pass).
         self.twopass_m = int(os.environ.get("CF_TWOPASS_M", "0") or 0)
         # CF_TWOPASS_SEED conditions pass A on the seed path's residual+markov bias. MEASURED
@@ -527,23 +619,85 @@ class FlowDrafterProposer:
                     f"were sized for the larger depth, so verify would index unfilled draft slots "
                     f"and silently corrupt the drafts. Set CF_TREE_DEPTH<={emit} and "
                     f"num_speculative_tokens={self.tree_keep * emit + 1}.")
+        else:
+            # The CHAIN equivalent of the check above, and it was missing.  A chain emits one
+            # token per flow depth and depth 0 reconstructs the already-committed token, so the
+            # ceiling is `draft_length - 1` exactly as for the tree.  Asking for more used to
+            # build fine, load the model, and then die on the first decode step inside
+            # `_async_draft_tensor` with "draft is (32, 7) but 8 columns were declared to vLLM"
+            # -- a shape assertion about an internal buffer, several minutes after the mistake,
+            # naming neither the flag to change nor the value to change it to. (Found by the
+            # K x prompt-length sweep at K=8 against a draft_length=8 drafter.)
+            emit = dcfg.draft_length - 1
+            if self.K > emit:
+                raise ValueError(
+                    f"num_speculative_tokens={self.K} but this drafter can only emit {emit} "
+                    f"chain tokens (draft_length={dcfg.draft_length}; depth 0 reconstructs the "
+                    f"token that was already committed). vLLM has been told to expect "
+                    f"{self.K} draft columns and a short draft cannot be widened -- doing so "
+                    f"would scatter the previous step's tokens into input_ids. Set "
+                    f"num_speculative_tokens<={emit}.")
         if self.gpuctx:
             self._init_ring(H)
 
         # knob 1: shortlist head (quality-free at full coverage; the tree only uses top candidates)
+        #
+        # Resolved HERE rather than at import time for two reasons, both of which were bugs:
+        # `self.ckd` is a real local directory only after the HF snapshot download above, and the
+        # VOCAB GUARD needs `V`, which only exists once the target model is loaded.
         self._sl = None
+        self._sl_src = "none"
+        self._sl_why = ("FULL HEAD -- ~43-47% of the draft is wasted; "
+                        "build one with `chained-flow build-shortlist`")
         self._hw = lm_w
         self._w2 = d.markov.w2.weight
-        if self.shortlist_path:
+        from chained_flow import defaults as _cfd_sl
+        from chained_flow import shortlist as _slmod
+
+        if _cfd_sl.was_explicit("CF_SHORTLIST") and self.shortlist_path:
             # fail loudly: a typo'd path silently benchmarking the full head is exactly how the
             # shortlist went unmeasured for a week.
             if not os.path.exists(self.shortlist_path):
                 raise FileNotFoundError(f"CF_SHORTLIST={self.shortlist_path} does not exist")
-            sl = torch.load(self.shortlist_path, map_location="cpu").flatten().long()
-            sl = sl[(sl >= 0) & (sl < V)].unique().to(self.dev)
-            self._sl = sl
+            cands = [(self.shortlist_path, "CF_SHORTLIST")]
+        elif _cfd_sl.was_explicit("CF_SHORTLIST"):
+            cands = []                       # CF_SHORTLIST="" means "full head, deliberately"
+            self._sl_why = "explicit CF_SHORTLIST='' -- FULL HEAD by request"
+        else:
+            cands = _cfd_sl.shortlist_candidates(self.ckd)
+
+        rejected: list[str] = []
+        for path, src in cands:
+            ids, meta = _slmod.load(path)
+            # THE GUARD.  A shortlist is a list of integers; against a different vocabulary every
+            # id names a different token, so the list is not suboptimal, it is nonsense -- and the
+            # only symptom is a quietly lower accept.  The old code filtered `ids < V` and carried
+            # on, which is exactly the silent path.  Refuse, name the reason, try the next one.
+            bad = _slmod.check(ids, meta, V)
+            if bad:
+                rejected.append(f"{src} {path}: {bad}")
+                continue
+            sl = ids[(ids >= 0) & (ids < V)].unique().to(self.dev)
+            self._sl, self._sl_src = sl, f"{src} {os.path.basename(path)}"
             self._hw = lm_w[sl].contiguous()
             self._w2 = d.markov.w2.weight[sl].contiguous()
+            print(f"[chained-flow] shortlist head: {sl.numel()} of {V} rows "
+                  f"({V / max(sl.numel(), 1):.2f}x less head traffic) from {path} [{src}]",
+                  flush=True)
+            break
+        if rejected:
+            # Loud, and loud even when a later candidate DID load: "the packaged list was
+            # refused" is a fact about this model that the user needs, and the fallback list is
+            # short enough that this can never become noise.
+            self._sl_why = ("FULL HEAD -- every candidate refused: " + " | ".join(rejected)) \
+                if self._sl is None else self._sl_why
+            for r in rejected:
+                print(f"[chained-flow] WARNING: shortlist REFUSED -- {r}", flush=True)
+            if self._sl is None:
+                print("[chained-flow] WARNING: running the FULL "
+                      f"{V}-row lm_head at every draft depth (~43-47% of the draft). Build a "
+                      "matching one with `chained-flow build-shortlist --tokenizer <target "
+                      "model> --ids ...`.", flush=True)
         if self.twopass_m >= self._hw.shape[0]:
             # A two-pass head wider than the head it narrows would gather more rows than exist
             # and buy nothing.  If the value was ASKED FOR, refuse loudly; if it is only the
@@ -559,6 +713,11 @@ class FlowDrafterProposer:
                   f"{self._hw.shape[0]} rows, shared={'on' if self.twopass_shared else 'off'}, "
                   f"seed_cond={'on' if self.twopass_seed else 'off'}", flush=True)
         # knob 2: fuse/compile the flow net. Both are pure-speed monkeypatches on the loaded drafter.
+        # The compile GATE runs first, so a box without an inductor backend never reaches the wrap
+        # (the failure would otherwise surface inside the first draft, i.e. inside a cudagraph
+        # capture, which the engine does not survive).
+        from chained_flow import defaults as _cfd_c
+        self.compile = _cfd_c.finalize_compile(self)
         if self.fuse_path or self.compile:
             from chained_flow.vllm_plugin import fused
             if self.fuse_path:

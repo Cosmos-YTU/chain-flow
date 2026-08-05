@@ -14,19 +14,27 @@ pip install chained-flow          # pulls vllm==0.25.*
 
 That is the **default build: fork-free**. It runs the *chain* path on unmodified
 vLLM and needs no patching. The install registers a `vllm.general_plugins` entry
-point ([`chained_flow/vllm_plugin/async_guard.py`](src/chained_flow/vllm_plugin/async_guard.py))
+point ([`chained_flow/vllm_plugin/async_guard.py`](https://github.com/Zeuss5/chained-flow/blob/main/src/chained_flow/vllm_plugin/async_guard.py))
 that relaxes one guard so a `custom_class` proposer is allowed to keep vLLM's
 async scheduling, which vLLM otherwise hands to the baseline and denies to us.
 Measured worth on the chain arm: **+6.1% at 4B**. That is why the install has to
 be a real install — a bare `PYTHONPATH` creates no entry points and the plugin
 never fires.
 
-Measured on pristine vLLM 0.25.1, batch 1, 7 domains, 256 tokens, pooled:
+Measured on pristine vLLM 0.25.1, batch 1, 7 domains, 256 tokens, pooled,
+**with no environment variables set beyond `CF_DRAFTER_DIR`**:
 
 | | base (vLLM default) | chain | speedup |
 |---|---|---|---|
 | Qwen3.5-4B  | 139.6 tok/s | **157.8** | **1.13x** |
 | Qwen3.5-27B |  26.2 tok/s |  **41.0** | **1.57x** |
+
+How that number was taken, and the two baseline mistakes that have corrupted it
+before, are in the benchmarking protocol. It ships in the wheel:
+
+```bash
+chained-flow docs        # docs/BENCHMARKING.md — read it before quoting any speedup
+```
 
 Check what you got:
 
@@ -35,28 +43,16 @@ chained-flow info
 ```
 
 It prints the vLLM build in use, whether the async guard was relaxed, whether the
-fused CUDA kernel compiles on this box, and the resolved state of every flag.
+fused CUDA kernel compiles on this box, which shortlist would be used, whether
+flashinfer's kernels are prebuilt, and the resolved state of every flag.
 
-## Quickstart
+## What you have to supply
 
-```python
-from vllm import LLM, SamplingParams
+Exactly two things. Everything else has a default that is gated and printed.
 
-llm = LLM(
-    model="Qwen/Qwen3.5-4B",
-    dtype="float16",
-    speculative_config={
-        "method": "custom_class",
-        "model": "chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer",
-        "num_speculative_tokens": 5,
-    },
-)
-print(llm.generate(["Explain gradient descent simply."],
-                   SamplingParams(temperature=0, max_tokens=256))[0].outputs[0].text)
-```
-
-The drafter checkpoint comes from `CF_DRAFTER_DIR` — a local directory or a
-Hugging Face repo id, downloaded on first use:
+1. **The target model** — any Qwen3.5 checkpoint a drafter was trained for.
+2. **`CF_DRAFTER_DIR`** — the drafter checkpoint: a local directory, or a Hugging
+   Face repo id downloaded on first use.
 
 | target model | drafter |
 |---|---|
@@ -64,23 +60,93 @@ Hugging Face repo id, downloaded on first use:
 | `Qwen/Qwen3.5-9B`  | `selimaktas/Flow-Drafter-9B` |
 | `Qwen/Qwen3.5-27B` | `selimaktas/Flow-Drafter-Qwen3.5-27B-v2` |
 
-```bash
-CF_DRAFTER_DIR=selimaktas/Flow-Drafter-4B-v2 python your_script.py
+## Quickstart
+
+```python
+# quickstart.py  —  CF_DRAFTER_DIR=selimaktas/Flow-Drafter-4B-v2 python quickstart.py
+from vllm import LLM, SamplingParams
+
+
+def main():
+    llm = LLM(
+        model="Qwen/Qwen3.5-4B",
+        dtype="float16",
+        speculative_config={
+            "method": "custom_class",
+            "model": "chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer",
+            "num_speculative_tokens": 5,
+        },
+    )
+    out = llm.generate(
+        ["Explain how gradient descent works, and why the learning rate matters."],
+        SamplingParams(temperature=0, max_tokens=256),
+    )
+    print(out[0].outputs[0].text)
+
+
+# REQUIRED, not style: vLLM 0.25 starts its engine core in a `spawn`ed subprocess, which
+# re-imports this file. Without the guard the module-level `LLM(...)` runs again in the
+# child and the process dies in multiprocessing before generating anything.
+if __name__ == "__main__":
+    main()
 ```
 
-One thing worth setting explicitly: `CF_SHORTLIST=<a .pt of token ids>`. Without
-it the drafter scores the full 248k-row `lm_head` at every depth, which is ~40%
-of the draft spent on rows the beam never looks at. `scripts/build_shortlist.py`
-builds one; drop it next to the checkpoint as `shortlist.pt` and it is picked up
-automatically. A run without one says so at startup.
+```bash
+CF_DRAFTER_DIR=selimaktas/Flow-Drafter-4B-v2 python quickstart.py
+```
 
-Everything else is defaulted and **capability-gated**: ten optimisation flags are
-proposed, each gate is evaluated against the real process (does the CUDA
-extension build? does the drafter's shape fit the kernel? did the engine actually
-enable async scheduling?), and the resolved state of all of them is printed on one
-`[cf-defaults]` line at startup. See
-[`defaults.py`](src/chained_flow/defaults.py). A flag that could not engage says
-so; nothing here fails silently.
+Everything else is defaulted and **capability-gated**: eleven optimisation flags
+are proposed, each gate is evaluated against the real process (does the CUDA
+extension build? does the drafter's shape fit the kernel? was the shortlist built
+for this vocabulary? did the engine actually enable async scheduling?), and the
+resolved state of all of them is printed on one `[cf-defaults]` line at startup.
+See [`defaults.py`](https://github.com/Zeuss5/chained-flow/blob/main/src/chained_flow/defaults.py).
+A flag that could not engage says so; nothing here fails silently.
+
+### First run is slow, and only some of that is ours
+
+* **flashinfer** JIT-compiles its sampling kernels on first use unless the
+  prebuilt cache is installed. It is not on PyPI (it is built per CUDA version),
+  so `pip` cannot pull it for you and vLLM will not warn you. Minutes, and it
+  needs `nvcc`. Skip it with:
+
+  ```bash
+  pip install flashinfer-jit-cache --extra-index-url https://flashinfer.ai/whl/cu130/   # match your CUDA
+  ```
+
+* **our fused CUDA kernel** JIT-compiles once (~60 s) — `chained-flow build-kernel`
+  precompiles it, see [CUDA kernel](#cuda-kernel).
+* **`CF_COMPILE`** (default on) `torch.compile`s the drafter's flow net on the
+  first draft; worth 9.79 → 5.26 ms per draft at 27B.
+
+`chained-flow info` tells you which of these are still pending.
+
+### The shortlist
+
+The drafter decodes through the target's frozen 248k-row `lm_head`, but drafting
+only ever consumes the top few candidates per position — so ~45% of the draft is
+weight traffic for rows the beam never looks at. A **shortlist** restricts the
+head to the 62,642 ids that actually occur. It is quality-free: the drafter only
+*proposes*, and vLLM verifies every token, so a missing id can cost acceptance
+and can never cost correctness.
+
+**It ships in the wheel** (250 KB, int32) and is used automatically — it is keyed
+by token id, so one file serves 4B/9B/27B, which share the Qwen3.5 vocabulary.
+Without it, 4B measures 145.7 tok/s (1.04x) instead of 157.8 (1.13x).
+
+You only touch this for a vocabulary we do not ship one for:
+
+* the packaged list is **refused, loudly, on a vocab-size mismatch** — it falls
+  back to the full head rather than silently indexing the wrong tokens;
+* `chained-flow build-shortlist --tokenizer <model> --vocab-size <lm_head rows> --ids '<glob>.pt' --jsonl '<glob>.jsonl'`
+  builds one. Pass `--vocab-size` explicitly: the guard compares it against the
+  model's `lm_head`, and a tokenizer under-reports whenever that head is padded
+  (Qwen3.5: 248,044 vs 248,320);
+* put it next to the drafter checkpoint as `shortlist.pt` (this works for an HF
+  drafter repo too — it is downloaded with the weights) or point `CF_SHORTLIST`
+  at it. `CF_SHORTLIST=` (empty) forces the full head.
+
+The `[cf-defaults]` line reports which one won and its row count.
 
 ## The two arms
 
@@ -141,7 +207,8 @@ instantiated for, it falls back to the **bit-identical** PyTorch block stack
 
 ## Benchmarking
 
-**Before quoting any speedup, read [docs/BENCHMARKING.md](docs/BENCHMARKING.md).**
+**Before quoting any speedup, read the benchmarking protocol** — `chained-flow docs`,
+or [docs/BENCHMARKING.md](https://github.com/Zeuss5/chained-flow/blob/main/docs/BENCHMARKING.md).
 The baseline is where this project has been wrong before.
 
 ```bash

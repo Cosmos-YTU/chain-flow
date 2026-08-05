@@ -71,3 +71,14 @@ vllm/_vllm_backup/
 vllm/_vllm_preopt/
 vllm/_vllm_preopt2/
 vllm/_cf_backup/
+
+# ---- package data that MUST be in the repo (two rules above conspire against it) ----
+# `data/` has no leading slash, so it matches src/chained_flow/data/ as well as the 374 GB flow
+# cache it was written for, and `*.pt` matches the shortlist. Together they made the 250 KB
+# shortlist that SHIPS IN THE WHEEL invisible to `git add`: the wheel built here would have it
+# and the wheel built from a clone would not, which is precisely the 1.13x-vs-1.04x difference
+# this file is supposed to make impossible.
+# Un-ignoring the DIRECTORY first is load-bearing: git does not descend into an excluded
+# directory, so a `!.../*.pt` rule on its own is never even evaluated.
+!src/chained_flow/data/
+!src/chained_flow/data/*.pt

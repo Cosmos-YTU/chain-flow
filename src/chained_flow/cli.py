@@ -6,10 +6,12 @@ compiles on this box, and which of ten capability-gated flags survived their gat
 those from a 200-line engine log is how two silent fallbacks went unnoticed for days.  So they
 get one command.
 
-    chained-flow info            # resolved flags, vLLM build, async guard, kernel, drafter
-    chained-flow build-kernel    # precompile the fused-block extension (else it JITs on first use)
-    chained-flow tree-patch      # where the OPTIONAL forked-vLLM patch is, and how to apply it
-    chained-flow env             # `eval "$(chained-flow env)"`: the flag table as exports
+    chained-flow info              # resolved flags, vLLM build, async guard, kernel, drafter
+    chained-flow build-kernel      # precompile the fused-block extension (else it JITs on first use)
+    chained-flow build-shortlist   # build a CF_SHORTLIST for a vocabulary we do not ship one for
+    chained-flow tree-patch        # where the OPTIONAL forked-vLLM patch is, and how to apply it
+    chained-flow docs             # print docs/BENCHMARKING.md (it ships in the wheel)
+    chained-flow env               # `eval "$(chained-flow env)"`: the flag table as exports
 
 ``info`` is deliberately runnable WITHOUT a GPU or a drafter checkpoint: it reports what it
 cannot determine instead of failing.
@@ -81,6 +83,57 @@ def _kernel_line() -> str:
             f"stack (~2x slower draft)\n             {err.splitlines()[0][:300]}")
 
 
+def _jit_cache_line() -> str:
+    """flashinfer's sampling kernels: prebuilt, or compiled on YOUR first run?
+
+    `pip install chained-flow` pulls `vllm`, which pulls `flashinfer-python` -- the Python
+    frontend only. The compiled kernels live in a SEPARATE distribution, `flashinfer-jit-cache`,
+    which is not on PyPI (it is per-CUDA-version and is published from flashinfer's own index),
+    so a plain pip install leaves flashinfer to JIT-compile them on the first sampling call. That
+    needs a full CUDA toolchain and costs minutes, and it happens BEFORE any chained-flow code
+    runs -- which makes it look like our stall. Reported here rather than left to be discovered.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("flashinfer_jit_cache") is not None:
+        return "flashinfer : jit-cache present (sampling kernels prebuilt)"
+    if importlib.util.find_spec("flashinfer") is None:
+        return "flashinfer : not installed (vLLM will use its own sampler)"
+    return ("flashinfer : jit-cache NOT installed -- flashinfer will COMPILE its sampling "
+            "kernels on the first run\n"
+            "             (minutes, needs nvcc; unrelated to chained-flow's own kernel). Fix:\n"
+            "             pip install flashinfer-jit-cache "
+            "--extra-index-url https://flashinfer.ai/whl/cu130/   # match your CUDA")
+
+
+def _shortlist_line() -> str:
+    """Which shortlist WOULD be used, and how big it is.
+
+    The vocab guard needs a loaded model, so this is the candidate list, not the verdict -- the
+    verdict is on the `[cf-defaults]` line of a real run. What it does answer is the question
+    that cost pip users 1.13x -> 1.04x: is there a shortlist here at all?
+    """
+    from chained_flow import defaults
+
+    cands = defaults.shortlist_candidates()
+    if not cands:
+        return ("shortlist  : NONE FOUND -- the drafter would score the full lm_head at every "
+                "depth (~43-47% of the draft).\n"
+                "             build one: chained-flow build-shortlist")
+    head = f"shortlist  : {cands[0][0]}  [{cands[0][1]}]"
+    try:
+        from chained_flow import shortlist as sl
+
+        ids, meta = sl.load(cands[0][0])
+        head += (f"\n             {ids.numel()} rows, built for vocab_size="
+                 f"{meta.get('vocab_size', '? (legacy format, max-id check only)')}")
+    except Exception as e:                                  # noqa: BLE001 - reporting only
+        head += f"\n             UNREADABLE: {e!r}"
+    if len(cands) > 1:
+        head += "\n             fallbacks: " + ", ".join(f"{p} [{w}]" for p, w in cands[1:])
+    return head
+
+
 def _drafter_line() -> str:
     d = os.environ.get("CF_DRAFTER_DIR")
     if not d:
@@ -98,7 +151,9 @@ def cmd_info(_args) -> int:
     print(_fork_line())
     print(_plugin_line())
     print(_kernel_line())
+    print(_jit_cache_line())
     print(_drafter_line())
+    print(_shortlist_line())
     print()
     print(defaults.summary())
     print("(gates that need the loaded drafter or the engine config are only resolved inside a "
@@ -126,6 +181,33 @@ def cmd_build_kernel(_args) -> int:
           "PyTorch block stack (~2x slower draft). Set CF_CUDA_BLOCK=0 to silence the probe.",
           file=sys.stderr)
     return 1
+
+
+def cmd_build_shortlist(_args, rest=None) -> int:
+    from chained_flow.shortlist import build
+
+    return build(rest)
+
+
+DOCS = {"benchmarking": "BENCHMARKING.md"}
+
+
+def cmd_docs(args) -> int:
+    """Print a shipped doc.  ``docs/BENCHMARKING.md`` is package data precisely so that the
+    README's "read this before quoting any speedup" is reachable by someone who has a wheel and
+    no checkout -- a relative link in a PyPI README goes nowhere."""
+    from pathlib import Path
+
+    name = DOCS.get(getattr(args, "doc", "benchmarking"))
+    if name is None:
+        print(f"[cf] unknown doc {args.doc!r}; have: {', '.join(DOCS)}", file=sys.stderr)
+        return 2
+    p = Path(__file__).resolve().parent / "docs" / name
+    if not p.is_file():
+        print(f"[cf] {name} is missing from this install (expected {p}).", file=sys.stderr)
+        return 1
+    print(p.read_text())
+    return 0
 
 
 TREE_PATCH = "vllm-0.25.1-chained-flow-tree.patch"
@@ -178,11 +260,21 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("info", help="resolved flags, vLLM build, async guard, kernel, drafter")
     sub.add_parser("build-kernel", help="precompile the fused-block CUDA extension")
+    # Its own arguments are parsed by chained_flow.shortlist.build, so everything after the
+    # subcommand is passed through verbatim rather than duplicated here and left to drift.
+    sub.add_parser("build-shortlist", add_help=False,
+                   help="build a CF_SHORTLIST token-id list (--help for its options)")
     sub.add_parser("tree-patch", help="where the optional forked-vLLM patch is, and how to apply it")
+    d = sub.add_parser("docs", help="print a shipped doc (default: the benchmarking protocol)")
+    d.add_argument("doc", nargs="?", default="benchmarking", choices=sorted(DOCS))
     sub.add_parser("env", help='shell exports for the flag table: eval "$(chained-flow env)"')
-    args = p.parse_args(argv)
-    fn = {"info": cmd_info, "build-kernel": cmd_build_kernel,
-          "tree-patch": cmd_tree_patch, "env": cmd_env}.get(args.cmd)
+    args, rest = p.parse_known_args(argv)
+    if args.cmd == "build-shortlist":
+        return cmd_build_shortlist(args, rest)
+    if rest:
+        p.error(f"unrecognized arguments: {' '.join(rest)}")
+    fn = {"info": cmd_info, "build-kernel": cmd_build_kernel, "tree-patch": cmd_tree_patch,
+          "docs": cmd_docs, "env": cmd_env}.get(args.cmd)
     if fn is None:
         p.print_help()
         return 2

@@ -19,11 +19,17 @@ PY=${CF_PY:-/home/shadeform/vllm-pristine/.venv/bin/python}
 OUT=${CF_OUT:-/home/shadeform/chained-flow/logs/forkfree}
 mkdir -p "$OUT"
 
-# The published drafters do not ship a shortlist, and without one the drafter scores the full
-# 248k-row lm_head at every depth (~40% of the draft wasted). The fork-side numbers we are
-# comparing against were taken WITH the repo's shortlist, so pass it explicitly rather than let
-# the two runs differ in a way that is invisible in the tok/s.
-export CF_SHORTLIST=${CF_SHORTLIST:-/home/shadeform/chained-flow/out/flow/shortlist_q3527b.pt}
+# CF_SHORTLIST IS DELIBERATELY NOT SET HERE ANY MORE.
+#
+# It used to be, pointing at /home/shadeform/chained-flow/out/flow/shortlist_q3527b.pt, because
+# the published drafters did not ship a shortlist and without one the drafter scores the full
+# 248k-row lm_head at every depth. That made this script -- the one whose entire purpose is to
+# validate the FORK-FREE, INSTALLED-FROM-A-WHEEL path -- the only place the shortlist existed:
+# every number here was taken with it and every pip user ran without it (145.7 vs 157.8 tok/s
+# at 4B). The shortlist now ships inside the package and is the default, so setting it here
+# would once again hide the difference between what we measure and what we ship.
+#
+# Set CF_SHORTLIST in the environment to override; the [cf-defaults] line reports which list won.
 
 run () {
   local arm=$1 tag=$2; shift 2

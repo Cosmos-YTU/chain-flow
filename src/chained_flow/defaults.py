@@ -89,9 +89,19 @@ def resolved(flag: str) -> str | None:
 
 DRAFTER: dict[str, str] = {
     # the shortlist head.  Not a boolean: a PATH.  Unset means the drafter silently scores the
-    # full 248k-row lm_head at every depth, ~40% of the draft for nothing -- which is exactly
-    # what happened for a week.  Defaulted to the repo's own shortlist when it exists.
+    # full 248k-row lm_head at every depth, ~43-47% of the draft for nothing -- which is exactly
+    # what happened for a week, and then again for every pip user until the list shipped inside
+    # the wheel.  Defaulted by `_shortlist_default()`; the VOCAB GUARD that decides whether the
+    # default may actually be used lives in `chained_flow.shortlist.check`, because it needs the
+    # loaded model's head size.
     "CF_SHORTLIST": "",              # filled in by _shortlist_default()
+    # torch.compile the flow net (predict_hidden): ~16 tiny layer-passes -> fused kernels,
+    # measured 9.79 -> 5.26 ms (1.86x) at 27B.  It was hard-coded to 1 in bench_cf.sh's chain and
+    # tree arms and defaulted to 0 in the proposer, so every published number was taken on a path
+    # a pip user was not on and no line anywhere said so.  Gate: inductor must have a working
+    # backend (triton) -- without one `torch.compile` either falls back to eager silently or
+    # raises inside the first draft, and a raise inside a cudagraph capture is not recoverable.
+    "CF_COMPILE": "1",
     # hand-written fused block-stack kernel.  Gate: the extension must BUILD and the drafter's
     # shape must be one the kernel is instantiated for.  Accept-neutral.
     "CF_CUDA_BLOCK": "1",
@@ -170,27 +180,56 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _shortlist_default() -> str:
-    """Where to find a shortlist without being told.  Deliberately a FILE CHECK, not a bare
-    path: CF_SHORTLIST already raises on a non-existent path, and a default that pointed at a
-    missing file would turn every stock run into a hard failure.
+def packaged_shortlist() -> Path:
+    """The 250 KB int32 list that ships INSIDE the wheel.  Duplicated from
+    ``chained_flow.shortlist.packaged_path`` on purpose: this module must stay importable as a
+    bare FILE with no ``chained_flow`` package and no torch (see ``_sh``)."""
+    return Path(__file__).resolve().parent / "data" / "shortlist_qwen3_5.pt"
 
-    Two candidates, in order:
 
-    1. ``$CF_DRAFTER_DIR/shortlist.pt``.  This is the one that survives ``pip install``: a
-       shortlist is a property of the DRAFTER (its lm_head rows), so shipping it next to the
-       checkpoint is what lets an installed-from-a-wheel user get it at all.
+def shortlist_candidates(drafter_dir: str | None = None) -> list[tuple[str, str]]:
+    """Every shortlist this process could use, best first, as ``(path, provenance)``.
+
+    Deliberately a list rather than one answer, and deliberately FILE CHECKS rather than bare
+    paths: the caller (``FlowDrafterProposer._build``) has the model's vocab size and can reject
+    a candidate that was built for a different vocabulary, at which point it needs the next one
+    rather than a hard failure.  ``CF_SHORTLIST`` still raises on a path that does not exist,
+    so a default pointing at a missing file would turn every stock run into a crash.
+
+    Order, and why:
+
+    1. ``<drafter dir>/shortlist.pt``.  A drafter checkpoint may ship a list tuned to itself, and
+       it must win over ours.  ``drafter_dir`` is passed in by ``_build`` AFTER any HF snapshot
+       download, which is the whole reason this takes an argument: at import time
+       ``CF_DRAFTER_DIR`` is usually a repo id, ``os.path.isdir`` is False, and the documented
+       "drop shortlist.pt next to the checkpoint" instruction could never fire.
     2. the repo's own ``out/flow/shortlist_q3527b.pt``, for a source checkout.  ``repo_root()``
-       is meaningless once the package lives in ``site-packages``; the ``is_file()`` check is
-       what keeps that harmless rather than a bogus path in the log.
+       is meaningless once the package lives in ``site-packages``; the ``is_file()`` check keeps
+       that harmless rather than a bogus path in the log.
+    3. the PACKAGED list.  This is the one that survives ``pip install`` -- it is keyed by token
+       id, so it is a property of the TOKENIZER and one file serves 4B / 9B / 27B.
     """
-    d = os.environ.get("CF_DRAFTER_DIR") or ""
+    out: list[tuple[str, str]] = []
+    d = drafter_dir if drafter_dir is not None else (os.environ.get("CF_DRAFTER_DIR") or "")
     if d and os.path.isdir(d):
         p = Path(d) / "shortlist.pt"
         if p.is_file():
-            return str(p)
+            out.append((str(p), "drafter checkpoint"))
     p = repo_root() / "out" / "flow" / "shortlist_q3527b.pt"
-    return str(p) if p.is_file() else ""
+    if p.is_file():
+        out.append((str(p), "source checkout"))
+    p = packaged_shortlist()
+    if p.is_file():
+        out.append((str(p), "packaged"))
+    return out
+
+
+def _shortlist_default() -> str:
+    """The best candidate available at IMPORT time.  ``_build`` re-resolves with the downloaded
+    checkpoint dir and the real vocab size; this value is what reaches ``chained-flow env`` and
+    any process that only reads the environment."""
+    c = shortlist_candidates()
+    return c[0][0] if c else ""
 
 
 _FORK_MARKERS = (
@@ -302,6 +341,9 @@ _EXPLICIT: dict[str, str] = {}
 # overwrites an emitted default AFTER eval-ing the emitter (bench_cf.sh's chain arm does exactly
 # that with CF_ASYNC_SPEC=0, since the chain path has no tree to run it on).  Name-only
 # provenance made `apply()` treat that deliberate 0 as its own default and write it back to 1.
+#
+# `apply()` writes it too, for the same reason one process further down: vLLM's engine core is
+# a SPAWNED subprocess and inherits this environment.
 _SHELL_MARK = "CF_DEFAULTS_FROM_SHELL"
 
 
@@ -340,7 +382,8 @@ def apply(force: bool = False) -> None:
         else:
             note("CF_SHORTLIST", False,
                  "NO SHORTLIST FOUND -- the drafter will score the FULL lm_head at every "
-                 "depth (~40% of the draft wasted). Build one: scripts/build_shortlist.py")
+                 "depth (~43-47% of the draft wasted). Build one: "
+                 "`chained-flow build-shortlist`")
             # Only shout at someone who is actually about to run a drafter.  `apply()` now runs
             # inside the `vllm.general_plugins` entry point, i.e. in EVERY vLLM process --
             # including a plain `vllm serve` that has chained-flow installed and is not using
@@ -348,10 +391,10 @@ def apply(force: bool = False) -> None:
             # noise is how real warnings stop being read.
             if os.environ.get("CF_DRAFTER_DIR"):
                 print("[cf-defaults] WARNING: CF_SHORTLIST is unset and no shortlist was found "
-                      "(looked for $CF_DRAFTER_DIR/shortlist.pt, then "
-                      "out/flow/shortlist_q3527b.pt in a source checkout) -- running the FULL "
-                      "vocab head. This is the silent 40%-of-the-draft waste; build one with "
-                      "scripts/build_shortlist.py.", flush=True)
+                      "(looked for $CF_DRAFTER_DIR/shortlist.pt, out/flow/shortlist_q3527b.pt "
+                      f"in a source checkout, and the packaged {packaged_shortlist()}) -- "
+                      "running the FULL vocab head. This is the silent ~45%-of-the-draft waste; "
+                      "build one with `chained-flow build-shortlist`.", flush=True)
     else:
         note("CF_SHORTLIST", bool(sl), f"explicit {sl or '<empty: full head>'}")
 
@@ -374,6 +417,23 @@ def apply(force: bool = False) -> None:
         else:
             os.environ[flag] = "0"
             note(flag, False, "fork_missing")
+
+    # ---- provenance ACROSS A PROCESS BOUNDARY --------------------------------------------
+    # vLLM starts its engine core in a SPAWNED subprocess.  By the time the child runs, every
+    # value this function wrote is an ordinary environment variable, indistinguishable from a
+    # caller's request -- so the child treated the whole table as explicit and shouted
+    # "CF_CUDA_BLOCK was requested but CANNOT ENGAGE" about a default it had proposed itself,
+    # which is precisely the false alarm this module exists to prevent.  Worse, an inherited
+    # CF_SHORTLIST read as explicit skips the candidate search, so the drafter checkpoint's own
+    # shortlist.pt could never win in the process that actually loads the drafter.
+    #
+    # Same problem the `--sh` emitter already solved for the shell, so it reuses the same
+    # marker and the same rule: record flag=value for everything WE set, so a value the caller
+    # changes afterwards still reads as a request.
+    mine = dict(from_shell)
+    mine.update({f: os.environ[f] for f in ALL
+                 if f in os.environ and not was_explicit(f) and "," not in os.environ[f]})
+    os.environ[_SHELL_MARK] = ",".join(f"{f}={v}" for f, v in mine.items())
 
 
 # ------------------------------------------------------------------ finalize (build time)
@@ -447,6 +507,32 @@ def finalize_cuda_block(drafter) -> None:
         note("CF_CUDA_PAIR", True, f"2 experts S={Ss}")
 
 
+def finalize_compile(p) -> bool:
+    """CF_COMPILE: torch.compile the flow net.  Gated on inductor having a backend at all.
+
+    Called BEFORE ``fused.compile_flow`` so a failed gate means the wrap never happens -- the
+    alternative (wrap and hope) defers the failure into the first draft, which on the shipping
+    path is inside a cudagraph capture, where an exception is not something the engine survives.
+
+    ``torch.compile`` is lazy, so "the gate passed" means "inductor can be asked", not "it
+    compiled".  That is the honest claim, and the compiled callable is installed on the drafter
+    object, so ``_build`` prints ``compile=<mode>`` off the object rather than off the env var.
+    """
+    if not truthy(os.environ.get("CF_COMPILE")):
+        note("CF_COMPILE", False, state("CF_COMPILE")[1])
+        return False
+    if truthy(os.environ.get("TORCHDYNAMO_DISABLE")):
+        disable("CF_COMPILE", "TORCHDYNAMO_DISABLE is set: torch.compile is a no-op here")
+        return False
+    if importlib.util.find_spec("triton") is None:
+        disable("CF_COMPILE",
+                "no inductor backend (triton is not importable) -- the flow net stays eager, "
+                "which measured 9.79 vs 5.26 ms per draft at 27B")
+        return False
+    note("CF_COMPILE", True, f"flow net, mode={p.compile_mode}")
+    return True
+
+
 def finalize_proposer(p) -> None:
     """Resolve the flags whose gate is a property of the PROPOSER / ENGINE, not the drafter."""
     # --- CF_RING_TRIM: tree-only, and refuses under CF_NONGREEDY_CHAIN ----------------
@@ -494,9 +580,10 @@ def finalize_proposer(p) -> None:
              "side-stream draft" if p.early else state("CF_DRAFT_EARLY")[1])
     note("CF_FUSE_PATH", bool(p.fuse_path),
          "path head -> one baddbmm" if p.fuse_path else state("CF_FUSE_PATH")[1])
+    # Read off the BUILT head, not off CF_SHORTLIST: the env var is a path, and a path that
+    # loaded, failed the vocab guard and was dropped looks identical to one that engaged.
     note("CF_SHORTLIST", p._sl is not None,
-         f"{p._sl.numel()} rows" if p._sl is not None
-         else "FULL HEAD -- ~40% of the draft is wasted")
+         f"{p._sl.numel()} rows, {p._sl_src}" if p._sl is not None else p._sl_why)
 
 
 def finalize_async(p, vllm_config) -> bool:
@@ -578,7 +665,8 @@ def finalize_tree(p) -> None:
 
 
 _SHORT = {
-    "CF_SHORTLIST": "shortlist", "CF_CUDA_BLOCK": "cuda_block", "CF_CUDA_PAIR": "cuda_pair",
+    "CF_SHORTLIST": "shortlist", "CF_COMPILE": "compile",
+    "CF_CUDA_BLOCK": "cuda_block", "CF_CUDA_PAIR": "cuda_pair",
     "CF_PATH_TRIM": "path_trim", "CF_RING_TRIM": "ring_trim", "CF_TWOPASS_M": "twopass",
     "CF_TWOPASS_SHARED": "twopass_shared", "CF_DRAFT_EARLY": "draft_early",
     "CF_FUSE_PATH": "fuse_path", "CF_GDN_DEFER": "gdn_defer", "CF_GDN_BV": "gdn_bv",
@@ -642,13 +730,21 @@ def _sh() -> str:
     Emits nothing for a flag the caller already set, so ``CF_X=0 ./bench_cf.sh ...`` still wins.
     Runs as a FILE, not ``-m``: executing the file directly skips ``chained_flow/__init__``
     and therefore skips importing torch, so this costs ~40 ms rather than ~5 s per bench run.
+
+    "The caller already set it" is ``was_explicit``, NOT "it is in os.environ right now".  Those
+    two are the same thing only when ``apply()`` has not run yet -- which is true for the FILE
+    invocation and false for ``chained-flow env``, because importing the package runs ``apply()``
+    (see ``chained_flow/__init__``) and therefore puts the whole table into ``os.environ`` before
+    this function is ever called.  Reading the live environment there made the emitter skip every
+    flag and print an empty export list: a command documented as ``eval "$(chained-flow env)"``
+    that silently exported nothing.  ``_EXPLICIT`` is snapshotted inside ``apply()``, i.e. at the
+    one moment the two are still distinguishable, so it is correct for both entry points.
     """
     out, mine = [], []
     fk = fork()
-    pre = dict(os.environ)
     apply()
     for flag in _KEYS:
-        if flag in pre:
+        if was_explicit(flag):
             continue
         v = os.environ.get(flag)
         if v:
