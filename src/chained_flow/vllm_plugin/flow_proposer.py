@@ -1491,15 +1491,13 @@ class FlowDrafterProposer:
         cap = max(int(self.max_reqs), 1)
         if env:
             b = sorted({int(x) for x in env if int(x) > 0})
-        else:
-            b, n = [1, 2, 4, 8, 16, 32], 64
-            while n < cap:
-                b.append(n)
-                n *= 2
-            if cap > b[-1]:
-                b.append(cap)
-        b = [x for x in b if x <= cap]
-        return b or [1]
+            return [x for x in b if x <= cap] or [1]
+        b, n = [], 1
+        while n < cap:
+            b.append(n)
+            n *= 2
+        b.append(cap)                       # ... and always the top, power of two or not
+        return b
 
     def _warm_buckets(self) -> None:
         """CF_WARM_BUCKETS: pay the per-bucket compile+capture at BUILD time, not in the server.

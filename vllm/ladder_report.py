@@ -63,6 +63,36 @@ def max_decode_batch(size: str, tag: str) -> int | None:
     return max(int(kv.split(":")[0]) for kv in hist[-1].split(",") if ":" in kv)
 
 
+def draft_config(size: str, tag: str) -> str | None:
+    """What the DRAFTER was configured with, read back off the arm's own log.
+
+    Two things that used to be constants are now per-arm variables, and both change the meaning
+    of the row above: the cudagraph bucket ladder (`CF_DRAFT_BUCKETS`) and the K-schedule
+    (`CF_SPEC_K_SCHEDULE`). A ladder table that does not say which arm ran which is a table whose
+    rows cannot be compared -- the same failure mode as reading a threshold off the offered
+    concurrency. `nocg` is the one number that says whether the ladder actually covered the run:
+    it counts drafted steps that found NO bucket and therefore ran eager, each one also a fresh
+    `dynamic=False` compile.
+    """
+    import re
+    d = os.path.join(ROOT, f"{size}_{tag}")
+    log, bits = os.path.join(d, "server.log"), []
+    if os.path.exists(log):
+        txt = open(log, errors="replace").read()
+        m = re.findall(r"draft_buckets=(\[[^\]]*\])", txt)
+        if m:
+            bits.append(f"buckets {m[-1]}")
+        m = re.findall(r"K-SCHEDULE: ([^.]*)\.", txt) or re.findall(r"K-schedule: (.*)", txt)
+        if m and "no K-schedule" not in m[-1]:
+            bits.append(f"K-schedule {m[-1].strip()}")
+    p = os.path.join(d, "batch_audit.txt")
+    if os.path.exists(p):
+        m = re.findall(r"no-cudagraph drafted steps[^)]*\)\s*(\d+)", open(p).read())
+        if m:
+            bits.append(f"{m[-1]} drafted steps with NO cudagraph")
+    return " | ".join(bits) or None
+
+
 def main() -> int:
     if len(sys.argv) < 3:
         print(__doc__)
@@ -108,6 +138,13 @@ def main() -> int:
             b = seen[t]
             if b is not None and b < top:
                 print(f"    {t}: reached only B={b} against a ladder to {top}")
+
+    cfg = {t: draft_config(size, t) for t in tags}
+    if any(cfg.values()):
+        print("\ndrafter config, per arm (both of these are now variables, so a ladder table "
+              "that\ndoes not state them is not comparable):")
+        for t in tags:
+            print(f"    {t}: {cfg[t] or '-'}")
     return 0
 
 

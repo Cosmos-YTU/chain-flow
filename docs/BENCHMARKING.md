@@ -25,6 +25,14 @@ and expensive to discover late.
 > 4. **Do not serve 27B with speculation above concurrency ~16 at all.** There the binding cost
 >    is not drafting and the cutoff cannot fix it: `--speculative-config` more than halves the
 >    engine's KV cache, capping the 27B decode batch at ~28 against the base engine's 64.
+> 5. **The draft cudagraph ladder now reaches `max_num_seqs`, not 32.** Nothing to set. It is
+>    worth **+2.3% at concurrency 64** and nothing below it, and it turns the 29 mid-traffic
+>    `torch.compile`s the unbucketed range used to trigger into one. `CF_DRAFT_BUCKETS` overrides
+>    the ladder.
+> 6. **`CF_SPEC_K_SCHEDULE` exists and is default OFF, because at 4B chain it loses.** A K=1 rung
+>    beats the uncut K=5 arm under load (+14.6% at concurrency 64) and never beats the K=0 cutoff
+>    at any batch. The measured reason is that the draft costs 19.4 ms at B=64 against a 14.1 ms
+>    no-speculation step, so no verify-width lever can reach parity.
 
 The published speedups and acceptance numbers are **batch-1 numbers**, taken through the
 offline `LLM()` API (`vllm/test_plugin_native.py`, which also forces
@@ -110,7 +118,7 @@ they are deliberate batch-1 specialisations that the flag report has no vocabula
 | `CF_CUDA_BLOCK` | **no, from B ≥ 2** | `chunked_flow._cf_fused_runner` requires `x.shape[0] == 1`; the drafter's `x.shape[0]` is the cudagraph *bucket*, so only bucket 1 qualifies. Falls back to the bit-identical PyTorch block stack. |
 | `CF_CUDA_PAIR` | **no, from B ≥ 2** | rides on `CF_CUDA_BLOCK`. |
 | `CF_GDN_DEFER` / `CF_GDN_BV` | **no, from B ≥ 2** (tree) | `tree_gdn.defer_rows(T)` caps at `CF_GDN_DEFER_MAXROWS` = 64 rows. An 8×5 tree is 41 rows per request, so B = 1 fits and B = 2 (82 rows) does not. The cap is a *memory* decision — a deferred stash pins that layer's k/v inside the cudagraph pool — not a correctness one. |
-| draft cudagraph | degrades, then off above 32 | buckets are `[1,2,4,8,16,32]`; B = 5 replays the bucket-8 graph, i.e. three whole drafts on padding rows. Above 32 there is no bucket and the draft runs eager. |
+| draft cudagraph | degrades, but no longer **off** | buckets are powers of two **up to `max_num_seqs`** (`[1,2,4,8,16,32,64]` at the default 64); B = 5 replays the bucket-8 graph, i.e. three whole drafts on padding rows. It used to stop at 32, above which the draft ran eager *and* recompiled per batch size — see the ladder fix below. |
 | `CF_DRAFT_EARLY` (side-stream prelaunch) | intermittent | the steady-state guard requires every input-batch slot to hold the *same request as last step*, which continuous batching breaks whenever a request joins or leaves. It is also tree-only: in chain mode `_prelaunch` returns immediately and the flag's remaining job is publishing the GPU counts for `CF_ASYNC_SPEC`. |
 | `CF_TREE_FUSED_ATTN` | yes | its `N < 128` limit is the per-request tree width, not the batch. |
 | `CF_TREE_FULLCG` | yes | a uniform multi-request decode still dispatches FULL. |
@@ -127,12 +135,16 @@ that stall to steady-state throughput — `bench_serve_drive.py` warms up with `
 requests for exactly this reason, and got it wrong once (4B chain c=16 read 175.9 tok/s and a
 20.0 s mean TTFT against 826 tok/s at c=8, purely from the un-warmed bucket-16 capture).
 
-**Above bucket 32 it is much worse than "one stall per bucket."** The buckets are
-`[1,2,4,8,16,32]`, so a decode batch of 33 or more has no bucket at all: `_ctx_gpu` falls back
-to `bucket = B`, the flow net is compiled with `dynamic=False`, and therefore **every distinct
-batch size in 33…max_num_seqs is its own compile**. That is the shape of the 850-autotune-block
-storm seen on a first `guidellm --rate 64` pass — not six shapes discovered once, but ~25, most
-of them discovered while the concurrency was decaying through the thirties and forties.
+**Above bucket 32 it used to be much worse than "one stall per bucket," and that is FIXED.**
+The buckets were `[1,2,4,8,16,32]`, so a decode batch of 33 or more had no bucket at all:
+`_ctx_gpu` falls back to `bucket = B`, the flow net is compiled with `dynamic=False`, and
+therefore **every distinct batch size in 33…max_num_seqs was its own compile**. That is the
+shape of the 850-autotune-block storm seen on a first `guidellm --rate 64` pass — not six shapes
+discovered once, but ~25, most of them discovered while the concurrency was decaying through the
+thirties and forties. `FlowDrafterProposer._bucket_ladder` now runs the powers of two all the way
+to `max_num_seqs` (plus `max_num_seqs` itself when it is not one), so the same range is **two**
+shapes, and `CF_DRAFT_BUCKETS` overrides the ladder if you want it finer. See
+"The drafter had no cudagraph above bucket 32" below for what that is worth in throughput.
 
 **`CF_WARM_BUCKETS=1` (default off)** does the buckets up front: `FlowDrafterProposer._build()`
 compiles and captures the draft graph for every bucket the batch cutoff can reach, against the
@@ -144,8 +156,14 @@ request at deploy time and an arbitrary request stalling later. Measured at 4B w
 > `draft buckets warmed at startup: [1, 2, 4] in 51.3s` — the whole compile-and-capture bill for
 > every shape the server can subsequently reach, paid once.
 
-It is most useful **with** `CF_SPEC_MAX_BATCH`, which is what makes the set of reachable shapes
-finite and small; warming without a cutoff cannot cover the unbucketed range above 32 at all.
+With the ladder now reaching `max_num_seqs` it covers an **uncut** server too — measured on the
+same 4B chain engine with `CF_SPEC_MAX_BATCH=0`:
+
+> `draft buckets warmed at startup: [1, 2, 4, 8, 16, 32, 64] in 125.4s`
+
+i.e. ~18 s per rung, not the 70–80 s the per-shape figure above suggests (that number is one
+inductor codegen *inside* a live engine, contending with it). Seven rungs for 125 s is what makes
+the coarse top of the ladder the right trade: it replaces ~25 mid-traffic compiles.
 
 ### Measured, 2026-08-05 — the speedup is a batch-1 speedup
 
@@ -195,6 +213,65 @@ the kernel *off* costs nothing, because the `x.shape[0] == 1` gate had already t
 The rest of the collapse is structural and not ours to fix — a speculative step verifies
 `(K+1) × B` tokens, so as `B` grows the target forward stops being bandwidth-bound per token
 and the thing speculation exploits goes away.
+
+### The drafter had no cudagraph above bucket 32 — fixed, and it is worth 2.3%
+
+The profile in commit `81d0ecc` put the drafter at **24.2 ms of a 65.7 ms step at B=64**, the
+larger half of the 0.56x deficit, and identified the missing cudagraph as the debt inside it:
+**1901 of 2000 steps ran the draft with no cudagraph at all**, because the bucket ladder stopped
+at 32. `FlowDrafterProposer._bucket_ladder` now runs powers of two to `max_num_seqs`
+(`CF_DRAFT_BUCKETS` overrides). The A/B is one variable — the ladder — on the same GPU in the
+same session, both arms `CF_SPEC_MAX_BATCH=0` so nothing else disengages:
+
+| conc | base | chain, buckets **…32** | vs base | chain, buckets **…64** | vs base |
+|---|---|---|---|---|---|
+| 1 | 139.2 | 165.3 | **1.19x** | 165.4 | **1.19x** |
+| 4 | 498.1 | 500.7 | 1.01x | 500.0 | 1.00x |
+| 8 | 953.5 | 868.5 | 0.91x | 865.8 | 0.91x |
+| 16 | 1763.2 | 1289.7 | 0.73x | 1292.7 | 0.73x |
+| 32 | 2962.8 | 1749.6 | 0.59x | 1750.9 | 0.59x |
+| 64 | 4523.9 | 1986.8 | **0.439x** | **2031.7** | **0.449x** |
+
+**The mechanism is fully engaged and it is worth +2.3% at concurrency 64, and nothing anywhere
+else.** `CF_BATCH_AUDIT` on the two arms: `no-cudagraph drafted steps` **769 → 0**, and the
+unbucketed range that was **29 distinct `dynamic=False` compiles** (34, 35, 36, 37, 38, 39, 40,
+41, 43, 45…64) is now the single bucket 64. Levels 1–32 are unchanged to within run-to-run noise
+*by construction* — those buckets already existed, so not one step below 33 changes shape.
+
+**+2.3% is the right answer and it was predictable before the ladder ran, which is what makes it
+an attribution rather than a result.** `CF_DRAFTPROF=1 CF_WARM_BUCKETS=1` times the captured
+graph against the eager (still `torch.compile`d) path at every bucket, in-engine:
+
+| bucket | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| graph replay, whole draft (ms) | 2.675 | 4.390 | 4.900 | 5.816 | 7.867 | 11.810 | **19.446** |
+| eager whole draft (ms) | 3.080 | 8.067 | 8.122 | 8.695 | 9.458 | 14.156 | **21.218** |
+
+At bucket 64 the graph saves **1.77 ms of a 21.2 ms draft (8%)**, and the draft is about a third
+of a 65.7 ms step — so ~2.7% predicted against +2.3% measured.
+
+**So the profile's headline needs a correction, and it is the useful finding here.** The drafter
+really is the larger half of the deficit at B=64, but the *missing cudagraph* was only 8% of the
+drafter, not most of it. The remaining ~19 ms is real GPU work, and the kernel profile of the
+captured bucket-64 graph says exactly where:
+
+| | bucket 1 | bucket 64 |
+|---|---|---|
+| whole draft, captured | 2.675 ms | 19.446 ms |
+| the 8-block stack | `cf_fused_expert`, **1.30 ms** (2 launches at S=8 + 2 at S=4) | 5 launches of a `cutlass wmma 32x` GEMM, **9.08 ms** |
+| its share of the draft | 41% | **48%** |
+
+That is the same batch-1 gate (`chunked_flow.py:296`, `x.shape[0] == 1`) showing up as **9.08 ms
+per step** at B=64. Its roofline is not close: the block stack's weights are `16 × D²` per block
+× 8 blocks × 2 Euler steps ≈ 210 MB at `D=640`, i.e. ~0.12 ms of streaming, and 512 rows through
+it is ~107 GFLOP, i.e. ~0.36 ms of fp16 math. **Batching `cf_fused_expert` over `gridDim.y` is
+therefore the next drafter fix, and it is worth ~25x more than the ladder was.** It is templated
+`<D, FM, S, TB>` where `S` is one draft's row count, not the batch, and shared memory depends
+only on `(D, S, C)`, so no new instantiations are needed — batch becomes a `gridDim.y` slice
+(offset xin/xout/res/qkv/t1/hf/kv, and make the counting grid barrier `bar + blockIdx.y`;
+`cf_cross_kv` already uses `blockIdx.y` and has no barrier). The constraint is co-residency for
+the grid sync: `G_slice × B ≤ cf_max_grid` (~188 blocks here), so `G` comes from
+`cf_max_grid / B` with an eager fallback above it. **NOT IMPLEMENTED.**
 
 ### `CF_SPEC_MAX_BATCH` — stop speculating above a decode batch (default ON where measured)
 
@@ -262,6 +339,58 @@ the table would cut.
 derived width rule for such a target, `=<n>` sets one directly, `=0` or `off` disables. The
 asymmetry is the point: a derived N that is too low silently costs speedup and nothing in the
 throughput number says so, so it is not a thing to acquire by accident.
+
+#### `CF_SPEC_K_SCHEDULE` — a K-ladder instead of a K=0 cliff. Measured, and at 4B it LOSES.
+
+The cutoff is a cliff. The roofline says there should be something between K=5 and K=0: `F.linear`
+at this model's shapes runs at 138–162 TFLOP/s at M=64 against an M=2688 asymptote of 330–380, so
+`B=64` is only half way to compute-bound and `M=128` — which is `B=64` at **K=1** — costs only
+~1.33x the M=64 forward the no-speculation baseline pays. So a K=1 arm ought to have a chance of
+staying above parity where K=5 provably cannot.
+
+`CF_SPEC_K_SCHEDULE="4:full,16:1"` expresses that: rungs of `<max decode batch>:<K>`, implicit
+K=0 above the last. It rides the **same** scheduler patch — `_update_after_schedule` already
+writes `num_spec_tokens_to_schedule`, and writing `1` there instead of `0` needs no change in the
+proposer, because `_prepare_input_ids` scatters `range(start, start + draft_len)` from
+`start = prev_index * prev_num_spec_tokens`, i.e. the **first `draft_len` columns** of whatever
+width tensor the proposer returned, and `prev_num_spec_tokens` is read off that tensor's own
+width every step. For a chain those columns are exactly the first `draft_len` links. So this is
+still not vLLM's `num_speculative_tokens_per_batch_size`, which would downgrade `cudagraph_mode`
+to PIECEWISE engine-wide including batch 1.
+
+**Measured, 4B chain, `CF_SPEC_K_SCHEDULE="64:1"` — K=1 at every decode batch, so the whole K=1
+curve in one run — against the same-session base and the uncut K=5 arm:**
+
+| conc | base | K=5, uncut | | K=1 | | K=0 cliff at N=4 |
+|---|---|---|---|---|---|---|
+| 1 | 139.2 | 165.4 | **1.19x** | 136.6 | 0.98x | **1.19x** |
+| 4 | 498.1 | 500.0 | 1.00x | 424.0 | 0.85x | 1.00x |
+| 8 | 953.5 | 865.8 | 0.91x | 749.5 | 0.79x | **0.95x** |
+| 16 | 1763.2 | 1292.7 | 0.73x | 1229.1 | 0.70x | **0.94x** |
+| 32 | 2962.8 | 1750.9 | 0.59x | 1776.1 | 0.60x | **0.96x** |
+| 64 | 4523.9 | 2031.7 | 0.449x | 2329.4 | 0.515x | **0.95x** |
+
+Acceptance is flat at **1.525–1.530** for K=1 against 1.849–1.865 for K=5, exactly as a chain
+should behave.
+
+**K=1 beats K=5 under load (+14.6% at concurrency 64) and it never once beats the K=0 cliff.**
+There is therefore **no 4B chain threshold at which a K=1 rung is the right answer**, and
+`_AUTO_K1` stays empty and the schedule stays default OFF.
+
+**The reason is one number and it is not the verify width.** Per-step, at a decode batch of 64:
+
+| | tokens/step | step |
+|---|---|---|
+| base | 1.000 | **14.1 ms** |
+| K=1 | 1.525 | 40.0 ms |
+| K=5 | 1.849 | 52.7 ms |
+
+Dropping K from 5 to 1 removes 256 of 384 verify positions and buys 12.7 ms — the roofline was
+right about that. It cannot be enough, because **the draft alone is 19.4 ms and the entire
+no-speculation step is 14.1 ms**. No reduction in verify width can bring a step to parity when
+the drafter's own fixed cost already exceeds the whole step it is trying to accelerate. The only
+lever that reaches it is the DRAFT, which is what the cliff pulls — and what batching
+`cf_fused_expert` would pull without giving up the acceptance.
 
 **It also deletes the compile storm**, for free: with the cutoff at 4 the drafter is only ever
 asked for buckets 1, 2 and 4, so those are the only three that ever compile — confirmed from
@@ -1118,6 +1247,29 @@ Regression arms on the fork, same day, same GPU, `CF_TREE_KEEP=8 CF_TREE_DEPTH=5
 3.450 / 3.824 / 2.144 / 2.520 / 2.106 / 1.882 / 2.364 against the recorded
 3.526 / 3.821 / 2.154 / 2.520 / 2.098 / 1.882 / 2.358 — every domain within 0.01
 except the 67-token domain 0, where one request-step is worth 0.05.
+
+**Batch-1 regression check for the bucket-ladder and K-schedule work**, `bench_cf.sh`, 4B,
+`CF_MAXTOK=256`, 7 domains, GPU 3, same session as the ladders above:
+
+| arm | tok/s | reference |
+|---|---|---|
+| base (async off) | 127.6 | 126.7 / 127.3 |
+| **chain** | **157.8** | **157.8** (exact) |
+| **8×5 tree** | see below | 188.9 |
+
+`chain` reproduces the recorded figure exactly and the serve path agrees — concurrency 1 reads
+**165.3** with the old ladder and **165.4** with the new one, against the recorded 165.2. That
+is what the check is for, and it is also true *by construction*: `_bucket_ladder` still starts
+at 1, `_ctx_gpu` picks bucket 1 for a batch of 1 under either ladder, and the K-schedule is off
+unless `CF_SPEC_K_SCHEDULE` is set. **No step at a decode batch of 1 changes shape, kernel or
+output.**
+
+One trap found while doing it: **`bench_cf.sh`'s `tree` arm does not default to the 8×5 tree
+the published number is from.** Run as-is it resolves `K=16 width=4`, a 4×4 tree, whose
+per-domain accept (3.091 / 3.421 / 1.830 / 2.402 / 1.977 / 1.766 / 2.185) is well below the 8×5
+reference list above while its pooled tok/s (190.4) is close to it. Comparing those accepts to
+the recorded ones would read as a large regression that is only a different tree. Set
+`CF_TREE_KEEP=8 CF_TREE_DEPTH=5` explicitly for any tree number meant to be compared.
 
 ### The shortlist is guarded, not trusted
 

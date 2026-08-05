@@ -161,12 +161,32 @@ WHY THIS AND NOT vLLM's `num_speculative_tokens_per_batch_size`: unchanged, see 
 it downgrades `cudagraph_mode` engine-wide including batch 1.  The scheduler patch expresses the
 same schedule without touching the config, which is the whole reason it exists.
 
+MEASURED AT 4B CHAIN, AND THE K=1 RUNG LOSES TO THE CLIFF AT EVERY BATCH.  `serve_ladder.sh`,
+one RTX PRO 6000, `CF_SPEC_K_SCHEDULE="64:1"` so the whole K=1 curve comes out of one run,
+against the same-session no-speculation base and the uncut K=5 arm:
+
+    conc          1       4       8      16      32      64
+    base      139.2   498.1   953.5  1763.2  2962.8  4523.9   tok/s
+    K=5       165.4   500.0   865.8  1292.7  1750.9  2031.7    1.19 / 1.00 / 0.91 / 0.73 / 0.59 / 0.449x
+    K=1       136.6   424.0   749.5  1229.1  1776.1  2329.4    0.98 / 0.85 / 0.79 / 0.70 / 0.60 / 0.515x
+    K=0 at 4                                                   1.19 / 1.00 / 0.95 / 0.94 / 0.96 / 0.95x
+
+K=1 beats K=5 under load (+14.6% at concurrency 64, acceptance a flat 1.525-1.530 against 1.85)
+and it NEVER beats the K=0 cliff.  The roofline was right about the verify and wrong about the
+conclusion, and the missing term is the drafter: per step at a decode batch of 64, base is
+14.1 ms for 1.000 tokens, K=1 is 40.0 ms for 1.525 and K=5 is 52.7 ms for 1.849.  Going 5 -> 1
+removes 256 of 384 verify positions and buys 12.7 ms, which is the ~1.33x the roofline predicts.
+It cannot be enough, because THE DRAFT ALONE IS 19.4 ms AND THE WHOLE NO-SPECULATION STEP IS
+14.1 ms.  No verify-width lever reaches parity while the drafter's fixed cost exceeds the entire
+step it is accelerating; only cutting the DRAFT does, which is what the cliff does.
+
 DEFAULT OFF, AND IT STAYS OFF UNTIL A LADDER SAYS OTHERWISE.  `_AUTO_K1` is the measured
 `(hidden_size, K+1) -> highest decode batch at which K=1 is still at or above parity` table, and
-it is EMPTY: a K=1 rung that is set too high is a slowdown nobody opted into, which is the same
-asymmetry `_AUTO` is governed by.  Until an entry exists, the schedule is only what
-`CF_SPEC_K_SCHEDULE` says, and the resolution log prints the ladder together with whether each
-rung was MEASURED or DERIVED.
+it is EMPTY -- for 4B chain because the ladder above says there is no such batch, and for every
+other combination because nobody has laddered one.  A K=1 rung set too high is a slowdown nobody
+opted into, the same asymmetry `_AUTO` is governed by.  Until an entry exists, the schedule is
+only what `CF_SPEC_K_SCHEDULE` says, and the resolution log prints the ladder together with
+whether each rung was MEASURED or DERIVED.
 """
 from __future__ import annotations
 
@@ -327,10 +347,14 @@ _KFLAG = "CF_SPEC_K_SCHEDULE"
 FULL = -1
 
 #: MEASURED highest decode batch at which a K=1 arm is still at or above the no-speculation
-#: baseline, keyed exactly like `_AUTO`.  DELIBERATELY EMPTY: an entry here turns a K=1 rung ON
-#: by default for that target, and a rung set too high is a silent slowdown -- the same asymmetry
-#: that keeps `_AUTO` measured-only.  Add an entry only with a ladder behind it, with the tok/s
-#: in the provenance string the way `_AUTO`'s entries carry theirs.
+#: baseline, keyed exactly like `_AUTO`.  EMPTY, and for `(2560, 6)` that is itself a measurement:
+#: the 4B chain K=1 ladder in the module docstring is BELOW the K=0 cliff at every batch, so
+#: there is no rung to record.  Every other combination is simply unladdered.
+#:
+#: An entry here turns a K=1 rung ON by default for that target, and a rung set too high is a
+#: silent slowdown -- the same asymmetry that keeps `_AUTO` measured-only.  Add one only with a
+#: ladder behind it, with the tok/s in the provenance string the way `_AUTO`'s entries carry
+#: theirs, and only where K=1 beats BOTH the uncut arm and the cliff at that batch.
 _AUTO_K1: dict[tuple[int, int], tuple[int, str]] = {}
 
 #: The ladder actually in force: ascending `(max decode batch, K)` rungs, implicit K=0 above the
@@ -611,6 +635,13 @@ def install() -> None:
     REASON = ""
     m = _mode()
     asked = (os.environ.get(_FLAG, "") or "").strip().lower() or f"unset -> {m}"
+    if ladder():
+        # An explicit K-schedule supersedes the cliff, so saying "schedules NO speculative tokens"
+        # would be wrong for every rung but the last. Print the ladder that is actually in force.
+        print(f"[cf-plugin] batch cutoff INSTALLED as a K-SCHEDULE: {describe_ladder()}. Rungs "
+              f"are decode-batch thresholds, inclusive; the drafter runs on every rung except "
+              f"the implicit K=0 one above the last.", flush=True)
+        return
     print(f"[cf-plugin] batch cutoff INSTALLED: {_FLAG}={asked} -- a scheduler step with more "
           f"than N requests schedules NO speculative tokens for the next step, and the drafter "
           f"does not run."

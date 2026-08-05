@@ -27,7 +27,7 @@
                      and self.speculative_config.method != "dspark"
 --- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
 +++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
-@@ -1338,7 +1338,44 @@
+@@ -1338,9 +1338,62 @@
              mixed_qkv_non_spec = mixed_qkv
  
          # 1.1: Process the multi-query part
@@ -71,8 +71,26 @@
 +        elif spec_sequence_masks is not None:
              # spec_state_indices_tensor is always set when spec_sequence_masks is set
              assert spec_state_indices_tensor is not None
++            # CF_TREE_CONV_NARROW guard.  This is the STALE-TREE fallback (the tree
++            # shape did not match what the scheduler scheduled, so `_tree_meta` is
++            # None and the drafts are verified with chain semantics).  It reaches
++            # `causal_conv1d_update` with `num_accepted_tokens`, which internally
++            # raises its effective window to `width - 1 + (seqlen - 1)` -- 44 columns
++            # for the 8x5 tree -- and indexes the conv state with it under
++            # `validate_data=False`.  With the narrowed conv state that is an
++            # out-of-bounds read with no error and no crash, i.e. exactly the silent
++            # corruption the flag is supposed to be safe from.  Refuse instead.
++            if self.num_spec > 0 and conv_state.shape[-1] == self.conv_kernel_size - 1:
++                raise RuntimeError(
++                    "CF_TREE_CONV_NARROW=1 but this step took the stale-tree "
++                    "fallback, which needs the full speculative conv window "
++                    f"(only {conv_state.shape[-1]} columns are allocated). "
++                    "Re-run without CF_TREE_CONV_NARROW."
++                )
              mixed_qkv_spec = causal_conv1d_update(
-@@ -1452,7 +1489,30 @@
+                 mixed_qkv_spec,
+                 conv_state,
+@@ -1452,7 +1505,30 @@
          # 2. Recurrent attention
  
          # 2.1: Process the multi-query part
@@ -104,6 +122,83 @@
              core_attn_out_spec, last_recurrent_state = (
                  fused_sigmoid_gating_delta_rule_update(
                      A_log=self.A_log,
+--- a/vllm/model_executor/layers/mamba/mamba_utils.py
++++ b/vllm/model_executor/layers/mamba/mamba_utils.py
+@@ -21,6 +21,65 @@
+ logger = init_logger(__name__)
+ 
+ ConvStateLayoutType = Literal["SD", "DS"]
++
++
++# --------------------------------------------------------------------------- #
++#  CHAINED-FLOW  CF_TREE_CONV_NARROW  (default OFF -- unset behaves as stock)   #
++# --------------------------------------------------------------------------- #
++# Stock vLLM widens the GDN **conv** state of every state slot from
++# `conv_kernel-1` to `conv_kernel-1 + num_speculative_tokens`, because the CHAIN
++# spec path keeps the whole draft window in ONE slot (`causal_conv1d_update` is
++# called with `conv_state_indices = spec_state_indices[:, 0]` and recovers the
++# right 3-token window by offsetting with `num_accepted_tokens - 1`).
++#
++# The chained-flow TREE path does not work that way.  `tree_gdn._tree_conv_kernel`
++# keeps a per-NODE window in the node's own state slot and reads exactly columns
++# 0,1,2 (`h0/h1/h2`), taking every older token from the ancestor rows of `x`
++# instead.  So for a tree engine the extra `num_speculative_tokens` conv columns
++# are allocated in all `3 x (1 + K)` slots per request and never read or written.
++#
++# That is not a rounding error, because the conv width sets the whole engine's
++# page size.  `Platform.check_and_update_config` pads the mamba page up to the
++# attention page and then derives the attention block size from it, so at
++# Qwen3.5-4B with the 8x5 tree (K = 41):
++#
++#     conv 8192 x 44 x 2B + ssm 32x128x128 x 4B = 2,818,048 B -> block 688 tokens
++#     conv 8192 x  3 x 2B + ssm 32x128x128 x 4B = 2,146,304 B -> block 528 tokens
++#
++# and since `num_blocks = kv_memory / (page_size x layers_per_group)`, the same
++# 41.57 GiB buys 1,979 blocks at 688 and 2,579 at 528 -- +30% blocks for free,
++# which is +30% concurrent requests on an arm whose admission cap is the binding
++# constraint above concurrency 2.  (Predicted 15 -> 20 admitted at 4B, 3 -> 4 at 27B.)
++#
++# WHY IT IS GATED AND OFF BY DEFAULT.  Narrowing is only sound if the wide-window
++# `causal_conv1d_update` spec path is never taken on this engine.  In a tree engine
++# it is taken only on the documented STALE-TREE fallback (`tree_state.lookup`
++# returns None, so the layer's `_tree_meta` is None), and there it would compute
++# `state_len = width - 1 + (seqlen - 1) = 44` against a 3-wide allocation and read
++# out of bounds -- silently, since that call passes `validate_data=False`.
++# `QwenGatedDeltaNetAttention.forward` therefore refuses that combination loudly
++# rather than letting it run; see the guard next to the `causal_conv1d_update`
++# call.  This flag must not be set on a CHAIN engine, where the wide window is the
++# only place the draft conv history lives.
++def cf_gdn_conv_spec_width(num_spec: int) -> int:
++    """Speculative widening to apply to the GDN conv state (0 = stock width)."""
++    import os
++
++    if num_spec <= 0 or os.environ.get("CF_TREE_CONV_NARROW", "0") != "1":
++        return num_spec
++    if os.environ.get("VLLM_SPEC_TREE", "0") != "1":
++        raise ValueError(
++            "CF_TREE_CONV_NARROW=1 requires VLLM_SPEC_TREE=1. On a chain engine the "
++            "speculative conv columns hold the draft window itself (causal_conv1d_update "
++            "with num_accepted_tokens), so narrowing them corrupts the conv state."
++        )
++    logger.info(
++        "CF_TREE_CONV_NARROW=1: GDN conv state kept at conv_kernel-1 instead of "
++        "conv_kernel-1+%d. The tree conv kernel reads only columns 0..%d.",
++        num_spec,
++        2,
++    )
++    return 0
+ 
+ 
+ @functools.lru_cache
+@@ -223,7 +282,7 @@
+         conv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads
+         conv_state_shape = cls._orient_conv_shape(
+             divide(conv_dim, tp_world_size),
+-            conv_kernel_size - 1 + num_spec,
++            conv_kernel_size - 1 + cf_gdn_conv_spec_width(num_spec),
+         )
+ 
+         temporal_state_shape = (
 --- a/vllm/v1/attention/backends/flash_attn.py
 +++ b/vllm/v1/attention/backends/flash_attn.py
 @@ -31,6 +31,7 @@
