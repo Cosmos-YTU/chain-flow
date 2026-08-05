@@ -262,19 +262,26 @@ request counts, and it refuses to run on a GPU that has not finished draining (a
 that profiles against a busy GPU gets a silently tiny KV cache and then benchmarks its own
 admission queue).
 
-**Serving under concurrency: `CF_SPEC_MAX_BATCH=N` (default off).** Speculation is a batch-1
-win. Above a decode batch of N it is a loss — the target verifies `(K+1) x B` positions for an
-acceptance that cannot pay for them, while the drafter's batch-1 kernels have already
-disengaged. Measured at 4B, chain vs no speculation: 1.19x at concurrency 1, 1.00x at 4, 0.90x
-at 8, **0.44x at 64**. With `CF_SPEC_MAX_BATCH=4` the same ladder reads 1.19x / 1.00x / 0.95x /
-0.95x — and the batch-1 number is bit-identical to the uncut arm.
+**Serving under concurrency: `CF_SPEC_MAX_BATCH` (default ON where the threshold is measured).**
+Speculation is a batch-1 win. Above a decode batch of N it is a loss — the target verifies
+`(K+1) x B` positions for an acceptance that cannot pay for them, while the drafter's batch-1
+kernels have already disengaged. Measured at 4B, chain vs no speculation: 1.19x at concurrency 1,
+1.00x at 4, 0.90x at 8, **0.44x at 64**. With the cutoff the same ladder reads 1.19x / 1.00x /
+0.95x / 0.95x — and the batch-1 number is bit-identical to the uncut arm.
 
 The flag works in two halves that must both be on: the scheduler stops allocating speculative
-slots (so the target stops verifying) and the proposer stops drafting. **N is per model size** —
-4 is right at 4B and wrong at 27B, where the curve crosses at 16 — so `CF_SPEC_MAX_BATCH=auto`
-picks it from the loaded target's hidden size and says which value it chose and whether that
-value was measured or interpolated. `CF_WARM_BUCKETS=1` pairs with it to move the drafter's
-per-batch-shape `torch.compile` out of live traffic.
+slots (so the target stops verifying) and the proposer stops drafting. **N is per model size AND
+per arm** — the scheduler hands the target `K+1` query positions per request, so an 8×5 tree
+saturates it seven times sooner than a chain. `_AUTO` is keyed on `(hidden_size, K+1)` and every
+size × arm this project publishes a number for is now laddered against its own no-speculation
+baseline on the same GPU.
+
+**The default resolves that table and nothing else.** A combination that was never laddered
+resolves to *no cutoff at all*, with the reason printed — a derived N that is too low silently
+costs speedup, and that is not something to acquire by accident. `CF_SPEC_MAX_BATCH=auto` opts
+back into the derived guess for an unmeasured target, `=<n>` sets one directly, and `=0` (or
+`off`) disables it. `CF_WARM_BUCKETS=1` pairs with it to move the drafter's per-batch-shape
+`torch.compile` out of live traffic.
 
 Two baseline hazards have corrupted results here before:
 

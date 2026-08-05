@@ -146,14 +146,18 @@ def register() -> None:
     # not be taken on the path whose numbers this project actually reports -- `vllm serve` at a
     # real decode batch. This is the same install, from the plugin entry point, so it lands in
     # the ENGINE CORE process. Pair it with `CF_VPROF_EVERY=N`: atexit does not run there.
-    if _truthy(os.environ.get("CF_VPROF")):
+    if _truthy(os.environ.get("CF_VPROF")) or _truthy(os.environ.get("CF_DBG_CG")):
         try:
             from chained_flow.vllm_plugin import vprof
 
-            vprof.install()
-            if _truthy(os.environ.get("CF_SYNCDBG")):
-                vprof.install_sync_debug()
-            print("[cf-plugin] CF_VPROF: step profiler installed in this process", flush=True)
+            if _truthy(os.environ.get("CF_VPROF")):
+                vprof.install()
+                if _truthy(os.environ.get("CF_SYNCDBG")):
+                    vprof.install_sync_debug()
+                print("[cf-plugin] CF_VPROF: step profiler installed in this process", flush=True)
+            if _truthy(os.environ.get("CF_DBG_CG")):
+                vprof.install_cgmode()
+                print("[cf-plugin] CF_DBG_CG: cudagraph-mode tally installed", flush=True)
         except Exception as e:                              # noqa: BLE001 - advisory only
             print(f"[cf-plugin] CF_VPROF not installed ({e!r})", flush=True)
 

@@ -45,6 +45,12 @@ _WALL = [0.0, 0.0]   # [t of first counted step, t of last counted step]
 # FULL cudagraph removes.  Readback is DEFERRED by _LAG steps so nothing ever
 # blocks the step loop.
 _CUDA = os.environ.get("CF_VPROF_CUDA", "0") == "1"
+#: Which wrapped calls get the event pair.  The DRAFT is in the set because at a large decode
+#: batch it is the segment in question: its host time is ~4x the target forward's, and host time
+#: alone cannot say whether that is the drafter occupying the device or the drafter's launch
+#: stream stalled behind a target forward that has not finished.  Only a device span separates
+#: those two, and they call for opposite fixes.
+_CUDA_LABELS = ("1.execute_model", "1b._model_forward", "2b.draft(propose)", "2.sample_tokens")
 _LAG = 64
 _PEND: dict[str, list] = collections.defaultdict(list)
 _GT: dict[str, float] = collections.defaultdict(float)
@@ -70,7 +76,7 @@ def _wrap(obj, name, label):
         return
 
     def w(*a, **k):
-        if _CUDA and label in ("1.execute_model", "1b._model_forward"):
+        if _CUDA and label in _CUDA_LABELS:
             import torch
 
             _drain(label)
@@ -157,6 +163,42 @@ def install() -> None:
     _wrap(Scheduler, "schedule", "0.sched.schedule")
     _wrap(Scheduler, "update_from_output", "3.sched.update_from_output")
     atexit.register(report)
+
+
+def install_cgmode(every: int = 500) -> None:
+    """`CF_DBG_CG=1`: tally which cudagraph mode each step actually dispatches.
+
+    The same tally `vllm/test_plugin_native.py` has had, moved somewhere the SERVE path can
+    reach.  It answers a question no throughput number can: whether a wide decode batch still
+    replays a captured FULL graph or has fallen to PIECEWISE.  A spec engine's
+    `uniform_decode_query_len` is `1 + num_spec_tokens`, so the captured decode graph is keyed
+    on `B x (K+1)` tokens -- and `cudagraph_capture_sizes` is a finite list, so there is a batch
+    above which no key matches and every step is eager-dispatched.  Printed every `every`
+    dispatches because the engine core is killed by a signal and atexit does not run there.
+    """
+    from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+
+    tally: dict = collections.Counter()
+    n = [0]
+    orig = CudagraphDispatcher.dispatch
+
+    def dispatch(self, *a, **k):
+        r = orig(self, *a, **k)
+        try:
+            mode, desc = (r if isinstance(r, tuple) else (r, None))
+            tally[f"{mode} ntok={getattr(desc, 'num_tokens', None)} "
+                  f"uniform={getattr(desc, 'uniform', None)}"] += 1
+        except Exception as e:                               # noqa: BLE001
+            tally[f"ERR {e!r}"] += 1
+        n[0] += 1
+        if every and n[0] % every == 0:
+            print(f"[cf-cgmode] dispatched modes (n={n[0]}): "
+                  f"{dict(tally.most_common(10))}", flush=True)
+        return r
+
+    CudagraphDispatcher.dispatch = dispatch
+    atexit.register(lambda: print(f"\n[cf-cgmode] dispatched modes: {dict(tally.most_common(10))}",
+                                  flush=True))
 
 
 _SYNCS: dict = collections.Counter()
