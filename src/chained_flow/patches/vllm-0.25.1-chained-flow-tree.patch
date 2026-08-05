@@ -27,15 +27,22 @@
                      and self.speculative_config.method != "dspark"
 --- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
 +++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
-@@ -1338,9 +1338,62 @@
+@@ -1338,9 +1338,100 @@
              mixed_qkv_non_spec = mixed_qkv
  
          # 1.1: Process the multi-query part
 +        _tree_meta = None
++        _cf_narrow = False
          if spec_sequence_masks is not None:
 +            from vllm.v1.spec_decode import tree_gdn as _tg
 +            from vllm.v1.spec_decode import tree_state as _ts_mod
 +
++            # Resolved off the BUILT conv state, not off CF_TREE_CONV_NARROW: this is
++            # the only fact the code below cares about, and reading the env var here
++            # would also be a dict lookup per layer per step.
++            _cf_narrow = (
++                self.num_spec > 0 and conv_state.shape[-1] == self.conv_kernel_size - 1
++            )
 +            _ts = _ts_mod.get_current()
 +            if _ts is not None and (_ts.branching or _ts_mod.force_tree_gdn()):
 +                _lay = _ts.extras.get("gdn_layout")
@@ -71,26 +78,57 @@
 +        elif spec_sequence_masks is not None:
              # spec_state_indices_tensor is always set when spec_sequence_masks is set
              assert spec_state_indices_tensor is not None
-+            # CF_TREE_CONV_NARROW guard.  This is the STALE-TREE fallback (the tree
-+            # shape did not match what the scheduler scheduled, so `_tree_meta` is
-+            # None and the drafts are verified with chain semantics).  It reaches
-+            # `causal_conv1d_update` with `num_accepted_tokens`, which internally
-+            # raises its effective window to `width - 1 + (seqlen - 1)` -- 44 columns
-+            # for the 8x5 tree -- and indexes the conv state with it under
-+            # `validate_data=False`.  With the narrowed conv state that is an
-+            # out-of-bounds read with no error and no crash, i.e. exactly the silent
-+            # corruption the flag is supposed to be safe from.  Refuse instead.
-+            if self.num_spec > 0 and conv_state.shape[-1] == self.conv_kernel_size - 1:
++            # ------------------------------------------------------------------ #
++            #  THE STALE-TREE FALLBACK, AND WHY CF_TREE_CONV_NARROW CANNOT SHIP ON #
++            # ------------------------------------------------------------------ #
++            # This is the wide-window CHAIN conv update.  It is reached when this step's
++            # `TreeStep.branching` is False -- every spec request's `tree_state.lookup`
++            # missed, so `_prepare_inputs` synthesised chain parents `[-1, 0, 1, ...]`
++            # and the drafts are verified with chain semantics.
++            #
++            # IT IS CORRECT, AND IT IS NOT OPTIONAL.  Measured 2026-08-05 with
++            # CF_TREE_FORCE_STALE=1 (every step forced onto this path), 4B, 7 domains x
++            # 256 greedy tokens: 7/7 TOKEN-IDENTICAL to base at 104.5 tok/s.  So this is
++            # a real, working, slower path -- not a corner that can be refused.
++            #
++            # IT NEEDS THE WIDE CONV WINDOW, and that is what makes it incompatible with
++            # CF_TREE_CONV_NARROW.  `causal_conv1d_update` recomputes
++            # `state_len = width - 1 + (seqlen - 1)` with `seqlen = max_query_len`, a
++            # CONSTANT `1 + num_spec` of the engine (42 for the 8x5 tree), and indexes the
++            # conv state with it under `validate_data=False` -- so on a narrowed engine
++            # this is a silent out-of-bounds read of 41 columns that were never allocated.
++            #
++            # THREE WAYS OF AVOIDING IT ON A NARROWED ENGINE WERE MEASURED AND ALL THREE
++            # ARE WRONG (same protocol, against base):
++            #   1. run the TREE GDN kernels over the synthesised chain
++            #      (`_cf_narrow` joined `branching` in the predicate above)
++            #         -> 0/7, accept 3.45 -> 1.00, text diverges at token 2
++            #   2. promote the whole step to `branching=True` in `_prepare_inputs`, so the
++            #      tree attention, the position rewrite and the tree rejection sampler are
++            #      coherent with the tree GDN
++            #         -> 0/7, accept ~1.00, text diverges at token 2
++            #   3. keep this chain call but drop `num_accepted_tokens`, so
++            #      `state_len = width - 1` fits the narrow allocation and the three columns
++            #      the tree conv kernel wrote are used as the history
++            #         -> 0/7, accept 1.0-1.7, text diverges at token 2-6
++            # The wide sliding window is therefore load-bearing, not vestigial, on exactly
++            # this one step -- which is why the flag stays OPT-IN and this is a hard error
++            # rather than a degrade.  See the module docstring of
++            # `vllm/model_executor/layers/mamba/mamba_utils.py`.
++            if _cf_narrow:
 +                raise RuntimeError(
-+                    "CF_TREE_CONV_NARROW=1 but this step took the stale-tree "
-+                    "fallback, which needs the full speculative conv window "
-+                    f"(only {conv_state.shape[-1]} columns are allocated). "
-+                    "Re-run without CF_TREE_CONV_NARROW."
++                    "CF_TREE_CONV_NARROW=1 but this step took the stale-tree fallback, "
++                    f"which needs {self.conv_kernel_size - 1 + self.num_spec} conv columns "
++                    f"and this engine allocated {conv_state.shape[-1]}. The fallback is a "
++                    "correct path that genuinely uses the speculative conv window, so it "
++                    "cannot be degraded -- re-run without CF_TREE_CONV_NARROW. Set "
++                    "CF_TREE_FALLBACK_LOG=1 to see how often this step occurs in your "
++                    "workload before deciding."
 +                )
              mixed_qkv_spec = causal_conv1d_update(
                  mixed_qkv_spec,
                  conv_state,
-@@ -1452,7 +1505,30 @@
+@@ -1452,7 +1543,30 @@
          # 2. Recurrent attention
  
          # 2.1: Process the multi-query part
@@ -124,14 +162,14 @@
                      A_log=self.A_log,
 --- a/vllm/model_executor/layers/mamba/mamba_utils.py
 +++ b/vllm/model_executor/layers/mamba/mamba_utils.py
-@@ -21,6 +21,65 @@
+@@ -21,6 +21,131 @@
  logger = init_logger(__name__)
  
  ConvStateLayoutType = Literal["SD", "DS"]
 +
 +
 +# --------------------------------------------------------------------------- #
-+#  CHAINED-FLOW  CF_TREE_CONV_NARROW  (default OFF -- unset behaves as stock)   #
++#  CHAINED-FLOW  CF_TREE_CONV_NARROW  (OPT-IN -- unset behaves as stock)        #
 +# --------------------------------------------------------------------------- #
 +# Stock vLLM widens the GDN **conv** state of every state slot from
 +# `conv_kernel-1` to `conv_kernel-1 + num_speculative_tokens`, because the CHAIN
@@ -158,47 +196,123 @@
 +# which is +30% concurrent requests on an arm whose admission cap is the binding
 +# constraint above concurrency 2.  (Predicted 15 -> 20 admitted at 4B, 3 -> 4 at 27B.)
 +#
-+# WHY IT IS GATED AND OFF BY DEFAULT.  Narrowing is only sound if the wide-window
-+# `causal_conv1d_update` spec path is never taken on this engine.  In a tree engine
-+# it is taken only on the documented STALE-TREE fallback (`tree_state.lookup`
-+# returns None, so the layer's `_tree_meta` is None), and there it would compute
-+# `state_len = width - 1 + (seqlen - 1) = 44` against a 3-wide allocation and read
-+# out of bounds -- silently, since that call passes `validate_data=False`.
-+# `QwenGatedDeltaNetAttention.forward` therefore refuses that combination loudly
-+# rather than letting it run; see the guard next to the `causal_conv1d_update`
-+# call.  This flag must not be set on a CHAIN engine, where the wide window is the
-+# only place the draft conv history lives.
++# WHAT IT BUYS, AND WHY THAT IS A CORRECTNESS ARGUMENT AND NOT A TUNING ONE.
++# Block size is `ceil16(page/4096)`, so the 8x5 tree's 44 conv columns move the 4B
++# engine's attention block from base's 528 to 688 -- and at 688 the tree
++# deterministically decodes DIFFERENT TEXT from base on 2 of 7 domains.  Measured
++# 2026-08-05, twice, batch 1, 256 greedy tokens, against a base arm that is 7/7
++# reproducible against itself: wide is 5/7 (d3 diverges at token 129, d4 at 59)
++# at 177.9 tok/s; narrow is 7/7 on FOUR repeats at 187.6 tok/s.  At 9B narrowing
++# also removes the tree's run-to-run nondeterminism outright (3/3 repeats 7/7 and
++# byte-identical to each other, against a recorded 6/7-and-varying).  So the flag
++# is worth more than the +30% blocks it was introduced for.
++#
++# AND YET IT STAYS OPT-IN, BECAUSE THE HAZARD IS REAL AND COULD NOT BE CLOSED.
++# Narrowing is sound only if the wide-window `causal_conv1d_update` spec path is
++# never taken.  That path is the STALE-TREE FALLBACK (`tree_state.lookup` missed
++# for EVERY spec request, so the step's `TreeStep.branching` is False), and:
++#
++#   * it is CORRECT and load-bearing, not a corner.  Forced on for every step
++#     (`CF_TREE_FORCE_STALE=1`) it is 7/7 token-identical to base at 104.5 tok/s.
++#   * it genuinely needs the wide window.  Three ways of serving it on a narrowed
++#     engine were measured and ALL THREE produce wrong text from token ~2 with
++#     accept collapsing to 1.00 -- routing it through the tree GDN kernels,
++#     promoting the whole step to `branching=True`, and dropping
++#     `num_accepted_tokens` so `state_len` fits.  See the call site in
++#     `gdn/qwen_gdn_linear_attn.py` for the numbers.
++#   * it is REACHABLE in principle: the scheduler's `pad_spec_decode` branch is
++#     keyed on the engine's static `num_spec_tokens`, not on the cut
++#     `num_spec_tokens_to_schedule`, so a request entering from the WAITING queue
++#     with a full prefix-cache hit is handed `[-1] * num_spec_tokens` slots it was
++#     never drafted for, while `CF_SPEC_MAX_BATCH` has cut every running request's
++#     slots to zero.
++#   * but it was NOT OBSERVED to fire.  `CF_TREE_FALLBACK_LOG=1` over a 4/8/16
++#     concurrency ladder (440 requests, requests joining and leaving, prefix
++#     caching on, the cutoff engaging and disengaging) and over a targeted
++#     prefix-cache-hit-under-load reproduction recorded ZERO stale rows, with the
++#     accounting demonstrably live in the engine-core process.
++#
++# Not observed is not unreachable, and the failure mode is silent wrong text, so
++# the default is OFF and turning it on logs a warning that names the hazard.
++#
++# This flag must not be set on a CHAIN engine, where the wide window is the only
++# place the draft conv history lives; asking for it there is refused.
 +def cf_gdn_conv_spec_width(num_spec: int) -> int:
-+    """Speculative widening to apply to the GDN conv state (0 = stock width)."""
++    """Speculative widening to apply to the GDN conv state (0 = stock width).
++
++    Resolution table:
++
++      tree engine (VLLM_SPEC_TREE=1), flag `1`  -> 0        (narrowed, opted in)
++      anything else with the flag unset/off     -> num_spec (stock)
++      chain engine, flag `1`                    -> refused
++    """
 +    import os
 +
-+    if num_spec <= 0 or os.environ.get("CF_TREE_CONV_NARROW", "0") != "1":
++    if num_spec <= 0:
 +        return num_spec
-+    if os.environ.get("VLLM_SPEC_TREE", "0") != "1":
++    v = (os.environ.get("CF_TREE_CONV_NARROW", "") or "").strip().lower()
++    tree = os.environ.get("VLLM_SPEC_TREE", "0") == "1"
++    if v not in ("1", "on", "yes", "true", "enable", "enabled"):
++        return num_spec
++    if not tree:
 +        raise ValueError(
 +            "CF_TREE_CONV_NARROW=1 requires VLLM_SPEC_TREE=1. On a chain engine the "
 +            "speculative conv columns hold the draft window itself (causal_conv1d_update "
 +            "with num_accepted_tokens), so narrowing them corrupts the conv state."
 +        )
-+    logger.info(
-+        "CF_TREE_CONV_NARROW=1: GDN conv state kept at conv_kernel-1 instead of "
-+        "conv_kernel-1+%d. The tree conv kernel reads only columns 0..%d.",
-+        num_spec,
-+        2,
-+    )
 +    return 0
++
++
++_CF_CONV_SHAPE_LOGGED = False
++
++
++def cf_log_gdn_conv_shape(shape, conv_kernel_size: int, num_spec: int, spec_w: int) -> None:
++    """One line, once, naming the conv state THAT WAS BUILT."""
++    global _CF_CONV_SHAPE_LOGGED
++    if _CF_CONV_SHAPE_LOGGED or num_spec <= 0:
++        return
++    _CF_CONV_SHAPE_LOGGED = True
++    state_len = conv_kernel_size - 1 + spec_w
++    assert state_len in shape, f"conv state {shape} does not carry state_len {state_len}"
++    if spec_w == 0:
++        logger.info(
++            "[chained-flow] GDN conv state BUILT NARROW: %s (state_len %d = conv_kernel-1), "
++            "%d speculative columns reclaimed. The tree conv kernel reads and writes only "
++            "columns 0..2; the narrower page is what restores the base engine's block size.",
++            tuple(shape),
++            state_len,
++            num_spec,
++        )
++    else:
++        logger.info(
++            "[chained-flow] GDN conv state BUILT WIDE (stock): %s (state_len %d = "
++            "conv_kernel-1+%d).",
++            tuple(shape),
++            state_len,
++            spec_w,
++        )
  
  
  @functools.lru_cache
-@@ -223,7 +282,7 @@
+@@ -221,10 +346,16 @@
+         num_spec: int = 0,
+     ):
          conv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads
++        _cf_spec_w = cf_gdn_conv_spec_width(num_spec)
          conv_state_shape = cls._orient_conv_shape(
              divide(conv_dim, tp_world_size),
 -            conv_kernel_size - 1 + num_spec,
-+            conv_kernel_size - 1 + cf_gdn_conv_spec_width(num_spec),
-         )
+-        )
++            conv_kernel_size - 1 + _cf_spec_w,
++        )
++        # Report the SHAPE THAT WAS BUILT, not the environment variable that was
++        # read.  The two can disagree (unset still narrows a tree engine, and a
++        # chain engine ignores the request), and the shape is what every kernel,
++        # the page size and therefore the block size are actually derived from.
++        cf_log_gdn_conv_shape(conv_state_shape, conv_kernel_size, num_spec, _cf_spec_w)
  
          temporal_state_shape = (
+             divide(num_v_heads, tp_world_size),
 --- a/vllm/v1/attention/backends/flash_attn.py
 +++ b/vllm/v1/attention/backends/flash_attn.py
 @@ -31,6 +31,7 @@
@@ -236,10 +350,12 @@
                  return output
  
          # Cascade attention (rare case).
-@@ -1298,6 +1319,180 @@
+@@ -1296,6 +1317,180 @@
+ 
+     mm_prefix_mask_mod.use_fast_sampling = True
      return mm_prefix_mask_mod
- 
- 
++
++
 +def _tree_attention_fixup(
 +    impl: "FlashAttentionImpl",
 +    ts,
@@ -412,11 +528,9 @@
 +        merged, prefix_out, prefix_lse, suffix_out, suffix_lse.float()
 +    )
 +    return merged
-+
-+
- def _make_rswa_mask_mod():
-     """Build a CuTE-DSL mask_mod for Reference Sliding Window Attention (R-SWA).
  
+ 
+ def _make_rswa_mask_mod():
 --- a/vllm/v1/sample/rejection_sampler.py
 +++ b/vllm/v1/sample/rejection_sampler.py
 @@ -118,6 +118,28 @@
@@ -448,10 +562,11 @@
          bonus_logits_indices = metadata.bonus_logits_indices
          target_logits_indices = metadata.target_logits_indices
  
-@@ -196,6 +218,20 @@
+@@ -195,6 +217,20 @@
+             sampled_token_ids=output_token_ids,
              logprobs_tensors=logprobs_tensors,
          )
- 
++
 +    @staticmethod
 +    def _tree_needs_processors(sampling_metadata: SamplingMetadata) -> bool:
 +        holder = sampling_metadata.thinking_budget_state_holder
@@ -465,14 +580,15 @@
 +        # descent does NOT run `sampling_metadata.logitsprocs` -- stock applies
 +        # them only to the bonus row via `self.sampler`.  min_tokens / logit_bias
 +        # / min_p therefore do not affect the bonus token in tree mode.
-+
+ 
      def _get_logprobs_tensors(
          self,
-         max_num_logprobs: int,
-@@ -391,6 +427,153 @@
+@@ -389,6 +425,153 @@
+             for i in range(len(spec) - 1):
+                 result.append([*result[-1], spec[i]])
          return result
- 
- 
++
++
 +# ---------------------------------------------------------------------------
 +#  TREE verify (chained-flow fork)
 +# ---------------------------------------------------------------------------
@@ -618,17 +734,16 @@
 +            cur.extras["accepted_path_cpu"] = accepted_path.to("cpu", non_blocking=False)
 +            cur.extras["accepted_len_cpu"] = accepted_len.to("cpu", non_blocking=False)
 +    return output_token_ids
-+
-+
+ 
+ 
  def rejection_sample(
-     # [num_tokens]
-     draft_token_ids: torch.Tensor,
 --- a/vllm/v1/spec_decode/metadata.py
 +++ b/vllm/v1/spec_decode/metadata.py
-@@ -23,6 +23,18 @@
+@@ -22,6 +22,18 @@
+     bonus_logits_indices: torch.Tensor
      # [num_tokens + batch_size]
      logits_indices: torch.Tensor
- 
++
 +    # ---- tree speculative decoding (chained-flow fork) -------------------
 +    # [num_tokens] int32: node-local parent index of each draft token
 +    # (-1 for the root of a request's tree).  None => stock linear chain.
@@ -640,10 +755,9 @@
 +    tree_depths_np: np.ndarray | None = None
 +    # True when at least one request's tree actually branches
 +    tree_branching: bool = False
-+
+ 
      def __post_init__(self):
          self.max_spec_len = max(self.num_draft_tokens)
- 
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -187,6 +187,8 @@
@@ -655,7 +769,7 @@
  from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
  from vllm.v1.spec_decode.ngram_proposer_gpu import (
      NgramProposerGPU,
-@@ -840,9 +842,51 @@
+@@ -840,9 +842,73 @@
              )
  
          self.uniform_decode_query_len = 1 + self.num_spec_tokens
@@ -674,6 +788,28 @@
 +            and self._cf_tree_keep * self._cf_tree_maxd == self.num_spec_tokens - 1
 +        )
 +        self._cf_force_uniform: bool | None = None
++        # CF_TREE_CONV_NARROW: has this engine's GDN conv state been built at
++        # `conv_kernel-1` instead of `conv_kernel-1 + num_spec`?  Asked of the RESOLVER
++        # that produced the shape rather than of the environment variable, because it is
++        # the shape the kernels index against.  Only used to make the startup warning
++        # below say something true about THIS engine.
++        from vllm.model_executor.layers.mamba.mamba_utils import cf_gdn_conv_spec_width
++
++        self._cf_conv_narrow = (
++            tree_state.tree_enabled()
++            and self.num_spec_tokens > 0
++            and cf_gdn_conv_spec_width(self.num_spec_tokens) == 0
++        )
++        if self._cf_conv_narrow:
++            logger.warning(
++                "CF_TREE_CONV_NARROW=1: this engine's GDN conv state has no speculative "
++                "columns, so the STALE-TREE FALLBACK (every spec request missed the tree "
++                "registry) cannot run and the engine will RAISE if a step takes it. That "
++                "step is reachable in principle through the scheduler's `pad_spec_decode` "
++                "branch; it was not observed in a 4/8/16 concurrency ladder or in a "
++                "targeted prefix-cache-hit-under-load reproduction, but it is not proven "
++                "unreachable. Set CF_TREE_FALLBACK_LOG=1 to account for it."
++            )
 +        # `max_seqlen_k` of the fix-up's prefix attention is a HOST argument and
 +        # therefore baked into the captured graph, so it must be an UPPER BOUND
 +        # on any context the graph will ever replay against; the true per-request
@@ -707,7 +843,7 @@
  
          self.mm_budget = (
              MultiModalBudget(self.vllm_config, self.mm_registry)
-@@ -877,6 +921,9 @@
+@@ -877,6 +943,9 @@
              self._num_valid_draft_tokens_copy_stream = torch.cuda.Stream()
  
          self._draft_token_req_ids: list[str] | None = None
@@ -717,7 +853,7 @@
          self.transfer_event = torch.Event()
          self.sampled_token_ids_pinned_cpu = torch.empty(
              (self.max_num_reqs, 1),
-@@ -1519,6 +1566,194 @@
+@@ -1519,6 +1588,194 @@
          else:
              return None
  
@@ -912,7 +1048,7 @@
      def _update_states_after_model_execute(
          self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
      ) -> None:
-@@ -1538,6 +1773,13 @@
+@@ -1538,6 +1795,13 @@
          # tokens gives us the first -1 position (i.e., number of accepted).
          num_reqs = output_token_ids.size(0)
          self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
@@ -926,7 +1062,7 @@
  
          if self.cache_config.mamba_cache_mode == "align":
              # Fused GPU postprocess: state copies + per-request accepted-token
-@@ -2125,6 +2367,25 @@
+@@ -2125,6 +2389,25 @@
                  self.prev_num_draft_tokens.gpu,
                  cpu_values,
              )
@@ -952,7 +1088,7 @@
          else:
              self.num_computed_tokens[:num_reqs].copy_(
                  self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
-@@ -2192,6 +2453,11 @@
+@@ -2192,6 +2475,11 @@
              # TODO: Support prompt logprobs.
              logits_indices = query_start_loc[1:] - 1
              spec_decode_metadata = None
@@ -964,7 +1100,7 @@
              num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
          else:
              # Get the number of draft tokens for each request.
-@@ -2201,18 +2467,317 @@
+@@ -2201,18 +2489,322 @@
              # For chunked prefills, use -1 as mask rather than 0, as guided
              # decoding may rollback speculative tokens.
              num_decode_draft_tokens = np.full(num_reqs, -1, dtype=np.int32)
@@ -1062,6 +1198,7 @@
 +            elif _use_tree and num_draft_tokens.sum() > 0:
 +                _pp: list[np.ndarray] = []
 +                _dd: list[np.ndarray] = []
++                _stale_rows = 0
 +                for r in range(num_reqs):
 +                    n = int(num_draft_tokens[r])
 +                    if n == 0:
@@ -1079,6 +1216,7 @@
 +                        # chain_w = n + 1), flag it and let the dispatcher below
 +                        # force this step back onto PIECEWISE.
 +                        _tree_fallback = True
++                        _stale_rows += 1
 +                        p = np.arange(-1, n - 1, dtype=np.int32)
 +                        d = np.arange(n, dtype=np.int32)
 +                    else:
@@ -1088,6 +1226,9 @@
 +                            tree_branching = True
 +                    _pp.append(p)
 +                    _dd.append(d)
++                # CF_TREE_FALLBACK_LOG=1 only; `note_spec_step` returns immediately
++                # otherwise, so this costs one call on a path that already looped.
++                tree_state.note_spec_step(_stale_rows, len(_pp))
 +                if _pp:
 +                    tree_parents_np = np.concatenate(_pp).astype(np.int32)
 +                    tree_depths_np = np.concatenate(_dd).astype(np.int32)
@@ -1096,6 +1237,7 @@
 +                    _tree_maxd = 1 + int(tree_depths_np.max())
              spec_decode_metadata = self._calc_spec_decode_metadata(
 -                num_draft_tokens, cu_num_tokens
+-            )
 +                num_draft_tokens,
 +                cu_num_tokens,
 +                tree_parents_np,
@@ -1167,7 +1309,7 @@
 +            _graphable = False
 +            _pad_map = getattr(
 +                self.cudagraph_dispatcher, "_bs_to_padded_graph_size", ()
-             )
++            )
 +            if self._cf_tree_fullcg and (
 +                tree_parents_np is not None or tree_parents_gpu is not None
 +            ):
@@ -1292,7 +1434,7 @@
              logits_indices = spec_decode_metadata.logits_indices
              num_sampled_tokens = num_draft_tokens + 1
              # For DECODE only cuda graph of some attention backends (e.g., GDN).
-@@ -2799,6 +3364,10 @@
+@@ -2799,6 +3391,10 @@
          self,
          num_draft_tokens: np.ndarray,
          cu_num_scheduled_tokens: np.ndarray,
@@ -1303,7 +1445,7 @@
      ) -> SpecDecodeMetadata:
          # Inputs:
          # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
-@@ -2837,19 +3406,39 @@
+@@ -2837,19 +3433,39 @@
              num_draft_tokens, self._arange_scratch, cumsum_dtype=np.int32
          )
          # [0, 0, 0, 5, 5, 9]
@@ -1348,7 +1490,7 @@
          )
          bonus_logits_indices = async_tensor_h2d(
              bonus_logits_indices, device=self.device
-@@ -2857,8 +3446,27 @@
+@@ -2857,8 +3473,27 @@
  
          # Compute the draft token ids.
          # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
@@ -1377,7 +1519,7 @@
  
          return SpecDecodeMetadata(
              draft_token_ids=draft_token_ids,
-@@ -2868,6 +3476,11 @@
+@@ -2868,6 +3503,11 @@
              target_logits_indices=target_logits_indices,
              bonus_logits_indices=bonus_logits_indices,
              logits_indices=logits_indices,
@@ -1389,7 +1531,7 @@
          )
  
      def _prepare_kv_sharing_fast_prefill(
-@@ -4179,6 +4792,10 @@
+@@ -4179,6 +4819,10 @@
                  max_num_scheduled_tokens=max_num_scheduled_tokens,
                  use_cascade_attn=cascade_attn_prefix_lens is not None,
                  num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
@@ -1400,7 +1542,7 @@
              )
  
              logger.debug(
-@@ -4491,6 +5108,7 @@
+@@ -4491,6 +5135,7 @@
          with record_function_or_nullcontext("gpu_model_runner: sample"):
              sampler_output = self._sample(logits, spec_decode_metadata)
  
@@ -1408,10 +1550,11 @@
          self._update_states_after_model_execute(
              sampler_output.sampled_token_ids, scheduler_output
          )
-@@ -4789,6 +5407,44 @@
+@@ -4788,6 +5433,44 @@
+             self.input_batch.is_token_ids[i, pos] = True
              self.input_batch.num_tokens_no_spec[i] = pos + 1
          self.input_batch.prev_req_id_to_index = prev_req_id_to_index
- 
++
 +    def _cf_static_depths(self, num_reqs: int) -> np.ndarray:
 +        """Node depths of the canonical keep x depth tree, tiled over ``num_reqs``.
 +
@@ -1449,11 +1592,10 @@
 +        cpu[:n].copy_(torch.from_numpy(arr))
 +        gpu[:n].copy_(cpu[:n], non_blocking=True)
 +        return gpu[:n]
-+
+ 
      def take_draft_token_ids(self) -> DraftTokenIds | None:
          if not self.num_spec_tokens or not self._draft_token_req_ids:
-             return None
-@@ -6722,6 +7378,56 @@
+@@ -6722,6 +7405,56 @@
          if num_warmups is None:
              num_warmups = self.compilation_config.cudagraph_num_of_warmups
          force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
@@ -1512,7 +1654,7 @@
                  desc.num_tokens,
 --- a/vllm/v1/spec_decode/tree_state.py
 +++ b/vllm/v1/spec_decode/tree_state.py
-@@ -0,0 +1,684 @@
+@@ -0,0 +1,772 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Tree speculative decoding support (chained-flow fork of vLLM 0.25.1).
 +
@@ -1560,6 +1702,87 @@
 +def force_tree_gdn() -> bool:
 +    """Run the tree GDN kernels even for chain-shaped trees (equivalence test)."""
 +    return os.environ.get("VLLM_SPEC_TREE_GDN_FORCE", "0") == "1"
++
++
++# ---------------------------------------------------------------------------
++# STALE-TREE FALLBACK: forcing it, and counting it
++# ---------------------------------------------------------------------------
++# The fallback (`lookup` misses, so the step is verified against a synthesised
++# CHAIN) is the one path that could reach the wide `causal_conv1d_update` on a
++# CF_TREE_CONV_NARROW engine.  It is rare and event-driven -- a request resuming
++# out of the waiting queue, the CF_SPEC_MAX_BATCH cutoff clearing the registry --
++# so "it never fired in my run" is not evidence about it.  These two levers turn
++# it into something that can be measured and something that can be forced:
++#
++#   CF_TREE_FORCE_STALE=1  every step takes it, so the degraded path can be run
++#                          against BASE over a whole 7-domain sweep.
++#   CF_TREE_FALLBACK_LOG=1 count the steps that took it, printed at exit and
++#                          every 2000 spec steps.
++#
++# Both are diagnostics.  Neither is read on a step that is not already speculative.
++FORCE_STALE = os.environ.get("CF_TREE_FORCE_STALE", "0") == "1"
++FALLBACK_LOG = os.environ.get("CF_TREE_FALLBACK_LOG", "0") == "1"
++
++#: spec_steps / stale_rows / steps_with_any_stale / steps_ALL_stale (the last is
++#: the one that used to be fatal under narrowing: no request carries a real tree,
++#: so `TreeStep.branching` is False and the GDN layer left the tree kernels).
++FALLBACK_COUNTS = {
++    "spec_steps": 0,
++    "stale_rows": 0,
++    "steps_any_stale": 0,
++    "steps_all_stale": 0,
++}
++
++
++def note_spec_step(stale_rows: int, spec_rows: int) -> None:
++    """Called once per speculative step from `_prepare_inputs`.  No-op unless asked."""
++    if not FALLBACK_LOG:
++        return
++    c = FALLBACK_COUNTS
++    c["spec_steps"] += 1
++    c["stale_rows"] += stale_rows
++    if stale_rows:
++        c["steps_any_stale"] += 1
++        if stale_rows == spec_rows:
++            c["steps_all_stale"] += 1
++        # The FIRST few are the whole answer to "is this reachable at all", and a
++        # server is killed by SIGTERM, so waiting for a periodic print or for atexit
++        # is how a rare-but-real event gets reported as "never happened".
++        if c["steps_any_stale"] <= 5 or c["steps_all_stale"] in (1, 2, 3):
++            print(
++                f"[cf-tree-fallback] STALE STEP: {stale_rows}/{spec_rows} spec rows had no "
++                f"registered tree (step {c['spec_steps']}); "
++                f"{'ALL rows -> TreeStep.branching would be False' if stale_rows == spec_rows else 'partial, branching survives'}",
++                flush=True,
++            )
++    if c["spec_steps"] % 500 == 0:
++        print(f"[cf-tree-fallback] {fallback_summary()}", flush=True)
++
++
++def fallback_summary() -> str:
++    c = FALLBACK_COUNTS
++    n = max(c["spec_steps"], 1)
++    return (
++        f"spec steps {c['spec_steps']} | stale rows {c['stale_rows']} | steps with any "
++        f"stale row {c['steps_any_stale']} ({100 * c['steps_any_stale'] / n:.3f}%) | "
++        f"steps where EVERY row is stale {c['steps_all_stale']} "
++        f"({100 * c['steps_all_stale'] / n:.3f}%)"
++    )
++
++
++if FALLBACK_LOG:
++    import atexit as _atexit
++
++    # Banner at import, so "no output" can never be read as "no stale steps" when what
++    # actually happened is that the flag did not reach the engine-core process.
++    print(
++        "[cf-tree-fallback] accounting ENABLED in this process "
++        f"(force_stale={FORCE_STALE})",
++        flush=True,
++    )
++    _atexit.register(
++        lambda: print(f"[cf-tree-fallback] FINAL {fallback_summary()}", flush=True)
++    )
 +
 +
 +# ---------------------------------------------------------------------------
@@ -1622,6 +1845,11 @@
 +    staging without synchronising, for the steps that end up taking this path.
 +    """
 +    global _GPU_TREE
++    if FORCE_STALE:
++        # The device hand-off bypasses the registry entirely, so forcing the
++        # fallback has to close this door too or nothing changes.
++        discard()
++        return
 +    _GPU_TREE = {
 +        "parents": parents,
 +        "req_ids": list(req_ids),
@@ -1702,6 +1930,8 @@
 +    decoding rollback).  If the tokens do not match what we registered, the tree
 +    shape is stale and the caller must fall back to chain semantics.
 +    """
++    if FORCE_STALE:
++        return None
 +    ent = _REGISTRY.get(str(req_id))
 +    if ent is None:
 +        return None
