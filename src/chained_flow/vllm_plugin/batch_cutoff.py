@@ -99,9 +99,22 @@ And if it were reachable, both disagreements are still safe:
 A request in flight when the cutoff engages is therefore never corrupted; it decodes without
 speculation for as long as the server is loaded, and resumes speculating when it is not.
 
-DEFAULT OFF.  Unlike the greedy guard -- which turns a crash into a 4xx and has no case where it
-is worse -- this one has a real trade: it gives up speculative speedup at concurrency, and the
-right N is a property of the deployment.  It ships off, with a measured N in the docs.
+DEFAULT ON, BUT ONLY WHERE THE THRESHOLD WAS MEASURED
+-----------------------------------------------------
+The flag shipped OFF while `_AUTO` had three entries and everything else was a guess.  It now has
+six -- every size x arm this project publishes a number for -- and leaving it off means the
+default deployment of a laddered combination is the 2.3x-slower one.  So `CF_SPEC_MAX_BATCH`
+unset now behaves as `auto`, WITH ONE DIFFERENCE THAT IS THE WHOLE POINT: a combination that is
+not in `_AUTO` resolves to 0 and speculation stays on at every batch, with the reason printed.
+
+That asymmetry is deliberate.  `auto` asked for explicitly still takes the derived branch, because
+someone who typed it asked for a best guess.  The DEFAULT must not: a derived N that is too low
+silently costs speedup and nothing in the throughput number says so -- exactly what the two
+27B-tree points (1.85x at concurrency 1, 1.55x at 2, against a derived N of 2) demonstrated
+before that combination was laddered.  A wrong guess nobody opted into is worse than no cutoff.
+
+`CF_SPEC_MAX_BATCH=0` (or `off`) turns it off; a number sets N directly; `auto` is the old
+guess-allowed behaviour.
 """
 from __future__ import annotations
 
@@ -156,6 +169,28 @@ _AUTO = {
     # 139.0 / 256.8 / ~378 (interpolated) / 498.8 -> 1.35x / 1.04x / 0.93x / 0.85x.  N=2 keeps
     # the point that is still above parity and drops the first one that is not.
     (2560, 41): (2, "measured: 4B tree (1.35x at batch 1, 1.04x at 2, 0.93x at 3)"),
+    # 27B tree, `27b_tree_lad` vs `27b_base_lad`, laddered at nominal concurrency 1/2/4/8:
+    # 48.7 / 79.1 / 107.8 / 107.2 tok/s against 26.3 / 51.0* / 100.2 / 190.8 -> 1.85x / 1.55x /
+    # 1.08x / 0.56x.  The width rule DERIVED 2; the measurement says 3, and that extra batch is
+    # worth the 1.08x the derived value would have thrown away.
+    #
+    # N IS 3 AND NOT 4, AND THE DIFFERENCE IS THE WHOLE REASON THIS TABLE SAYS "DECODE BATCH"
+    # RATHER THAN "CONCURRENCY".  `CF_BATCH_AUDIT` on this run: the decode-batch histogram is
+    # {1: 4251, 2: 2636, 3: 6613} -- B NEVER REACHES 4, at any offered load, because a 27B tree
+    # engine gets 27,185 KV tokens and cannot admit a fourth request.  So nominal concurrency 4
+    # ran at a decode batch of 3, and batch 4 was never measured; recording 4 would be recording
+    # a number this ladder did not produce.  Batches 1, 2 and 3 are all above parity, so on this
+    # engine the cutoff correctly never fires.
+    #
+    # The 0.56x at nominal 8 is NOT a decode-batch crossing and must not be read as one: the B
+    # histogram there is the same {1,2,3} and TTFT is 11.6 s.  That is the admission queue, i.e.
+    # the `--speculative-config` KV reservation (docs/BENCHMARKING.md), and no decode-batch
+    # threshold can address it -- cutting speculation at a batch of 3 would only remove the 2.50
+    # acceptance that is currently carrying those three requests.
+    #
+    # * base at concurrency 2 is from the earlier `27b_base` run; `27b_base_lad` has no c=2.
+    (5120, 41): (3, "measured: 27B tree (1.85x at batch 1, 1.55x at 2, 1.08x at 3; batch >= 4 "
+                    "unreachable -- a 27k-token KV caps this engine's decode batch at 3)"),
 }
 
 #: The width rule, for a `(size, K+1)` that was never laddered: the crossing sits at a roughly
@@ -166,11 +201,22 @@ _AUTO = {
 _WIDTH_AT_CROSSING = ((3072, 24, "4B"), (4608, 48, "9B, itself interpolated"), (1 << 30, 96, "27B"))
 
 
-def auto_for(hidden_size: int, k_plus_1: int = 6) -> tuple[int, str]:
-    """`(N, why)` for a target of this hidden size running an arm of this verify width."""
+def auto_for(hidden_size: int, k_plus_1: int = 6,
+             measured_only: bool = False) -> tuple[int, str]:
+    """`(N, why)` for a target of this hidden size running an arm of this verify width.
+
+    `measured_only` is what makes the DEFAULT safe to turn on: it refuses to guess, returning
+    `(0, why)` -- no cutoff at all -- for a combination nobody laddered.  See `resolve()`.
+    """
     hit = _AUTO.get((int(hidden_size), int(k_plus_1)))
     if hit:
         return hit
+    if measured_only:
+        return 0, (f"NOT MEASURED for hidden_size={hidden_size} at verify width {k_plus_1}, and "
+                   f"the default only engages a MEASURED threshold -- speculation stays ON at "
+                   f"every batch. A derived N that is too low silently costs speedup, so it is "
+                   f"not something to opt into by accident. Set {_FLAG}=auto for the derived "
+                   f"guess, or {_FLAG}=<n> for one you measured yourself")
     for hi, width, label in _WIDTH_AT_CROSSING:
         if hidden_size <= hi:
             n = max(1, width // max(int(k_plus_1), 1))
@@ -185,44 +231,83 @@ def auto_for(hidden_size: int, k_plus_1: int = 6) -> tuple[int, str]:
 _RESOLVED: int = 0
 
 
-def set_resolved(n: int, why: str) -> None:
-    global _RESOLVED
-    _RESOLVED = max(int(n), 0)
-    print(f"[cf-plugin] {_FLAG}=auto resolved to {_RESOLVED} ({why}). Speculation is off above a "
-          f"decode batch of {_RESOLVED}; at or below it nothing changes.", flush=True)
+#: Words that mean "off".  `0` is one of them and has to stay one: before the default flipped,
+#: `CF_SPEC_MAX_BATCH=0` was already the way to say "no cutoff", and anything that had it pinned
+#: off must keep reading off rather than silently acquire a threshold.
+_OFF_WORDS = ("0", "off", "no", "none", "false", "disable", "disabled")
 
 
-def max_batch() -> int:
-    """The configured cutoff, or 0 for "no cutoff".
+def _mode() -> str:
+    """`off` | `fixed` | `auto` | `default`.
 
     Read from the environment on every call rather than cached: this module is imported by the
     API-server process and the engine-core process independently, and the value has to be the
     same fact in both.  It is a couple of dict lookups on a path that already does far more.
 
-    `auto` reads 0 until the proposer's lazy `_build()` resolves it, which is correct rather than
-    merely tolerable: `_build()` runs inside the FIRST `propose()`, so the only steps that can
-    precede it are the first few of the first request -- a decode batch of 1, which no threshold
-    in the table would have cut anyway.
+    A value that parses as nothing at all reads `off`, not `default`: an engine must never
+    acquire a behaviour because someone typo'd the flag that was meant to configure it.
     """
     v = (os.environ.get(_FLAG, "") or "").strip().lower()
+    if not v:
+        return "default"
     if v == "auto":
-        return _RESOLVED
+        return "auto"
+    if v in _OFF_WORDS:
+        return "off"
     try:
-        n = int(v or 0)
+        return "fixed" if int(v) > 0 else "off"
     except ValueError:
-        return 0
-    return n if n > 0 else 0
+        return "off"
+
+
+def resolve(hidden_size: int, k_plus_1: int) -> tuple[int, str]:
+    """`(N, why)` for THIS engine under the mode actually in force.
+
+    The one place the default's extra rule lives: `auto` typed by a human may guess, the default
+    may not.  `_build()` calls this and nothing else, so the two cannot drift apart.
+    """
+    return auto_for(hidden_size, k_plus_1, measured_only=_mode() == "default")
+
+
+def set_resolved(n: int, why: str) -> None:
+    global _RESOLVED
+    _RESOLVED = max(int(n), 0)
+    how = "unset -> default" if _mode() == "default" else f"{_FLAG}=auto"
+    if _RESOLVED:
+        print(f"[cf-plugin] {_FLAG} ({how}) resolved to {_RESOLVED} ({why}). Speculation is off "
+              f"above a decode batch of {_RESOLVED}; at or below it nothing changes.", flush=True)
+    else:
+        print(f"[cf-plugin] {_FLAG} ({how}) resolved to NO CUTOFF: {why}.", flush=True)
+
+
+def max_batch() -> int:
+    """The configured cutoff, or 0 for "no cutoff".
+
+    `auto` and the default read 0 until the proposer's lazy `_build()` resolves it, which is
+    correct rather than merely tolerable: `_build()` runs inside the FIRST `propose()`, so the
+    only steps that can precede it are the first few of the first request -- a decode batch of 1,
+    which no threshold in the table would have cut anyway.
+    """
+    m = _mode()
+    if m in ("auto", "default"):
+        return _RESOLVED
+    if m == "fixed":
+        return int((os.environ.get(_FLAG, "") or "").strip())
+    return 0
 
 
 def requested() -> bool:
-    """Was a cutoff ASKED FOR, whatever it resolves to?
+    """Is a cutoff IN FORCE, whatever it resolves to?
 
-    Distinct from `max_batch() > 0` and the difference is load-bearing: under `auto` the value is
-    0 until `_build()` resolves it, and `install()` runs long before that.  Keying the scheduler
-    patch on the resolved number would silently install nothing.
+    Distinct from `max_batch() > 0` and the difference is load-bearing: under `auto` (and under
+    the default) the value is 0 until `_build()` resolves it, and `install()` runs long before
+    that.  Keying the scheduler patch on the resolved number would silently install nothing.
+
+    True by default.  A non-speculative engine never calls `_build()`, so `_RESOLVED` stays 0 and
+    the installed patch never cuts anything -- the scheduler wrapper is inert, not merely
+    harmless.
     """
-    v = (os.environ.get(_FLAG, "") or "").strip().lower()
-    return v == "auto" or max_batch() > 0
+    return _mode() != "off"
 
 
 def half() -> str:
@@ -263,7 +348,8 @@ def install() -> None:
     if INSTALLED:
         return
     if not requested():
-        REASON = f"{_FLAG} unset (no cutoff; speculation stays on at every batch)"
+        REASON = (f"{_FLAG}={(os.environ.get(_FLAG, '') or '').strip()} -- turned off explicitly; "
+                  f"speculation stays on at every batch")
         return
     if not scheduler_half():
         REASON = (f"{_HALF}={half()} -- MEASUREMENT ONLY: the target will keep verifying a full "
@@ -295,12 +381,16 @@ def install() -> None:
     AsyncScheduler._update_after_schedule = _update_after_schedule  # type: ignore[assignment]
     INSTALLED = True
     REASON = ""
-    asked = (os.environ.get(_FLAG, "") or "").strip().lower()
+    m = _mode()
+    asked = (os.environ.get(_FLAG, "") or "").strip().lower() or f"unset -> {m}"
     print(f"[cf-plugin] batch cutoff INSTALLED: {_FLAG}={asked} -- a scheduler step with more "
           f"than N requests schedules NO speculative tokens for the next step, and the drafter "
           f"does not run."
-          + (" N is resolved from the target's size when the drafter is built."
-             if asked == "auto" else f" N={max_batch()}."), flush=True)
+          + (f" N={max_batch()}." if m == "fixed" else
+             " N is resolved from the target's size and the arm's verify width when the drafter "
+             "is built, and a combination with no measured ladder resolves to NO CUTOFF."
+             if m == "default" else
+             " N is resolved from the target's size when the drafter is built."), flush=True)
 
 
 def status() -> str:

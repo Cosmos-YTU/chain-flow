@@ -131,14 +131,31 @@ def register() -> None:
         print(f"[cf-plugin] greedy guard not installed ({e!r})", flush=True)
 
     # Also independent of the async relaxation, and for the same reason -- it patches the
-    # SCHEDULER, which exists on stock vLLM and on the fork alike, and it is a no-op unless
-    # CF_SPEC_MAX_BATCH is set. Default OFF; see batch_cutoff.install().
+    # SCHEDULER, which exists on stock vLLM and on the fork alike. Default ON, but only where a
+    # threshold was actually laddered, and inert in any engine that never builds a drafter --
+    # `_RESOLVED` stays 0 and the wrapper cuts nothing. See batch_cutoff.install().
     try:
         from chained_flow.vllm_plugin import batch_cutoff
 
         batch_cutoff.install()
     except Exception as e:                                  # noqa: BLE001 - advisory only
         print(f"[cf-plugin] batch cutoff not installed ({e!r})", flush=True)
+
+    # MEASUREMENT ONLY, default off. `CF_VPROF=1` was reachable only from the offline harness
+    # (`vllm/test_plugin_native.py` calls `vprof.install()` itself), so the step breakdown could
+    # not be taken on the path whose numbers this project actually reports -- `vllm serve` at a
+    # real decode batch. This is the same install, from the plugin entry point, so it lands in
+    # the ENGINE CORE process. Pair it with `CF_VPROF_EVERY=N`: atexit does not run there.
+    if _truthy(os.environ.get("CF_VPROF")):
+        try:
+            from chained_flow.vllm_plugin import vprof
+
+            vprof.install()
+            if _truthy(os.environ.get("CF_SYNCDBG")):
+                vprof.install_sync_debug()
+            print("[cf-plugin] CF_VPROF: step profiler installed in this process", flush=True)
+        except Exception as e:                              # noqa: BLE001 - advisory only
+            print(f"[cf-plugin] CF_VPROF not installed ({e!r})", flush=True)
 
     if _truthy(os.environ.get(_DISABLE)):
         REASON = f"{_DISABLE} is set"

@@ -75,8 +75,75 @@ def test_auto_is_inert_until_the_drafter_resolves_it(monkeypatch):
     assert batch_cutoff.should_cut(4) is False and batch_cutoff.should_cut(5) is True
 
 
-def test_unset_installs_nothing(monkeypatch):
+@pytest.mark.parametrize("val,mode", [
+    (None, "default"), ("", "default"),
+    ("auto", "auto"), ("AUTO", "auto"),
+    ("0", "off"), ("off", "off"), ("none", "off"), ("-3", "off"),
+    ("not-a-number", "off"),                 # a typo must not confer a behaviour
+    ("8", "fixed"),
+])
+def test_mode(monkeypatch, val, mode):
+    if val is None:
+        monkeypatch.delenv("CF_SPEC_MAX_BATCH", raising=False)
+    else:
+        monkeypatch.setenv("CF_SPEC_MAX_BATCH", val)
+    assert batch_cutoff._mode() == mode
+
+
+def test_zero_still_means_off_after_the_default_flipped(monkeypatch):
+    """`CF_SPEC_MAX_BATCH=0` was the way to say "no cutoff" while the flag shipped OFF. Anything
+    that has it pinned must keep reading off rather than silently acquire a threshold."""
+    monkeypatch.setenv("CF_SPEC_MAX_BATCH", "0")
+    monkeypatch.setattr(batch_cutoff, "_RESOLVED", 16)
+    assert batch_cutoff.requested() is False
+    assert batch_cutoff.max_batch() == 0
+    assert batch_cutoff.should_cut(9999) is False
+
+
+@pytest.mark.parametrize("hidden,width", [
+    (2560, 6), (2560, 41), (4096, 6), (4096, 41), (5120, 6), (5120, 41),
+])
+def test_the_default_engages_exactly_the_laddered_combinations(monkeypatch, hidden, width):
+    """DEFAULT ON is only defensible because it cannot guess. Every combination this project
+    publishes a number for is laddered and resolves to its measured N; the assertion that keeps
+    the two in step is that `resolve()` under the default returns a MEASURED threshold or none."""
     monkeypatch.delenv("CF_SPEC_MAX_BATCH", raising=False)
+    n, why = batch_cutoff.resolve(hidden, width)
+    assert n > 0 and "measured" in why, why
+    assert batch_cutoff.auto_for(hidden, width)[0] == n      # explicit `auto` agrees
+
+
+def test_the_default_refuses_to_guess_but_auto_still_guesses(monkeypatch):
+    """The asymmetry is the whole design: `auto` typed by a human asked for a best guess, the
+    default did not. A derived N that is too low silently costs speedup -- measured: the derived
+    N=2 for 27B tree was still leaving 1.55x on the table at concurrency 2."""
+    unladdered = (3584, 6)                                   # no such target here
+    monkeypatch.delenv("CF_SPEC_MAX_BATCH", raising=False)
+    n, why = batch_cutoff.resolve(*unladdered)
+    assert n == 0 and "NOT MEASURED" in why
+    batch_cutoff.set_resolved(n, why)
+    assert batch_cutoff.max_batch() == 0
+    assert batch_cutoff.should_cut(9999) is False            # speculation stays on everywhere
+
+    monkeypatch.setenv("CF_SPEC_MAX_BATCH", "auto")
+    n_auto, why_auto = batch_cutoff.resolve(*unladdered)
+    assert n_auto >= 1 and "DERIVED" in why_auto
+
+
+def test_no_measured_threshold_can_touch_batch_1(monkeypatch):
+    """The headline metric this project is judged on is batch 1, and the default now engages the
+    cutoff without anyone asking. Every entry must therefore be >= 1, so that `should_cut(1)` is
+    False by the inclusive-N rule -- not as a matter of the numbers happening to be large, but
+    checked against the table as it stands."""
+    monkeypatch.delenv("CF_SPEC_MAX_BATCH", raising=False)
+    for (hidden, width), (n, why) in batch_cutoff._AUTO.items():
+        assert n >= 1, f"({hidden}, {width}) -> {n}: would disable speculation at batch 1"
+        monkeypatch.setattr(batch_cutoff, "_RESOLVED", n)
+        assert batch_cutoff.should_cut(1) is False, f"({hidden}, {width}) cuts at batch 1"
+
+
+def test_off_installs_nothing(monkeypatch):
+    monkeypatch.setenv("CF_SPEC_MAX_BATCH", "off")
     monkeypatch.setattr(batch_cutoff, "INSTALLED", False)
     batch_cutoff.install()
     assert not batch_cutoff.INSTALLED, batch_cutoff.status()

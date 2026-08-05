@@ -11,6 +11,15 @@ The ratio is the whole point and it is the thing that has been got wrong here be
 table refuses to compute one when the two arms did not run the same number of requests at that
 concurrency -- a ladder level driven with a different request count is a different measurement,
 not a comparable one.
+
+IT ALSO REPORTS THE LARGEST DECODE BATCH EACH ARM ACTUALLY REACHED, because "concurrency" in
+this table is OFFERED LOAD and the thing `CF_SPEC_MAX_BATCH` thresholds is the DECODE BATCH, and
+on a spec engine the two come apart badly.  Measured: the 27B tree arm run at nominal concurrency
+8 had the same decode-batch histogram as at nominal 4 -- {1, 2, 3}, never a 4 -- because
+`--speculative-config` had left it 27,185 KV tokens and it could not admit a fourth request.  Its
+0.56x at nominal 8 is therefore the admission queue, not a batch-size crossing, and reading a
+threshold off the concurrency column would have recorded a batch-4 measurement that never
+happened.  Needs `CF_BATCH_AUDIT=1` on the run; silent when the arm has no audit.
 """
 from __future__ import annotations
 
@@ -36,6 +45,22 @@ def load(size: str, tag: str) -> dict[int, dict]:
         for p in j.get("phases", []):
             out[int(p["concurrency"])] = p
     return out
+
+
+def max_decode_batch(size: str, tag: str) -> int | None:
+    """The largest decode batch the engine ever ran, from `CF_BATCH_AUDIT`'s cumulative histogram.
+
+    `serve_ladder.sh` saves the last 20 audit lines; each is cumulative over the whole ladder, so
+    the last one covers every level.  None when the run had no audit.
+    """
+    import re
+    p = os.path.join(ROOT, f"{size}_{tag}", "batch_audit.txt")
+    if not os.path.exists(p):
+        return None
+    hist = re.findall(r"decode batch B hist \{([^}]*)\}", open(p).read())
+    if not hist:
+        return None
+    return max(int(kv.split(":")[0]) for kv in hist[-1].split(",") if ":" in kv)
 
 
 def main() -> int:
@@ -70,6 +95,19 @@ def main() -> int:
                     cell += f" {p['tps'] / b['tps']:.2f}x"
             row += f"{cell:>{w}}"
         print(row)
+
+    top = max(concs) if concs else 0
+    seen = {t: max_decode_batch(size, t) for t in tags}
+    if any(v is not None for v in seen.values()):
+        print(f"\n{'max B':>5} " + "".join(
+            f"{('-' if seen[t] is None else str(seen[t])):>{w}}" for t in tags))
+        print("  largest decode batch the engine actually reached (CF_BATCH_AUDIT). Where this "
+              "is\n  below the top concurrency the arm could not admit that many requests, so "
+              "those\n  levels measured the ADMISSION QUEUE -- read no batch threshold off them.")
+        for t in tags:
+            b = seen[t]
+            if b is not None and b < top:
+                print(f"    {t}: reached only B={b} against a ladder to {top}")
     return 0
 
 

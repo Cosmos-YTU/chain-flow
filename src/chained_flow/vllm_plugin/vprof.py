@@ -25,6 +25,14 @@ import os
 # Warmup steps to DISCARD.  The first steps carry vLLM's own cudagraph capture and our
 # draft capture; a cumulative mean over them decays like 1/n and hides the steady state.
 _SKIP = int(os.environ.get("CF_VPROF_SKIP", "60"))
+#: CF_VPROF_EVERY=N: also dump the report every N steps, not only at exit.
+#:
+#: `report()` is registered with `atexit`, which is enough for the offline `LLM()` harness --
+#: that process ends by returning from `main()`.  Under `vllm serve` the profiled process is the
+#: ENGINE CORE, which is torn down by a signal, so atexit is the one thing that does not run and
+#: a serve profile would produce no output at all.  Reporting on a step count instead of a timer
+#: keeps it off the clock: a step that does not cross the boundary pays one integer compare.
+_EVERY = int(os.environ.get("CF_VPROF_EVERY", "0"))
 _STEP = [0]
 _WALL = [0.0, 0.0]   # [t of first counted step, t of last counted step]
 
@@ -74,6 +82,8 @@ def _wrap(obj, name, label):
                     _T.clear(); _N.clear(); _GT.clear(); _GN.clear()
                     _WALL[0] = time.perf_counter()
                 _WALL[1] = time.perf_counter()
+                if _EVERY and _STEP[0] > _SKIP and _STEP[0] % _EVERY == 0:
+                    report(force_drain=False)
             t0 = time.perf_counter()
             _STACK.append([label, 0.0])
             s.record()
@@ -99,6 +109,8 @@ def _wrap(obj, name, label):
                 _N.clear()
                 _WALL[0] = time.perf_counter()
             _WALL[1] = time.perf_counter()
+            if _EVERY and _STEP[0] > _SKIP and _STEP[0] % _EVERY == 0:
+                report(force_drain=False)
         t0 = time.perf_counter()
         _STACK.append([label, 0.0])
         try:
@@ -185,7 +197,14 @@ def install_sync_debug() -> None:
     _a.register(rep)
 
 
-def report() -> None:
+def report(force_drain: bool = True) -> None:
+    """`force_drain=False` for the mid-run `CF_VPROF_EVERY` dump.
+
+    Forcing the drain calls `Event.synchronize()` on the events still in flight, which is
+    exactly the host block this profiler exists to find -- harmless at exit, and a measurement
+    artefact if it happens every N steps inside a live server.  The unforced drain leaves the
+    last `_LAG` events pending; against a cumulative n in the thousands that is noise.
+    """
     n = max(_N.get("1.execute_model", 0), 1)
     step = (_WALL[1] - _WALL[0]) / max(n - 1, 1) * 1000 if _WALL[0] else float("nan")
     print(f"\n[cf-vprof] HOST ms per execute_model (n={n}, first {_SKIP} steps discarded) "
@@ -193,7 +212,7 @@ def report() -> None:
     print(f"[cf-vprof]   >>> WALL ms per engine step: {step:.3f} <<<")
     if _CUDA:
         for k in sorted(_PEND):
-            _drain(k, force=True)
+            _drain(k, force=force_drain)
         for k in sorted(_GT):
             print(f"[cf-vprof]   GPU-span {k:28s} {_GT[k] / max(_GN[k], 1):7.3f} ms"
                   f"  (n={_GN[k]})")

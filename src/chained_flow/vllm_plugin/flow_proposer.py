@@ -501,10 +501,10 @@ class FlowDrafterProposer:
         self._audit = os.environ.get("CF_BATCH_AUDIT", "0") == "1"
         self._audit_t = {"steps": 0, "bucket": {}, "B": {}, "nocg": 0, "pre_hit": 0,
                          "cut": 0, "drafted": 0}
-        # CF_SPEC_MAX_BATCH (DEFAULT OFF): stop drafting above a decode batch. The half of the
-        # cutoff that saves the DRAFT; `vllm_plugin.batch_cutoff` patches the scheduler, which is
-        # the half that saves the VERIFY. See that module for why both are needed and why a skip
-        # must return a full-width tensor rather than a short one.
+        # CF_SPEC_MAX_BATCH (DEFAULT ON where the threshold was MEASURED): stop drafting above a
+        # decode batch. The half of the cutoff that saves the DRAFT; `vllm_plugin.batch_cutoff`
+        # patches the scheduler, which is the half that saves the VERIFY. See that module for why
+        # both are needed and why a skip must return a full-width tensor rather than a short one.
         # `requested()`, not `max_batch()`: under CF_SPEC_MAX_BATCH=auto the NUMBER is not known
         # until `_build()` has the target's hidden size, and this runs before that. Latching a 0
         # here would leave the drafter half permanently off while the scheduler half was on --
@@ -792,17 +792,20 @@ class FlowDrafterProposer:
         _cfd.print_summary()
         from chained_flow.vllm_plugin import batch_cutoff as _cf_cut2
         if _cf_cut2.requested():
-            # RESOLVE `auto` HERE, and only here: this is the first moment the target's hidden
-            # size is known, and both halves of the cutoff read the resolved number out of the
-            # module (scheduler and proposer are the same process, the engine core).
-            if (os.environ.get("CF_SPEC_MAX_BATCH", "") or "").strip().lower() == "auto":
+            # RESOLVE the threshold HERE, and only here: this is the first moment the target's
+            # hidden size is known, and both halves of the cutoff read the resolved number out of
+            # the module (scheduler and proposer are the same process, the engine core).
+            # This covers BOTH `=auto` and the unset default -- `batch_cutoff.resolve()` is what
+            # knows the difference (the default refuses to guess for an unladdered combination
+            # and resolves to no cutoff at all), so there is no mode test on this side to drift.
+            if _cf_cut2._mode() in ("auto", "default"):
                 _h = int(getattr(self, "target_hidden", 0) or 0)
                 # `draft_width + 1` is the number of query positions the scheduler hands the
                 # target per request per step -- 6 for a chain, 42 for the 8x5 tree -- and it is
                 # the second axis of the threshold, not a detail. Read off the built proposer,
                 # not off CF_K, so a tree that silently fell back to a chain is keyed correctly.
                 _w = int(getattr(self, "draft_width", 0) or 0) + 1
-                _n, _why = (_cf_cut2.auto_for(_h, _w) if _h
+                _n, _why = (_cf_cut2.resolve(_h, _w) if _h
                             else (0, "target hidden size unavailable"))
                 _cf_cut2.set_resolved(_n, f"{_why}; hidden_size={_h}, verify width={_w}")
             # Both halves, on one line, from STATE.  The proposer half is this object; the

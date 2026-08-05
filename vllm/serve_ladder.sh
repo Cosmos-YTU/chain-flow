@@ -68,6 +68,17 @@ ASYNC_ARG=(--async-scheduling)
 CG_ARG=()
 [ -n "${CF_CGMODE:-}" ] && CG_ARG=(--compilation-config "{\"cudagraph_mode\":\"$CF_CGMODE\"}")
 
+# CF_KVBLOCKS: `--num-gpu-blocks-override`. ATTRIBUTION ONLY, not a shipping knob.
+# `--speculative-config` shrinks the KV cache an engine gets at the same
+# `--gpu-memory-utilization` (4B: 1,112,818 -> 600,425 -> 117,537 tokens), so a base-vs-spec
+# ladder compares a BIGGER engine against a SMALLER one and calls the difference "speculation".
+# This gives the base arm the spec arm's block count so the two are like-for-like, and any
+# remaining gap is speculation itself. Tokens = blocks x the attention block size in the startup
+# log, which is NOT the same across arms (4B: 528 base / 544 chain / 688 tree), so the block
+# count that matches a token count has to be computed per arm.
+KVB_ARG=()
+[ -n "${CF_KVBLOCKS:-}" ] && KVB_ARG=(--num-gpu-blocks-override "$CF_KVBLOCKS")
+
 # WAIT FOR THE GPU TO BE EMPTY BEFORE PROFILING.  vLLM sizes the KV cache as
 # `gpu_memory_utilization * TOTAL - (everything already resident)`, so starting an arm while the
 # previous arm's engine is still tearing down does not slow it down, it SILENTLY SHRINKS ITS KV
@@ -102,6 +113,7 @@ env | grep -E "^CF_(SPEC_MAX_BATCH|COMPILE|BATCH_AUDIT|LADDER)" | sed 's/^/[ladd
   --max-num-seqs "${CF_MAXSEQS:-64}" \
   "${ASYNC_ARG[@]}" \
   "${CG_ARG[@]}" \
+  "${KVB_ARG[@]}" \
   "${SPEC_ARGS[@]}" \
   > "$SERVER_LOG" 2>&1 &
 SERVE_PID=$!
@@ -148,13 +160,25 @@ fi
 
 # CF_LADDER = "1:70,4:120,16:256,32:256,64:320"
 LADDER=${CF_LADDER:-1:70,4:120,16:256,32:256,64:320}
+: > "$OUT/running.txt"
 for lvl in ${LADDER//,/ }; do
   C=${lvl%%:*}; N=${lvl##*:}
+  # THE DECODE BATCH THE ENGINE ACTUALLY RAN, per level. "concurrency 64" is a property of the
+  # CLIENT; if the engine can only admit 15 requests the other 49 are queued and the level
+  # measures the admission queue. vLLM already logs `Running: R reqs, Waiting: W reqs` every few
+  # seconds -- slicing the log by level is the only thing needed to attribute it, and unlike
+  # CF_BATCH_AUDIT it works on the BASE arm, which has no proposer to audit.
+  MARK=$(wc -l < "$SERVER_LOG")
   "$CF_PY" $ROOT/vllm/bench_serve_drive.py \
     --base "http://localhost:${PORT}" --model "$CF_MODEL" \
     --concurrency "$C" --requests "$N" \
     --max-tokens "${CF_MAXTOK:-256}" --temperature "${CF_TEMP:-0}" \
     -o "$OUT/c${C}.json" 2>&1 | tee -a "$OUT/drive.log"
+  { echo "--- c=$C"
+    tail -n +"$MARK" "$SERVER_LOG" |
+      grep -oE "Running: [0-9]+ reqs, Waiting: [0-9]+ reqs, GPU KV cache usage: [0-9.]+%" |
+      sort | uniq -c | sort -rn
+  } >> "$OUT/running.txt"
 done
 
 grep -o "\[cf-batch-audit\].*" "$SERVER_LOG" | tail -20 > "$OUT/batch_audit.txt"

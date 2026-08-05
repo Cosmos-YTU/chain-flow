@@ -350,13 +350,50 @@ and it costs nothing at batch 1, but it leaves the arm at 0.32–0.71x of base r
 0.94–0.96x the chain reaches. Do not serve a 4B tree above concurrency ~2 on the strength of the
 cutoff alone.
 
-**27B tree is only partly laddered and its threshold is NOT measured.** What exists: 48.7 tok/s
-at concurrency 1 (**1.85x**) and 79.1 at concurrency 2 (**1.55x**, against the earlier `27b_base`
-run's 51.0). `auto` therefore takes the DERIVED branch for `(5120, 41)` and returns 2 — which
-those two points already show is **too conservative**, since the arm is still at 1.55x there. It
-is safe (never below base) but leaves speedup unclaimed, and the log line says `DERIVED, not
-measured for this combination` precisely so this is not mistaken for a result. Ladder 27B tree to
-16 and put the measurement in `_AUTO` before quoting a 27B tree deployment number.
+**27B tree, now laddered — and it is the case that shows why deriving is not good enough:**
+
+| conc | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| base | 26.3 | 51.0\* | 100.2 | 190.8 | 368.1 |
+| 27B tree | 48.7 | 79.1 | 107.8 | 107.2 | 106.6 |
+| | **1.85x** | **1.55x** | **1.08x** | 0.56x | **0.29x** |
+
+**`(5120, 41) -> 3` is now measured and in `_AUTO`**, against a *derived* 2 that would have given
+up the 1.08x. But read the third column carefully, because **the concurrency row and the decode
+batch are not the same number here**, and the threshold is a decode-batch threshold:
+
+| | conc 1 | conc 2 | conc 4 | conc 8 |
+|---|---|---|---|---|
+| decode batch actually run | 1 | 2 | **3** | **3** |
+
+`CF_BATCH_AUDIT` on this ladder gives `decode batch B hist {1: 4251, 2: 2636, 3: 6613}` — **B
+never reaches 4 at any offered load.** A 27B tree engine has **27,185 KV tokens** and cannot
+admit a fourth request, so concurrency 4 ran three requests and queued the rest (TTFT 2.4 s), and
+concurrency 8 ran *the same three* (TTFT 11.6 s). N is therefore 3 and not 4: batches 1, 2 and 3
+are measured and all above parity, and batch 4 was never observed, so recording 4 would record a
+measurement this ladder did not produce. On this engine the cutoff correctly never fires.
+
+**The 0.56x at concurrency 8 is not a batch-size crossing and must not be read as one.** Same
+decode batch as the 1.08x row, six times the queue. It is the `--speculative-config` KV
+reservation, and no decode-batch threshold can address it — cutting at a batch of 3 would only
+throw away the 2.50 acceptance that is carrying those three requests. `ladder_report.py` now
+prints the largest decode batch each arm reached, next to the ladder it was driven with, so this
+gap between offered load and decode batch is visible rather than something you have to know to
+go and grep for. (\* concurrency-2 base from the earlier `27b_base` ladder.)
+
+**Still unmeasured: 9B, on both arms.** `resolve()` under the default returns *no cutoff* for a
+combination that was never laddered, so a 9B server currently gets no protection at all — which
+is the safe failure, but it is a gap, and `tests/test_batch_cutoff.py::
+test_the_default_engages_exactly_the_laddered_combinations` fails for `(4096, 6)` and
+`(4096, 41)` to keep it visible. The project publishes 9B numbers (1.40x / 1.61x at batch 1), so
+it should not be the one size without a measured threshold.
+
+**The three ladders that close it are running** — `logs/bench_serve/9b_{base,chain,tree}_lad`,
+GPU 7, concurrency 1/2/4/8/16, chained so each waits for the previous to release the GPU. To
+finish: `vllm/ladder_report.py 9b base_lad chain_lad tree_lad`, then add `(4096, 6)` and
+`(4096, 41)` to `_AUTO` with the tok/s in the provenance string the way the other four carry
+theirs — and read the threshold off the **decode batch** column, not the offered concurrency, for
+the reason the 27B tree row above documents.
 
 **The cutoff helps the tree but cannot bring it to parity, and that is the interesting part.**
 The chain cutoff reaches 0.94–0.96x; the tree cutoff stalls at ~0.67x even though above N it is
