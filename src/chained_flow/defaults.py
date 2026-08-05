@@ -769,6 +769,28 @@ def _sh() -> str:
     for flag in _KEYS:
         if was_explicit(flag):
             continue
+        if flag == "CF_SHORTLIST":
+            # NEVER EXPORTED, and this is the one flag for which that matters.
+            #
+            # `CF_SHORTLIST` is a PATH whose resolution is deliberately deferred: only
+            # `FlowDrafterProposer._build()` knows the drafter dir AFTER the HF snapshot download
+            # and the target's real vocab size, so only it can prefer a checkpoint's own
+            # `shortlist.pt` and reject a list built for another vocabulary
+            # (`shortlist_candidates()`).  Exporting our *default* turns it into the caller's
+            # *request* in the child, and `apply()` treats an explicit CF_SHORTLIST as final: it
+            # skips the candidate search outright.
+            #
+            # Two things then quietly stop working.  A drafter checkpoint that ships its own
+            # shortlist -- documented as winning over ours -- is overridden by whatever path this
+            # process happened to resolve.  And in a source checkout the exported path is always
+            # `out/flow/shortlist_q3527b.pt`, so the PACKAGED list that every `pip install` user
+            # actually gets is never exercised by any benchmark in this repo, which is exactly the
+            # class of "the published number came from a path no pip user is on" this table exists
+            # to prevent.
+            #
+            # Nothing is lost by omitting it: the child imports `chained_flow`, runs `apply()`,
+            # and re-derives the same default in-process, with better information.
+            continue
         v = os.environ.get(flag)
         if v:
             out.append(f"export {flag}={v}")

@@ -499,7 +499,21 @@ class FlowDrafterProposer:
         # Host-side dict arithmetic once per step, no sync, no GPU work; still default off
         # because a benchmark should not pay for its own instrumentation unasked.
         self._audit = os.environ.get("CF_BATCH_AUDIT", "0") == "1"
-        self._audit_t = {"steps": 0, "bucket": {}, "B": {}, "nocg": 0, "pre_hit": 0}
+        self._audit_t = {"steps": 0, "bucket": {}, "B": {}, "nocg": 0, "pre_hit": 0,
+                         "cut": 0, "drafted": 0}
+        # CF_SPEC_MAX_BATCH (DEFAULT OFF): stop drafting above a decode batch. The half of the
+        # cutoff that saves the DRAFT; `vllm_plugin.batch_cutoff` patches the scheduler, which is
+        # the half that saves the VERIFY. See that module for why both are needed and why a skip
+        # must return a full-width tensor rather than a short one.
+        # `requested()`, not `max_batch()`: under CF_SPEC_MAX_BATCH=auto the NUMBER is not known
+        # until `_build()` has the target's hidden size, and this runs before that. Latching a 0
+        # here would leave the drafter half permanently off while the scheduler half was on --
+        # the exact half-configured state whose symptom is "the cutoff does not work".
+        from chained_flow.vllm_plugin import batch_cutoff as _cf_cut
+        self._cut_on = _cf_cut.requested() and _cf_cut.drafter_half()
+        # CF_WARM_BUCKETS (DEFAULT OFF): compile + capture the draft graph for every batch bucket
+        # at BUILD time instead of the first time each bucket is touched. See `_warm_buckets`.
+        self.warm_buckets = os.environ.get("CF_WARM_BUCKETS", "0") == "1"
         # CF_ASYNC_SPEC (default OFF): become GPU-token-native so vLLM's async scheduling
         # can be enabled for this proposer.  See `_install_async_hooks`.  Requires the
         # `_sample` hook, so it implies CF_DRAFT_EARLY.
@@ -569,6 +583,9 @@ class FlowDrafterProposer:
         lm_w = lm.weight
         self.dev, self.dtype = embed_w.device, embed_w.dtype
         H, V = embed_w.shape[1], embed_w.shape[0]
+        # Read off the LOADED embedding, not off a config: it is the one number here that cannot
+        # be stale or overridden. `CF_SPEC_MAX_BATCH=auto` keys its threshold on it.
+        self.target_hidden = int(H)
 
         class Emb:
             def __init__(s, w): s.w = w
@@ -773,6 +790,32 @@ class FlowDrafterProposer:
                   "Bit-exactness checks in this configuration must use CF_CUDA_BLOCK=0.",
                   flush=True)
         _cfd.print_summary()
+        from chained_flow.vllm_plugin import batch_cutoff as _cf_cut2
+        if _cf_cut2.requested():
+            # RESOLVE `auto` HERE, and only here: this is the first moment the target's hidden
+            # size is known, and both halves of the cutoff read the resolved number out of the
+            # module (scheduler and proposer are the same process, the engine core).
+            if (os.environ.get("CF_SPEC_MAX_BATCH", "") or "").strip().lower() == "auto":
+                _h = int(getattr(self, "target_hidden", 0) or 0)
+                # `draft_width + 1` is the number of query positions the scheduler hands the
+                # target per request per step -- 6 for a chain, 42 for the 8x5 tree -- and it is
+                # the second axis of the threshold, not a detail. Read off the built proposer,
+                # not off CF_K, so a tree that silently fell back to a chain is keyed correctly.
+                _w = int(getattr(self, "draft_width", 0) or 0) + 1
+                _n, _why = (_cf_cut2.auto_for(_h, _w) if _h
+                            else (0, "target hidden size unavailable"))
+                _cf_cut2.set_resolved(_n, f"{_why}; hidden_size={_h}, verify width={_w}")
+            # Both halves, on one line, from STATE.  The proposer half is this object; the
+            # scheduler half is a class patch installed by a different module, and "the drafter
+            # stopped but the target is still verifying zeros" is precisely the half-configured
+            # state that would read as "the cutoff does not work" -- so it says which halves are
+            # live rather than which flag was set.
+            _n = _cf_cut2.max_batch()
+            print(f"[chained-flow] CF_SPEC_MAX_BATCH: drafter "
+                  f"{'skips any decode batch > ' + str(_n) if (self._cut_on and _n) else 'HALF OFF'}"
+                  f" | scheduler cutoff {_cf_cut2.status()}", flush=True)
+        if self.warm_buckets:
+            self._warm_buckets()
 
     # ================= GPU-resident context ring (replaces the per-request dict) =========
     #
@@ -1315,28 +1358,124 @@ class FlowDrafterProposer:
         for k, v in agg.most_common(14):
             print(f"[cf-draftprof]   {v:8.1f} us  x{cnt[k]:5.1f}  {k[:70]}", flush=True)
 
-    def _audit_step(self, bucket: int, B: int) -> None:
+    def _audit_step(self, bucket: int, B: int, drafted: bool = True) -> None:
         """CF_BATCH_AUDIT: record the batch this step's draft actually ran at, and say what
         that implies for the batch-1-gated flags.  Printed periodically because a server has
-        no exit to report at."""
+        no exit to report at.
+
+        `drafted=False` is a step `CF_SPEC_MAX_BATCH` skipped.  Its BATCH is still recorded --
+        that is the histogram the cutoff has to be judged against -- but it must NOT count
+        toward the bucket/kernel tallies, because on that step no draft ran at all: folding it
+        in would have the report claim the fused kernel "fell back to the PyTorch block stack"
+        on steps where the PyTorch block stack did not run either.
+        """
         t = self._audit_t
         t["steps"] += 1
-        t["bucket"][bucket] = t["bucket"].get(bucket, 0) + 1
         t["B"][B] = t["B"].get(B, 0) + 1
-        if bucket not in self._buckets:
-            t["nocg"] += 1
+        if drafted:
+            t["drafted"] += 1
+            t["bucket"][bucket] = t["bucket"].get(bucket, 0) + 1
+            if bucket not in self._buckets:
+                t["nocg"] += 1
         if t["steps"] % 500:
             return
-        n = t["steps"]
+        n, d = t["steps"], max(t["drafted"], 1)
         fused = t["bucket"].get(1, 0)
-        print(f"[cf-batch-audit] steps={n} | decode batch B hist "
+        print(f"[cf-batch-audit] steps={n} ({t['drafted']} drafted, {t['cut']} skipped by "
+              f"CF_SPEC_MAX_BATCH) | decode batch B hist "
               f"{dict(sorted(t['B'].items()))} | draft cudagraph bucket hist "
               f"{dict(sorted(t['bucket'].items()))} | fused block kernel (needs bucket==1) ran "
-              f"on {fused}/{n} = {100.0 * fused / n:.1f}% of steps -- the rest fell back to the "
-              f"PyTorch block stack | no-cudagraph steps (B>32) {t['nocg']} | "
-              f"CF_DRAFT_EARLY prelaunch: {t['pre_hit']} of {n} steps took the side-stream "
-              f"fast path (guard bail-outs are steps where a request joined/left the batch)",
-              flush=True)
+              f"on {fused}/{t['drafted']} = {100.0 * fused / d:.1f}% of DRAFTED steps -- the rest "
+              f"fell back to the PyTorch block stack | no-cudagraph drafted steps (B>32) "
+              f"{t['nocg']} | CF_DRAFT_EARLY prelaunch: {t['pre_hit']} of {n} steps took the "
+              f"side-stream fast path (guard bail-outs are steps where a request joined/left "
+              f"the batch)", flush=True)
+
+    # ---------- CF_SPEC_MAX_BATCH: don't draft for a batch that cannot pay for it ----------
+    def _cut(self, B: int) -> bool:
+        """Is this step over the cutoff?  `B` is the number of DRAFTABLE rows this step.
+
+        Delegates so the drafter half and the scheduler half can never drift apart on where the
+        boundary is; `self._cut_on` is only the "is it on at all" short-circuit.
+        """
+        if not self._cut_on:
+            return False
+        from chained_flow.vllm_plugin import batch_cutoff as _cf_cut
+        return _cf_cut.should_cut(B)
+
+    @torch.inference_mode()
+    def _no_draft(self, out, nreq: int):
+        """The "no draft this step" return value, in whichever shape the caller owes vLLM.
+
+        SYNCHRONOUS path: the list-of-empty-lists vLLM already understands -- it becomes
+        `request.spec_token_ids = []`, so the scheduler allocates no spec slots next step and the
+        cutoff needs no scheduler patch at all.  (Under ASYNC scheduling it never reads these,
+        which is exactly why `vllm_plugin.batch_cutoff` exists.)
+
+        ASYNC path: a `[num_reqs, draft_width]` GPU tensor of ZEROS.  Not `None`, and not a
+        narrower tensor: `_prepare_input_ids` scatters `_draft_token_ids.flatten()[...]` into
+        `input_ids` whenever the scheduler DID allocate spec slots, and it neither checks the
+        width nor tolerates a missing tensor.  A short row would leave the tail of the persistent
+        buffer holding the previous step's draft, which is scattered as if it were this step's --
+        silent corruption.  Zeros are simply drafts that lose, which rejection sampling handles.
+        This mirrors vLLM's own drafter-skip (`not input_fits_in_drafter` -> zeros of the full
+        declared width).
+        """
+        if self._audit:
+            self._audit_t["cut"] += 1
+        if not self.async_spec:
+            return out
+        N = self.draft_width
+        if self._dtok is None:
+            self._dtok = torch.zeros((self.max_reqs, N), dtype=torch.int32, device=self.dev)
+        v = self._dtok[:nreq]
+        v.zero_()
+        if self.branching:
+            # No tree was staged, so nothing may be left in the registry claiming to describe
+            # this step -- `_async_register` treats `self._areg is None` as "clear it and take
+            # the documented fallback", which is what we want here.
+            self._areg = None
+            try:
+                from vllm.v1.spec_decode import tree_state
+                tree_state.drop_gpu_tree()
+            except Exception:                                # noqa: BLE001 - fork-only module
+                pass
+        return v
+
+    def _warm_buckets(self) -> None:
+        """CF_WARM_BUCKETS: pay the per-bucket compile+capture at BUILD time, not in the server.
+
+        `CF_COMPILE` wraps the flow net with `torch.compile(..., dynamic=False)`, so inductor
+        re-codegens AND re-autotunes for every new draft batch shape.  Under `vllm serve` the
+        shapes are discovered one at a time as concurrency changes, and each discovery is a
+        70-80 s engine stall in the middle of live traffic (measured; a first guidellm pass at
+        rate 64 logged 850 autotune events as concurrency decayed through the buckets).  The work
+        is unavoidable -- it is what makes the draft fast -- but WHEN it is paid is a choice, and
+        paying it during startup is strictly better than paying it during a request.
+
+        Only buckets the cutoff can actually reach are warmed: with `CF_SPEC_MAX_BATCH=8` the
+        drafter never sees a batch above 8, so buckets 16 and 32 would be pure startup cost for
+        shapes that can never occur.
+
+        Uses the REAL capture path (`_capture_ring`) against the freshly zeroed ring, so the
+        graphs it leaves behind are the ones serving will replay -- `_h2d` allocates each staging
+        buffer once at full capacity, so the addresses the capture bakes in are the addresses the
+        first real step writes to.  The drafts produced here are meaningless and discarded.
+        """
+        if not (self.gpuctx and self.use_cg) or self.feedback:
+            return
+        import numpy as np
+        buckets = [b for b in self._buckets if not self._cut(b)]
+        t0 = time.perf_counter()
+        for b in buckets:
+            rows_g = self._h2d("rows", np.zeros(b, dtype=np.int64), pad_to=b)
+            k0_g = self._h2d("k0", np.zeros(b, dtype=np.int64), pad_to=b)
+            self._capture_ring(b, rows_g, k0_g)
+        # The ring was only ever read here, but `_rpos`/`_nval` are left exactly as `_init_ring`
+        # made them, so the first real step seeds its slots normally.
+        print(f"[chained-flow] draft buckets warmed at startup: {buckets} in "
+              f"{time.perf_counter() - t0:.1f}s (CF_WARM_BUCKETS=1) -- these compiles and "
+              f"captures will NOT happen mid-request", flush=True)
 
     def _draft_from_ring(self, rows_g, k0_g):
         return self._draft_fn(self._ring_gather(rows_g), k0_g)
@@ -1645,6 +1784,17 @@ class FlowDrafterProposer:
                     print(f"[cf-ringcheck] steps={_rc['n']} mismatching={_rc['bad']} "
                           f"maxdiff={_rc['maxd']:.3g} k0 mismatches={_rc['k0bad']}", flush=True)
             self._hm("ctx")
+            # CF_SPEC_MAX_BATCH: over the cutoff, skip the flow net. Deliberately AFTER
+            # `_ctx_gpu`: the ring append is what keeps every slot's context history current, and
+            # it is cheap (one fixed-shape index_copy_). Skipping it too would leave the history
+            # a hole `ctx_size` steps wide, so the first drafts after the batch drops back below
+            # the cutoff would be drawn from a stale window -- correct (they are verified) but
+            # worthless, for as long as it takes the ring to refill.
+            if self._cut(len(rows)):
+                if self._audit:
+                    self._audit_step(int(_rows_g.shape[0]), _B, drafted=False)
+                self._hm("draft")
+                return self._no_draft(out, len(sampled_token_ids))
             # NON-GREEDY GUARD (see _tree_ok). A branching tree that reaches the stock linear
             # rejection sampler RAISES, so one temperature>0 request would kill the engine. Emit a
             # CHAIN for such steps -- exact under any sampling params, and cheap (27B b1: chain
@@ -1688,6 +1838,16 @@ class FlowDrafterProposer:
                 return self._async_draft_tensor(_ch, rows, len(sampled_token_ids))
             return self._finish(out, rows, req_ids, _ch, sampled_token_ids,
                                 _tp if self.prof else None)
+        if self._cut(len(rows)):
+            # Legacy (CF_GPUCTX=0) path.  This bails BEFORE the context build, so unlike the ring
+            # path above it does leave `ctx_hist` a hole `ctx_size` steps wide and the first
+            # drafts after the batch drops back under the cutoff are drawn from a stale window --
+            # still correct (every draft is verified), just worthless until it refills.  Accepted
+            # because the legacy build is an O(batch) Python loop of `torch.cat`s, i.e. the one
+            # thing on this path that is genuinely expensive at the batches this branch runs at,
+            # and CF_GPUCTX=0 is a diagnostic fallback, not a shipping configuration.
+            self._hm("draft")
+            return self._no_draft(out, len(sampled_token_ids))
         _ctx, _k0 = self._ctx_legacy(rows, req_ids, sh, sampled_token_ids)
         hists = self._legacy_hists
         if self.feedback:
@@ -1934,6 +2094,12 @@ class FlowDrafterProposer:
             nd = list(smd.num_draft_tokens)
             nreq = runner.input_batch.num_reqs
             if nreq <= 0 or len(nd) != nreq or min(nd) <= 0:
+                return
+            if self._cut(nreq):
+                # CF_SPEC_MAX_BATCH: over the cutoff. Falling through to the normal path (rather
+                # than skipping here and letting the side-stream draft run) is the point --
+                # `propose()` still runs `_ctx_gpu`, so the ring stays current, and it takes the
+                # same cutoff branch a step later without the draft ever being issued.
                 return
             if bool(runner.discard_request_mask.np[:nreq].any()):
                 return

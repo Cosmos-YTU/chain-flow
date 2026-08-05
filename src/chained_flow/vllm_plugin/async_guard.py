@@ -130,6 +130,16 @@ def register() -> None:
     except Exception as e:                                  # noqa: BLE001 - advisory only
         print(f"[cf-plugin] greedy guard not installed ({e!r})", flush=True)
 
+    # Also independent of the async relaxation, and for the same reason -- it patches the
+    # SCHEDULER, which exists on stock vLLM and on the fork alike, and it is a no-op unless
+    # CF_SPEC_MAX_BATCH is set. Default OFF; see batch_cutoff.install().
+    try:
+        from chained_flow.vllm_plugin import batch_cutoff
+
+        batch_cutoff.install()
+    except Exception as e:                                  # noqa: BLE001 - advisory only
+        print(f"[cf-plugin] batch cutoff not installed ({e!r})", flush=True)
+
     if _truthy(os.environ.get(_DISABLE)):
         REASON = f"{_DISABLE} is set"
         return

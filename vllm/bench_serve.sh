@@ -138,6 +138,7 @@ RES=$OUT/serve_bench.json
 "$CF_PY" $ROOT/vllm/bench_serve_drive.py \
   --base "http://localhost:${PORT}" --model "$CF_MODEL" \
   --concurrency "${CF_CONC:-1,2,4,8,16}" \
+  --requests "${CF_REQ:-0}" \
   --max-tokens "${CF_MAXTOK:-256}" \
   --temperature "${CF_TEMP:-0}" \
   -o "$RES" 2>&1 | tee "$OUT/drive.log"

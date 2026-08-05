@@ -9,12 +9,20 @@ and expensive to discover late.
 ## 0. `vllm serve` compatibility. (Batch 1 is still the measurement of record.)
 
 > **Read first, if you are deploying:**
-> 1. **Do not serve the TREE arm above concurrency 1** — the engine core dies at concurrency 2
->    (device assert) or hangs (with async off), at 4B and 27B alike.
+> 1. **The TREE arm is stable under concurrency now** (the crash is fixed; re-verified here to
+>    concurrency 64 at 4B, 982 requests, zero errors, acceptance flat at 2.40). But it is a
+>    batch-1 technique: 1.35x at concurrency 1, 0.85x at 4, **0.14x at 64**, because its `K+1` is
+>    42 query positions per request against a chain's 6. Serve it with `CF_SPEC_MAX_BATCH=auto`.
 > 2. **Set `CF_TREE_GREEDY_GUARD=1` on any tree-mode server** — otherwise one `temperature>0`
 >    request kills it permanently, for every client.
-> 3. **At 4B, turn speculation off above ~4 concurrent requests** — the chain arm drops to
->    0.90x/0.78x of the no-speculation baseline at concurrency 8/16. 27B never does.
+> 3. **Set `CF_SPEC_MAX_BATCH` on any server that will see concurrency — `4` at 4B, `16` at
+>    27B.** Without it the 4B chain arm falls to 0.90x of the no-speculation baseline at
+>    concurrency 8, 0.74x at 16 and **0.44x at 64**; with it, 1.19x at batch 1 (bit-identical to
+>    the uncut arm) and 0.94–0.96x under load. The threshold is per model size and must be
+>    measured — 4 is the right answer at 4B and the wrong one at 27B. Default off.
+> 4. **Do not serve 27B with speculation above concurrency ~16 at all.** There the binding cost
+>    is not drafting and the cutoff cannot fix it: `--speculative-config` more than halves the
+>    engine's KV cache, capping the 27B decode batch at ~28 against the base engine's 64.
 
 The published speedups and acceptance numbers are **batch-1 numbers**, taken through the
 offline `LLM()` API (`vllm/test_plugin_native.py`, which also forces
@@ -47,6 +55,22 @@ CF_SAMPLING_PROBE=1 ./vllm/bench_serve.sh 4b tree 3 8603
 ./vllm/bench_serve_report.py                # the table, all runs
 ./vllm/bench_serve_diff.py logs/bench_serve/4b_{base,chain}/serve_bench.json
 ```
+
+For a ladder that goes past concurrency 16, use `vllm/serve_ladder.sh` instead — same arms, same
+env table, but a **per-level request count** (`CF_LADDER="1:70,4:120,16:256,64:320"`) and two
+pre-flight checks that `bench_serve.sh` does not have. Both exist because of the same failure:
+
+> **Never start an arm on a GPU that is not yet empty.** vLLM sizes the KV cache as
+> `gpu_memory_utilization × TOTAL − (whatever is already resident)`, so an engine that profiles
+> while the previous arm is still tearing down does not run slowly — it runs with a **silently
+> tiny KV cache**. Measured here: a 4B chain server started right after a 4B base server exited
+> reported `Available KV cache memory: 1.43 GiB` / `Maximum concurrency … 2.53x` instead of the
+> usual 41.38 GiB / 73.29x. It served `/health` fine, accepted every request, and read **505
+> tok/s at "concurrency 8" while its decode batch never once exceeded 4** — every level above
+> that measured the admission queue and reported it as the arm's throughput. Nothing in the
+> throughput number says so; the only tell is one line in the startup log. `serve_ladder.sh`
+> waits for the GPU to drain, then refuses to benchmark if the KV cache it got cannot hold the
+> ladder it is about to be driven with.
 
 Three things `bench_serve.sh` does that a naive serve script does not, each because
 getting it wrong produced a wrong answer here first:
@@ -101,8 +125,25 @@ that stall to steady-state throughput — `bench_serve_drive.py` warms up with `
 requests for exactly this reason, and got it wrong once (4B chain c=16 read 175.9 tok/s and a
 20.0 s mean TTFT against 826 tok/s at c=8, purely from the un-warmed bucket-16 capture).
 
-For a deployment the fix is to capture every bucket at startup rather than on demand; that
-is not implemented.
+**Above bucket 32 it is much worse than "one stall per bucket."** The buckets are
+`[1,2,4,8,16,32]`, so a decode batch of 33 or more has no bucket at all: `_ctx_gpu` falls back
+to `bucket = B`, the flow net is compiled with `dynamic=False`, and therefore **every distinct
+batch size in 33…max_num_seqs is its own compile**. That is the shape of the 850-autotune-block
+storm seen on a first `guidellm --rate 64` pass — not six shapes discovered once, but ~25, most
+of them discovered while the concurrency was decaying through the thirties and forties.
+
+**`CF_WARM_BUCKETS=1` (default off)** does the buckets up front: `FlowDrafterProposer._build()`
+compiles and captures the draft graph for every bucket the batch cutoff can reach, against the
+freshly zeroed ring, before the drafter serves anything. Because `_build()` is lazy it lands on
+the *first request*, not on process start — which is still the difference between one slow
+request at deploy time and an arbitrary request stalling later. Measured at 4B with
+`CF_SPEC_MAX_BATCH=4`:
+
+> `draft buckets warmed at startup: [1, 2, 4] in 51.3s` — the whole compile-and-capture bill for
+> every shape the server can subsequently reach, paid once.
+
+It is most useful **with** `CF_SPEC_MAX_BATCH`, which is what makes the set of reachable shapes
+finite and small; warming without a cutoff cannot cover the unbucketed range above 32 at all.
 
 ### Measured, 2026-08-05 — the speedup is a batch-1 speedup
 
@@ -152,6 +193,219 @@ the kernel *off* costs nothing, because the `x.shape[0] == 1` gate had already t
 The rest of the collapse is structural and not ours to fix — a speculative step verifies
 `(K+1) × B` tokens, so as `B` grows the target forward stops being bandwidth-bound per token
 and the thing speculation exploits goes away.
+
+### `CF_SPEC_MAX_BATCH=N` — stop speculating above a decode batch (default OFF)
+
+Taken past concurrency 16, the 4B chain arm does not level off, it keeps falling: **0.44x of the
+no-speculation baseline at concurrency 64.** A server that is 2.3x slower under load because a
+feature is enabled is not deployable, and "it helps at batch 1" is not a defence.
+
+`CF_SPEC_MAX_BATCH=N` turns speculation off above a decode batch of N. It is **two patches, and
+both are needed**:
+
+| half | what it stops | why it cannot be the other one |
+|---|---|---|
+| `vllm_plugin/batch_cutoff.py` — wraps `AsyncScheduler._update_after_schedule` and zeroes `scheduler_output.num_spec_tokens_to_schedule` | the **target** verifying `(K+1) × B` positions | under async scheduling the drafter has **no say**: the scheduler writes `request.spec_token_ids = [-1] * K` before any draft exists, and vLLM never reads our returned ids back (`_copy_draft_token_ids_to_cpu` returns early when `use_async_scheduling`) |
+| `FlowDrafterProposer.propose` — `_cut()` / `_no_draft()` | the **drafter** running at all | on its own the target would still be verifying a step's worth of zeros |
+
+**Why not vLLM's own `num_speculative_tokens_per_batch_size`.** 0.25.1 *does* have a native
+batch-size→K schedule (`SpeculativeConfig.num_speculative_tokens_per_batch_size` →
+`Scheduler.dynamic_sd_lookup`), K=0 is a legal entry, and it lands in the same place. It was
+rejected for one measured reason: setting it makes `VllmConfig.
+_maybe_override_dynamic_sd_cudagraph_mode` downgrade `cudagraph_mode` from FULL_AND_PIECEWISE to
+PIECEWISE **for the whole engine, including batch 1** — trading the high-concurrency fix for a
+regression on the metric this project is judged on. Patching the scheduler decision alone leaves
+full cudagraphs captured and dispatched for every step that still speculates.
+
+**Measured, 4B**, same server config, `--max-num-seqs 64`, `serve_ladder.sh`:
+
+| conc | base | chain | vs base | chain + `CF_SPEC_MAX_BATCH=4` | vs base |
+|---|---|---|---|---|---|
+| 1 | 139.0 | 165.2 | **1.19x** | 165.6 | **1.19x** |
+| 4 | 498.8 | 498.6 | 1.00x | 500.0 | 1.00x |
+| 8 | 952.9 | 855.7 | 0.90x | 905.2 | **0.95x** |
+| 16 | 1764.4 | 1297.9 | 0.74x | 1660.8 | **0.94x** |
+| 32 | 2968.3 | 1743.7 | 0.59x | 2836.4 | **0.96x** |
+| 64 | 4518.6 | 1993.9 | **0.44x** | 4274.1 | **0.95x** |
+
+**N=4 because that is where the curve crosses**, not because it is a round number: 1.19x at
+concurrency 1, 1.00x at 4, 0.90x at 8. N is inclusive, so a batch of exactly 4 still speculates,
+and the batch-1 number is **bit-identical** to the uncut arm (0/70 sequences differ).
+
+**`CF_SPEC_MAX_BATCH=auto` picks N from the target's size**, because the threshold is a
+measurement and both ways of getting it wrong cost real throughput — N=4 on a 27B server measured
+190.4 tok/s at concurrency 8 against the uncut arm's 253.5, and N=16 on a 4B server leaves it
+under water from concurrency 8 up. The table is keyed on the loaded embedding's hidden size (read
+off the model, not off a config): **4B → 4, 27B → 16, 9B → 8 and flagged INTERPOLATED** wherever
+it is printed, because 9B was not laddered. Resolution happens in `_build()`, which is the first
+moment the target's size is known; until then `max_batch()` reads 0 and the cutoff is inert —
+correct rather than merely tolerable, since the only steps that precede `_build()` are the first
+few of the first request, at a decode batch of 1 that no threshold in the table would cut.
+
+**It also deletes the compile storm**, for free: with the cutoff at 4 the drafter is only ever
+asked for buckets 1, 2 and 4, so those are the only three that ever compile — confirmed from
+`draft_buckets.txt`, which lists exactly those three for the cutoff arm. The uncut arm at the
+same ladder reached the unbucketed range and logged draft batches of 34, 37, 38, 42, 45, 46, 50,
+54, 55, 59, 62, 63 and 64 — **every one of them its own `torch.compile`.**
+
+**Correctness across the boundary.** The requirement is that a request in flight when drafting
+switches off is not corrupted. Three pieces of evidence, strongest first:
+
+1. **The two halves cannot disagree in the dangerous direction, by construction.** Both read the
+   batch of the *same* step X — `_update_after_schedule` decides how many spec slots step X+1
+   gets, and `propose()` produces the drafts that fill exactly those slots. The one thing that
+   can differ is that the proposer counts rows that emitted a token while the scheduler counts
+   every request it scheduled, and the former is a *subset* of the latter. So the proposer is
+   only ever **more** willing to draft than the scheduler is to schedule; "slots allocated that
+   the drafter did not fill" is unreachable. And if it were reachable, the skip returns a
+   full-width tensor of zeros — drafts that lose, not a short row that would leave the previous
+   step's tokens to be scattered.
+2. **Below the cutoff it is bit-identical.** 4B, concurrency 1, cutoff arm vs uncut chain arm:
+   **0 of 70 sequences differ.**
+3. **Above it the divergence is the tie lottery, not corruption.** At concurrency 64 with the
+   cutoff fully engaged, 48/320 sequences differ from base — inside the 10.0–17.1% null band
+   measured by running the base arm against *itself* across concurrencies. Inspecting the
+   divergent pairs: both continuations are coherent, grammatical and on-topic, branching
+   mid-sentence at a plausible token. Corruption from a stale draft scatter does not look like
+   that; it looks like token salad.
+
+   Note the same-concurrency base-vs-base null (0.0% up to concurrency 8) is the **wrong** floor
+   here and would flag this as a regression. It is a batch-shape-*preserving* null, and both
+   speculating and de-speculating change the batch shape the target sees. `ladder_diff.py`
+   computes the batch-shape-changing null instead, and says why.
+
+**Read the ratios at concurrency 64 with a ±10% eye.** The two cutoff arms differ there (0.95x
+at N=4, 0.85x at N=1) although both have speculation fully off at that batch, so that spread is
+run-to-run variance on a shared box, not an N effect. The claim these numbers support is
+"restored to roughly the no-speculation baseline", not a precise 5% deficit.
+
+**The 4–6% that is left is not the drafter.** With the cutoff engaged there is no drafting at
+all above N, yet the arm is still ~0.95x. About half of it is cudagraph dispatch: a step whose
+requests have no draft tokens has query length 1, but a spec-configured engine sets
+`uniform_decode_query_len = 1 + num_spec_tokens`, so that step cannot match a captured FULL
+decode graph and falls to PIECEWISE, while the base arm (`num_spec_tokens = 0`) matches its own
+FULL graph at query length 1. Measured with `CF_CGMODE=PIECEWISE` on the **base** arm — the same
+engine, the same absence of speculation, only the graph mode changed:
+
+| conc | 1 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|
+| base, FULL_AND_PIECEWISE | 139.0 | 498.8 | 952.9 | 1764.4 | 2968.3 | 4518.6 |
+| base, PIECEWISE | 136.9 | 487.9 | 933.7 | 1727.0 | 2915.1 | 4487.6 |
+| | 0.985x | 0.978x | 0.980x | 0.979x | 0.982x | 0.993x |
+
+So ~2 points of the residual are a property of turning speculation off *inside a speculative
+engine*, not of how it is turned off. The rest is the steps that still speculate: the decode
+batch straddles N during ramp-up and drain, so at nominal concurrency 8 the audit records
+batches of 3, 4, 7 and 8 in the same phase. That mixing is also visible in the acceptance —
+the cutoff arm reports 2.00–2.17 against the uncut arm's 1.85, because the only steps that draft
+are the low-batch ones.
+
+### The TREE arm: stable under concurrency now, and it crosses much sooner than chain
+
+The tree concurrency crash is fixed, so the tree arm can finally be laddered. Two results, and
+they point opposite ways.
+
+**It is stable.** 4B tree, concurrency 1 → 64, 982 requests: **zero errors at every level**, and
+acceptance flat at 2.395–2.411 throughout. That is a materially wider verification than the
+concurrency-8 the fix was signed off at, and nothing in it degrades.
+
+**And it is a batch-1 technique, more sharply than chain is:**
+
+| conc | base | tree | vs base | accept |
+|---|---|---|---|---|
+| 1 | 139.0 | 187.5 | **1.35x** | 2.395 |
+| 2 | 256.8\* | 268.3 | 1.04x | 2.41 |
+| 3 | ~378\*\* | 349.9 | 0.93x | 2.41 |
+| 4 | 498.8 | 426.2 | 0.85x | 2.411 |
+| 8 | 952.9 | 560.7 | 0.59x | 2.402 |
+| 16 | 1764.4 | 623.4 | 0.35x | 2.400 |
+| 32 | 2968.3 | 625.4 | 0.21x | 2.406 |
+| 64 | 4518.6 | 624.3 | **0.14x** | 2.399 |
+
+The chain arm is at parity at concurrency 4; the tree is already at 0.85x there and **1/7th of
+base at 64**. That is not a defect in the tree — it is arithmetic. The scheduler hands the target
+`K+1` query positions per request per step, and the 8×5 tree's `K+1` is **42 against a chain's
+6**: at concurrency 4 the tree asks the target to verify 168 positions where the chain asks for
+24. Acceptance being flat across the whole ladder is the proof that none of this is a drafting
+problem.
+
+Note also the plateau: from concurrency 16 the tree arm pins at ~625 tok/s and stops responding
+to load at all, because a tree engine gets **117,537 KV tokens against the base engine's
+1,112,818** — the lookahead reservation scales with `K`, so the tree cannot hold enough
+concurrent requests to use the GPU.
+
+With `CF_SPEC_MAX_BATCH=auto` (which resolves to **N=2** here, printed with its provenance):
+
+| conc | base | tree | tree + cutoff | |
+|---|---|---|---|---|
+| 1 | 139.0 | 187.5 | **187.5** | identical — the whole 1.35x survives |
+| 4 | 498.8 | 426.2 (0.85x) | 453.1 (**0.91x**) | |
+| 8 | 952.9 | 560.7 (0.59x) | 642.9 (**0.67x**) | |
+| 16 | 1764.4 | 623.4 (0.35x) | 1257.8 (**0.71x**) | 2.0x the uncut arm |
+
+**The cutoff helps the tree but cannot bring it to parity, and that is the interesting part.**
+The chain cutoff reaches 0.94–0.96x; the tree cutoff stalls at ~0.67x even though above N it is
+doing no drafting at all. The reason is the table above: a 4B tree engine gets **117,537 KV
+tokens against the base engine's 1,112,818**, so it cannot hold enough concurrent requests to
+use the GPU whether it speculates or not. `CF_SPEC_MAX_BATCH` removes the drafting and verify
+cost; it cannot give back memory that `--speculative-config` reserved before the first request
+arrived. **That reservation is the next blocker, and it now gates both arms.**
+
+\* concurrency 2 base is from the earlier `4b_base` ladder, not `base_lad6`, which did not run
+that level. \*\* concurrency 3 base is interpolated between 2 and 4; the tree point is measured.
+Both are flagged because the 2 and 3 rows are what set the tree threshold, and a threshold set
+against an interpolated baseline should say so.
+
+**Consequence for the threshold:** it cannot be keyed on model size alone. `CF_SPEC_MAX_BATCH=
+auto` keys on `(hidden_size, K+1)` and gives the 4B tree **N=2** — the last batch still above
+parity — against the 4B chain's N=4.
+
+### 27B: the crossing is at 16, and above it the cutoff cannot help
+
+| conc | base | chain | vs base | + `MAX_BATCH=4` (wrong N) | + `MAX_BATCH=auto` (N=16) | vs base |
+|---|---|---|---|---|---|---|
+| 1 | 26.3 | 42.7 | **1.62x** | 42.8 | 42.5 | **1.62x** |
+| 4 | 100.2 | 140.5 | **1.40x** | 140.7 | 140.9 | **1.41x** |
+| 8 | 190.8 | 253.5 | **1.33x** | 190.4 *(1.00x)* | 253.5 | **1.33x** |
+| 16 | 368.1 | 395.6 | **1.07x** | 351.3 *(0.95x)* | 397.1 | **1.08x** |
+| 32 | 630.7 | 501.7 | 0.80x | 513.1 | 518.9 | 0.82x |
+| 64 | 1011.7 | 503.4 | **0.50x** | 521.2 | 521.4 | 0.52x |
+
+Two things to read off this. **N=4 is the wrong threshold at 27B** — the `MAX_BATCH=4` column
+throws away 1.33x at concurrency 8 and 1.07x at 16 for nothing, which is why `auto` keys the
+threshold on the target rather than shipping one number. At N=16 the arm reproduces the uncut
+column exactly at and below the cutoff (1.62x / 1.41x / 1.33x / 1.08x), which is the no-op
+property the flag promises.
+
+And **above 16 the cutoff barely moves the number** (0.80x → 0.82x, 0.50x → 0.52x), because at
+27B the cost there is not drafting at all. `CF_BATCH_AUDIT` shows the 27B spec engine's decode
+batch **never exceeds 28 at concurrency 64**, while the base engine runs all 64: enabling
+`--speculative-config` more than halves the KV cache the engine gets for the same
+`--gpu-memory-utilization` (27B: 332,946 → 150,845 tokens; 4B: 1,112,818 → 600,425), and on a
+hybrid model that is a hard cap on concurrent requests. Raising `--gpu-memory-utilization` to
+0.93 does lift it (193,783 tokens, 32 running requests) and then **OOMs**, because
+`FlowDrafterProposer._build()` runs lazily on the first request — *after* vLLM has already sized
+the KV cache against memory the drafter had not yet claimed.
+
+**That is a separate production blocker from this one, and it is the binding one at 27B above
+concurrency 16.** `CF_SPEC_MAX_BATCH` cannot address it: the allocation happens before any
+request exists. At 4B chain it never binds (600,425 tokens is ~1,200 concurrent requests of this
+dataset's length), which is why the 4B chain cutoff arm reaches 0.95x and the 27B one does not.
+
+The tree makes it worse again, because the lookahead reservation scales with `K`:
+
+| engine | KV tokens at the same `--gpu-memory-utilization` | vs base |
+|---|---|---|
+| 4B base | 1,112,818 | — |
+| 4B chain (K=5) | 600,425 | 0.54x |
+| 4B tree (K=41) | 117,537 | **0.11x** |
+| 27B base | 332,946 | — |
+| 27B chain (K=5) | 150,845 | 0.45x |
+| 27B tree (K=41) | 27,185 | **0.08x** |
+
+A 27B tree engine holds ~55 requests of this dataset's length against the base engine's ~680.
+`serve_ladder.sh` refuses to ladder past what the KV can hold rather than report the admission
+queue as the arm's throughput — which is how this was found.
 
 **The tree arm does not survive concurrency ≥ 2 under `vllm serve`,** in either scheduling
 mode. Bisected on 4B:

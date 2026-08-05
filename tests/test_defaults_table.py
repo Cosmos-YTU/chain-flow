@@ -75,8 +75,16 @@ def test_the_shell_emitter_runs_as_a_bare_file_without_torch():
                          env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
     assert out.returncode == 0, out.stderr
     assert "export CF_COMPILE=1" in out.stdout
-    assert "export CF_SHORTLIST=" in out.stdout
     assert "torch" not in out.stderr
+    # CF_SHORTLIST must NOT be exported, for the reason the next test spells out: an inherited
+    # CF_SHORTLIST reads as EXPLICIT in the child and skips the candidate search in the one
+    # process that actually loads the drafter -- overriding a checkpoint's own `shortlist.pt`,
+    # which is documented as winning, and pinning every benchmark in this repo to the source
+    # checkout's copy so the PACKAGED list a pip user gets is never exercised.
+    assert "export CF_SHORTLIST=" not in out.stdout, (
+        "the shell emitter is exporting CF_SHORTLIST again; its resolution is deliberately "
+        "deferred to FlowDrafterProposer._build(), which is the only place that knows the "
+        "downloaded drafter dir and the target's vocab size")
 
 
 def test_apply_marks_its_own_defaults_so_a_spawned_child_does_not_read_them_as_requests(
