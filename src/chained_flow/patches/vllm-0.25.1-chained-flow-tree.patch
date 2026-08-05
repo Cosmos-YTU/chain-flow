@@ -374,7 +374,7 @@
      def _get_logprobs_tensors(
          self,
          max_num_logprobs: int,
-@@ -391,6 +427,129 @@
+@@ -391,6 +427,153 @@
          return result
  
  
@@ -414,6 +414,30 @@
 +    # row base of this request inside the flat logits array
 +    s0 = s1 - (n + 1)
 +    if n <= 0:
++        # NO DRAFT TOKENS -- and this request STILL EMITS ONE TOKEN.
++        #
++        # A request can be scheduled alongside tree requests and carry no draft of its
++        # own: a prefill that has just joined the running batch is the common case (the
++        # proposer had nothing to draft from last step), and any request the scheduler
++        # declined to speculate for is another.  Under continuous batching that is not a
++        # corner case, it is what EVERY new arrival looks like for one step.
++        #
++        # With n == 0 the request owns exactly one logits row -- s0, since s0 == s1 - 1 --
++        # and its output is that row's argmax, i.e. the bonus token.  The stock greedy
++        # kernel gets this for free: its per-draft loop simply does not run and it stores
++        # the bonus at column 0.  Returning here instead stored NOTHING, leaving the whole
++        # `output_token_ids[req_idx]` row at PLACEHOLDER_TOKEN_ID (-1), which
++        #   * LOSES the token the target model actually sampled for that request, and
++        #   * makes the proposer's `cnt = (tok != -1).sum()` come out 0, so
++        #     `k0 = tok[i, (cnt - 1).clamp(min=0)]` reads -1 and hands it to the drafter's
++        #     `MarkovHead.w1` (an nn.Embedding) -- an `index_select` with srcIndex == -1,
++        #     i.e. a device-side assert that kills the engine core for every client.
++        # `accepted_len` / `accepted_path` need no store: they are already 0 / -1, which is
++        # exactly "accepted no draft nodes".
++        tl.store(
++            output_token_ids_ptr + req_idx * (max_spec_len + 1),
++            tl.load(row_argmax_ptr + s0),
++        )
 +        return
 +
 +    cur = -1  # current node index; -1 == the root row
