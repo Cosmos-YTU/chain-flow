@@ -36,7 +36,7 @@ and expensive to discover late.
 
 The published speedups and acceptance numbers are **batch-1 numbers**, taken through the
 offline `LLM()` API (`vllm/test_plugin_native.py`, which also forces
-`VLLM_ENABLE_V1_MULTIPROCESSING=0`), and that remains the measurement of record — sections 1–3
+`VLLM_ENABLE_V1_MULTIPROCESSING=0`), and that remains the measurement of record — sections 1–4
 below. This section is about something different: whether the same code is **correct and
 robust** under `vllm serve`, which is an engine core in its own process plus continuous
 batching. It is not, yet, in the ways listed above; the rest of this section is the evidence.
@@ -764,7 +764,7 @@ outright, so a spec arm must turn both off together (`CF_NO_ASYNC_SCHED=1` in `b
 
 **vLLM is not batch-invariant.** The BASE arm, with no speculation anywhere, agrees with its own
 concurrency-1 run on only 60/70 sequences at concurrency 16 (4B) and 62/70 (27B) — 256-token
-greedy generations, same prompts, same server. This is the fp16-tie hazard of section 3, and
+greedy generations, same prompts, same server. This is the fp16-tie hazard of section 4, and
 continuous batching multiplies it, because the batch a request is decoded in changes the
 kernels it goes through.
 
@@ -1423,7 +1423,7 @@ bite whichever arm it likes.
 
 The async arm remains the default. Do not quote domain-4 4B accept or tok/s as a
 comparison between the flags — the two arms benchmarked different text. Use the
-protocol rule in section 3 to catch the next one automatically.
+protocol rule in section 4 to catch the next one automatically.
 
 ### The flag report has to survive the engine-core spawn
 
@@ -1650,7 +1650,139 @@ worse than recorded. Compare like with like.
 
 ---
 
-## 3. Other hazards worth knowing before you trust an A/B
+## 3. `RedHatAI/speculator_benchmarks`, per domain — the published numbers
+
+These are the figures on the three v2 model cards. Measured 2026-08-06 on
+RTX PRO 6000 Blackwell, `guidellm 0.6.0` driving `vllm serve` (**vLLM 0.25.1**) over the
+OpenAI HTTP API.
+
+### Read this first: the dataset is not what the README says
+
+The published snapshot ships **9 `.jsonl` files**, not the seven this project used
+previously and not the eight its README documents:
+
+- **`tool_call.jsonl` (200 rows) is undocumented.** It is absent from the dataset README
+  and had never been benchmarked here. It is a normal, well-behaved domain.
+- **`writing.jsonl` and `question.jsonl` are byte-identical** — the same blob
+  (`md5 f776f462`, both symlinking `e493606516e7…`). The README calls #4 "MT_bench" and #8
+  "Writing"; in this snapshot they are the same MT-bench prompts.
+  **Anyone reproducing our older "7-domain" numbers needs to know the old `writing`
+  column was MT-bench content, not prose.** It is dropped as a duplicate below, and
+  `question` is kept under the README's own name for that content.
+
+So: **8 distinct domains**. `load_dataset("RedHatAI/speculator_benchmarks")` still fails
+(HumanEval's schema differs, so `datasets` tries to concatenate the files into one split);
+load per-file with `data_files=`, which is also what the RedHat harness does — it runs one
+benchmark per file and never pools.
+
+### THE TRAP: every RedHat config ships `DATASET=".../math_reasoning.jsonl"`
+
+`math_reasoning` is the single most favourable domain at every size. Running the harness
+**as shipped** and quoting the result reports:
+
+| size | math_reasoning (as shipped) | honest pooled (8 domains) | overstatement |
+|---|---|---|---|
+| 4B  | 1.83x | 1.29x | +42% |
+| 9B  | 1.92x | 1.40x | +37% |
+| 27B | **2.51x** | **1.75x** | **+43%** |
+
+Quote the pooled row. If you quote a single domain, name it.
+
+### Settings
+
+Batch/concurrency **1** (guidellm `synchronous` profile, no rate; measured
+`request_concurrency` mean 0.9998–0.9999, max 1.000). Greedy (`temperature=0`). A **fixed
+256 output tokens** per request (`output_tokens_count` → `max_completion_tokens` +
+`ignore_eos`) so every arm does identical work — this also removes the HumanEval-EOS
+variability that once made identical repeats read 233 vs 277 tok/s. **Async scheduling ON
+for every arm including base** (`CF_ASYNC_SCHED=1`), so the baseline is not handicapped.
+25 prompts per domain, **3 repeats**, one guidellm benchmark **per domain** (the only way
+to attribute a Prometheus counter delta to a domain). Arm: **chain, K=5**, shipping
+defaults, shortlist head resolved from the package. Drafters confirmed by printed hash:
+4B `9c3962cc…`, 9B `ed77e698e501423858effa9a596908a700876be7`, 27B `59cbe06e…`.
+
+Every arm ran against a **frozen copy of `src/`** (`CF_SRC=…/src_snapshot`, which defaults
+to the repo working tree and is a no-op otherwise). Without it, another agent editing
+`drafters/` between the base and chain arms silently makes them non-comparable.
+
+### Metric definitions
+
+- **acceptance** = mean accepted length = `1 + num_accepted_tokens / num_drafts`, from the
+  delta of vLLM's own Prometheus counters across the domain's window. **The bonus token is
+  included**, so a non-speculative baseline is 1.00 by definition and K=5 caps at 6.00.
+  Same formula as `speculators/tests/e2e/run_vllm.py` and vLLM's "Mean acceptance length".
+- **speedup** = chain tok/s ÷ base tok/s, where tok/s = `sum(output tokens) / wall
+  duration`, **prefill in the denominator**.
+- For a **tree** arm `num_draft_tokens` is the tree's *node count*, so vLLM's "Avg Draft
+  acceptance rate" and its per-position rates are meaningless there. Mean accepted length
+  is the metric that stays comparable across draft geometries.
+
+### Results
+
+Acceptance (tokens/step, bonus included) and speedup vs the no-speculation baseline:
+
+| domain | 4B acc | 4B speedup | 9B acc | 9B speedup | 27B acc | 27B speedup |
+|---|---|---|---|---|---|---|
+| HumanEval | 2.29 | 1.47x | 2.39 | 1.61x | 2.42 | 2.00x |
+| math_reasoning | 2.88 | 1.83x | 2.85 | 1.92x | 3.05 | 2.51x |
+| qa | 1.93 | 1.24x | 1.96 | 1.34x | 2.01 | 1.67x |
+| question (MT-bench) | 1.98 | 1.28x | 2.05 | 1.40x | 2.09 | 1.74x |
+| rag | 2.03 | 1.29x | 2.10 | 1.42x | 2.13 | 1.74x |
+| summarization | 1.95 | 1.24x | 2.00 | 1.35x | 2.07 | 1.70x |
+| tool_call | 2.13 | 1.35x | 2.16 | 1.45x | 2.13 | 1.75x |
+| translation | 1.45 | **0.94x** | 1.49 | 1.02x | 1.57 | 1.31x |
+| **POOLED (8 domains)** | **2.02** | **1.29x** | **2.06** | **1.40x** | **2.12** | **1.75x** |
+
+Underlying tok/s (pooled, prefill included):
+
+| size | base | chain | pooled speedup | decode-only speedup (prefill excluded) |
+|---|---|---|---|---|
+| 4B  | 138.27 | 178.43 | 1.290x | 1.330x |
+| 9B  |  81.99 | 114.68 | 1.399x | 1.438x |
+| 27B |  26.26 |  45.95 | 1.750x | 1.802x |
+
+**`translation` is a regression at 4B (0.94x) and bare parity at 9B (1.02x).** Speculation
+costs a draft pass every step; where acceptance is low it does not pay for itself. The
+pooled figures above already carry those losses.
+
+### Confidence
+
+- **Baselines reproduce.** 138.27 / 81.99 / 26.26 against the previously recorded
+  138.9 / 82.4 / 26.3. The 4B gate against the legacy pooled subset read 138.66 vs 138.92
+  (−0.18%) before any new number was read.
+- **Spread is negligible**: 0.0–0.4% per domain, **≤0.1% pooled** over 3 complete repeats
+  (27B chain read 45.95 on all three).
+- **Base is deterministic**: repeat 1 vs repeat 2 was 200/200 byte-identical at every size.
+- **Equal work verified, not assumed**: all 3600 requests emitted exactly 256 tokens,
+  0 errors.
+- **Divergence from base** (fp16 1-ULP tie-flips, spread across all domains rather than
+  concentrated): 4B 27/200, 9B 17/200, 27B 13/200. Throughput stays comparable because the
+  token count is fixed regardless of which continuation is taken.
+
+### These are concurrency-1 numbers
+
+Section 0 above is the load story and it is the one that matters for deployment: the 4B
+chain arm falls to 0.90x at concurrency 8 and 0.44x at 64 without `CF_SPEC_MAX_BATCH`, and
+27B should not be served with speculation above concurrency ~16 at all. Do not quote the
+table above as though it holds on a busy server.
+
+### Reproducing
+
+```bash
+vllm/specbench_domains.py -o logs/specbench_dom/data --per-domain 25 --output-tokens 256
+CF_SRC=<frozen copy of src> SPECBENCH_REPEATS=3 \
+  vllm/specbench_dom_matrix.sh "27b:base 27b:chain 9b:base 9b:chain 4b:base 4b:chain"
+vllm/specbench_dom_report.py --size 27b --json-out logs/specbench_dom/report_27b.json
+```
+
+`specbench_dom_report.py` pools only domains **and complete repeats** present in every arm,
+and prints what it excluded — an in-flight repeat covers a subset of domains, and pooling it
+produces a fake run-to-run "spread" that is really a domain-mix difference (it moved 27B
+pooled from a contaminated 1.793x to the correct 1.750x).
+
+---
+
+## 4. Other hazards worth knowing before you trust an A/B
 
 - **Confirm the flag actually engaged.** A shape gate (`hidden_size == 640`) made
   `CF_CUDA_BLOCK` a silent no-op at 9B/27B for hours, producing confident, meaningless
