@@ -17,11 +17,16 @@ LOG=${4:?logfile}
 export CUDA_VISIBLE_DEVICES=${CF_GPU:-5}
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 CF_PY=${CF_PY:-/home/shadeform/vllm/.venv/bin/python}
-export PYTHONPATH=/home/shadeform/chained-flow/src
+# CF_SRC pins the chained-flow source tree. It defaults to the repo working tree, so this
+# is a no-op for everyone; a benchmark sweep sets it to a frozen COPY so that concurrent
+# edits by other agents cannot change the code out from under the arms mid-run (base and
+# chain must execute identical code to be comparable).
+CF_SRC=${CF_SRC:-/home/shadeform/chained-flow/src}
+export PYTHONPATH=$CF_SRC
 
 # Same capability-gated default table bench_cf.sh uses (src/chained_flow/defaults.py).
-_CF_DEF=$(PYTHONPATH=/home/shadeform/chained-flow/src "$CF_PY" \
-          /home/shadeform/chained-flow/src/chained_flow/defaults.py --sh)
+_CF_DEF=$(PYTHONPATH=$CF_SRC "$CF_PY" \
+          "$CF_SRC/chained_flow/defaults.py" --sh)
 eval "$_CF_DEF"
 # (The `unset CF_SHORTLIST` that used to be here is gone: `defaults.py --sh` no longer exports
 #  the shortlist at all, so the packaged list resolves in-process the way a pip user gets it.
@@ -60,7 +65,7 @@ esac
 # CF_ASYNC_SPEC=1 (already in the default table) or config/vllm.py refuses the request.
 export CF_ASYNC_SCHED=1
 
-echo "[serve_cf] size=$SIZE arm=$ARM port=$PORT gpu=$CUDA_VISIBLE_DEVICES model=$CF_MODEL" >&2
+echo "[serve_cf] size=$SIZE arm=$ARM port=$PORT gpu=$CUDA_VISIBLE_DEVICES model=$CF_MODEL src=$CF_SRC" >&2
 echo "[serve_cf] drafter=$CF_DRAFTER_DIR K=${CF_K:-n/a} keep=${CF_TREE_KEEP:-n/a} depth=${CF_TREE_DEPTH:-n/a}" >&2
 
 exec "${CF_PY%python}vllm" serve "$CF_MODEL" \

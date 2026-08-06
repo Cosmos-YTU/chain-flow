@@ -283,18 +283,34 @@ class HiddenKVFlowExpert(nn.Module):
             self.__dict__["_cf_fused_off_cached"] = off
         return off
 
+    @property
+    def _cf_batch_off(self) -> bool:
+        off = self.__dict__.get("_cf_batch_off_cached")
+        if off is None:
+            from chained_flow import cuda_block
+            off = not cuda_block.batch_enabled()
+            self.__dict__["_cf_batch_off_cached"] = off
+        return off
+
     def _cf_fused_runner(self, x: torch.Tensor, context_hidden: torch.Tensor):
         """Fused-CUDA block runner, or None to stay on the PyTorch path.
 
-        Only engages for the shape family the kernel is instantiated for (fp16, batch 1,
+        Only engages for the shape family the kernel is instantiated for (fp16,
         D in {640, 1024}, 8 heads, ffn x6, S in {4,8}, C<=16); anything else silently falls
-        back.  ``can_run`` also rejects a (S, C) whose shared-memory footprint does not fit."""
+        back.  ``can_run`` also rejects a (S, C, B) whose shared memory does not fit or whose
+        batch would need more co-resident blocks than the machine has.
+
+        BATCH > 1 IS GATED ON ``CF_CUDA_BLOCK_BATCH`` (default off).  The gate used to be a flat
+        ``x.shape[0] == 1``, so at any decode concurrency the whole block stack silently reverted
+        to the PyTorch/cutlass path -- which is where ~48% of a bucket-64 draft went."""
         from chained_flow import cuda_block
 
         if not cuda_block.enabled():
             return None
-        if not (x.is_cuda and x.dtype == torch.float16 and x.shape[0] == 1
+        if not (x.is_cuda and x.dtype == torch.float16
                 and x.shape[1] in cuda_block.SUPPORTED_S):
+            return None
+        if x.shape[0] != 1 and self._cf_batch_off:
             return None
         static_ok = getattr(self, "_cf_static_ok", None)
         if static_ok is None:
@@ -310,7 +326,9 @@ class HiddenKVFlowExpert(nn.Module):
         if not static_ok:
             return None
         fb = cuda_block.attach(self)            # None if the extension would not build
-        return fb if fb is not None and fb.can_run(x.shape[1], context_hidden.shape[1]) else None
+        if fb is None:
+            return None
+        return fb if fb.can_run(x.shape[1], context_hidden.shape[1], x.shape[0]) else None
 
     def pre_blocks(
         self,

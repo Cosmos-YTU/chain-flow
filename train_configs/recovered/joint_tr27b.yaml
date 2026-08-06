@@ -1,0 +1,95 @@
+# Turkish 27B flow drafter -- warm-started from selimaktas/Flow-Drafter-Qwen3.5-27B-v2.
+#
+# Every model_arg below is byte-identical to train_configs/recovered/joint_q3527bx.yaml (the v2
+# recipe). That is not stylistic: warm_start_from() does a name+shape match, so any architecture
+# drift here would silently leave those tensors random and the run would be a from-scratch train
+# wearing a warm-start config.
+#
+# Only five things change: init_from, dataset_path, output_dir, and a fine-tuning
+# learning rate / epoch budget (v2 trained from scratch at 5e-4 for 15 epochs).
+model_id: Qwen/Qwen3.5-27B
+context_size: 8
+draft_length: 8
+chunk_size: 4
+expert_dim: 1024
+num_heads: 8
+ffn_multiplier: 6
+num_drafter_layers: 8
+num_flow_steps: 2
+init_mode: delta
+detach_previous_chunks: true
+markov_rank: 256
+path_order: 8
+path_ffn_multiplier: 2
+lambda_cov: 0.3
+cov_b: 8
+cov_margin: 1.0
+tree_top_b: 8
+tree_max_nodes: 64
+architecture: tree_flow
+device: cuda
+vae_dir: /home/shadeform/chained-flow/out/vae/ckpts/transformer-hidden-q3527bx-5120-latent1024-fp16
+latent_size: 1024
+vae_type: transformer_hidden
+vae_intermediate_size: 4096
+vae_num_layers: 2
+vae_num_heads: 8
+vae_max_sequence_length: 16
+train_vae: true
+lambda_vae_recon: 0.5
+
+# The published v2 weights. This local dir is byte-identical to the HF snapshot
+# (sha256 31baf9ad6a417b15eba6c896b367277b0696c4933036242900cfa1a6dbc5b072 ==
+#  models--selimaktas--Flow-Drafter-Qwen3.5-27B-v2/snapshots/59cbe06e667dffd4...).
+# warm_start_from() re-prints that sha256 at startup -- check the LOG, not this comment.
+# The jointly-trained VAE lives in the same file, so it is warm-started too and
+# overwrites whatever vae_dir loaded.
+init_from: /home/shadeform/chained-flow/out/flow/ckpts/tree-vae-joint-q3527bx-1024-k8-l8
+
+dataset_path: data/flow_cache/stage1_tr27b_mix_k4
+dataset_split: train
+materialize_rows: true
+
+lambda_flow: 0.2
+lambda_hidden: 0.25
+lambda_cos: 0.1
+lambda_ce: 0.3
+lambda_accept: 0.15
+gamma: 0.8
+
+output_dir: out/flow/ckpts/tree-vae-joint-tr27b-1024-k8-l8
+# 1e-4, not v2's 5e-4: this is an adaptation on ~5M Turkish tokens from an already-converged
+# English drafter, and the English 7-domain accept has to survive it. Effective batch is kept
+# at v2's 64 x 48 x 2 GPUs = 6144 windows/step so the optimisation dynamics stay comparable.
+learning_rate: 0.0001
+# 3 epochs = 2551 steps = ~5.8h at the 8.2 s/step measured from v2's trainer_state.json.
+#
+# The step count comes from the trainer's OWN reported available_windows=5,225,335 (850 steps/epoch
+# at the 6144 effective batch), not from an estimate. A previous revision said 6 epochs on a
+# projection of 2.46M windows/epoch, which was 2.1x low: it derived windows-per-token from a
+# three-shard sample dominated by long-prompt tool data, but windows are only counted over the
+# GENERATION region, and the real mix is dominated by short-prompt instructurca. 6 epochs is
+# actually 11.6h, not 5.5h.
+#
+# 3 epochs is ~1.5-2x where both prior Turkish runs converged (4B at 2 epochs, 9B at ~1.3) -- enough
+# headroom to see saturation and the start of English erosion, without paying for 5 epochs of
+# training that the 9B run showed buys Turkish nothing.
+num_train_epochs: 3
+per_device_train_batch_size: 64
+gradient_accumulation_steps: 48
+lr_scheduler_type: constant
+# 300, not 400: at 850 steps/epoch this puts checkpoints at 0.35/0.71/1.06/1.41/1.76/2.12/2.47/2.82
+# epochs, i.e. FOUR samples across the 1-2 epoch band where 4B and 9B both converged. Resolution
+# where the knee is expected is the whole point of the sweep.
+save_steps: 300
+logging_steps: 25
+# Keep EVERY checkpoint (8 of them, ~6.5 GB each = ~52 GB). This was save_total_limit: 6, which
+# combined with the corrected 2551-step count would have retained only the LAST 6 of 12 and silently
+# DELETED the entire 0.94-1.88 epoch knee region -- the sweep would have been structurally unable to
+# find the answer it exists to find. Turkish accept and English retention pull in opposite
+# directions under a constant LR, so the stopping point has to be chosen from evidence.
+save_total_limit: 12
+dataloader_num_workers: 4
+report_to: none
+bf16: true
+ddp_find_unused_parameters: true

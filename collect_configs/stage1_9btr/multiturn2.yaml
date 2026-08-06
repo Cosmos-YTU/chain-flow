@@ -1,0 +1,13 @@
+model_id: Qwen/Qwen3.5-9B
+dataset_name: json
+data_files: /home/shadeform/chained-flow/data/turkish_prompts/tr_multiturn2.jsonl
+split: train
+source: tr_multiturn2
+format_name: raw_prompt
+generation_max_new_tokens: 256
+generation_batch_size: 40
+hidden_batch_size: 16
+storage_dtype: float16
+dtype: float16
+device: cuda:0
+output_dir: teacher_states/stage1-9btr-multiturn2

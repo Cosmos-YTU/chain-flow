@@ -71,14 +71,96 @@ def dram_read_bw():
     return n * 2 / (ms * 1e-3) / 1e9
 
 
-def set_flag(experts, on: bool, drafter=None, pair: bool = False):
+def set_flag(experts, on: bool, drafter=None, pair: bool = False, batch: bool = True):
     os.environ["CF_CUDA_BLOCK"] = "1" if on else "0"
     os.environ["CF_CUDA_PAIR"] = "1" if pair else "0"
+    os.environ["CF_CUDA_BLOCK_BATCH"] = "1" if batch else "0"
     for ex in experts:
         ex.__dict__.pop("_cf_fused_off_cached", None)
+        ex.__dict__.pop("_cf_batch_off_cached", None)
         ex.__dict__.pop("_cf_static_ok", None)
     if drafter is not None:
         drafter.__dict__.pop("_cf_pair_off_cached", None)
+
+
+def batch_ladder(d, experts, D, C, L, passes, wbytes, bw, dcfg, mode, batches):
+    """us/block-pass and integrate() across a batch ladder, all compiled+cudagraphed.
+
+    THE POINT OF THE WHOLE EXERCISE.  The fused kernel used to be gated on ``x.shape[0] == 1``,
+    so every rung but the first measured the cutlass/PyTorch fallback.  Both arms are quoted
+    per SLICE (divided by B) so the rungs are directly comparable: a flat per-slice number means
+    batching is free, which is what the shared weight stream should buy."""
+    import torch as _t
+
+    # Measure the KERNEL, not the economics gate: `cuda_block.batch_limit()` exists to hand
+    # batches above the crossover back to cutlass, and leaving it on here would print the
+    # fallback's numbers in the fused column and hide the crossover we are trying to locate.
+    os.environ["CF_CUDA_BLOCK_MAXB"] = "0"
+    dev = "cuda"
+    S = dcfg.chunk_size * 2 if d.num_chunks > 1 else dcfg.chunk_size
+    ex0 = experts[0]
+    from chained_flow import cuda_block
+
+    mask = _t.triu(_t.full((S, S), float("-inf"), device=dev), diagonal=1)
+    print(f"\nbatch ladder, block stack in isolation (S={S}, C={C}, {L} blocks), "
+          f"us/block-pass PER SLICE:")
+    print(f"{'B':>4} {'G/slice':>8} {'PyTorch':>9} {'fused':>9} {'speedup':>8} "
+          f"{'fused total':>12} {'roofline%':>10}")
+    fb = cuda_block.attach(ex0)
+    for B in batches:
+        x0 = _t.randn(B, S, D, device=dev, dtype=_t.float16)
+        ctxb = _t.randn(B, C, D, device=dev, dtype=_t.float16)
+
+        def py_stack():
+            h = x0
+            for b in ex0.blocks:
+                h = b(h, ctxb, attn_mask=mask)
+            return h
+
+        rep, _ = graphed(torch.compile(py_stack, mode=mode, dynamic=False))
+        t_py = bench(rep, n=100) / L * 1000 / B
+        if not fb.can_run(S, C, B):
+            print(f"{B:>4} {'--':>8} {t_py:9.2f} {'REFUSED':>9} {'':>8} {'':>12} {'':>10}")
+            continue
+
+        def run_fused():
+            fb._kv_cache = None
+            return fb.forward(x0, ctxb, mask)
+
+        rep_f, _ = graphed(run_fused)
+        tot = bench(rep_f, n=100) / L * 1000
+        t_f = tot / B
+        print(f"{B:>4} {fb.grid_for(S, C, B):>8} {t_py:9.2f} {t_f:9.2f} {t_py / t_f:7.2f}x "
+              f"{tot:11.1f}  {wbytes / (bw * 1e9) * 1e6 / t_f * 100:9.1f}")
+
+    print("\nbatch ladder, integrate() end to end (compiled + cudagraphed), ms:")
+    print(f"{'B':>4} {'PyTorch':>9} {'fused':>9} {'+pair':>9} {'best x':>8} "
+          f"{'us/pass/slice':>14} {'rel_l2':>10}")
+    for B in batches:
+        ctxb = _t.randn(B, C, D, device=dev, dtype=_t.float16)
+        z0 = d.init_latents(ctxb)
+        row, ref = [], None
+        for on, pair in ((False, False), (True, False), (True, True)):
+            set_flag(experts, on, d, pair)
+            for ex in experts:
+                ex.__dict__.pop("_cf_fused", None)
+            cuda_block._PAIR_GRIDS.clear()
+            try:
+                rep2, out = graphed(torch.compile(lambda: d.integrate(ctxb, z0), mode=mode,
+                                                  dynamic=False))
+                row.append(bench(rep2, n=100))
+                rep2()
+                _t.cuda.synchronize()
+                cur = out.float().clone()
+                ref = cur if ref is None else ref
+                if on and pair:
+                    rl2 = float((cur - ref).norm() / ref.norm())
+            except Exception as e:                                   # noqa: BLE001
+                row.append(float("nan"))
+                print(f"    B={B} on={on} pair={pair}: {type(e).__name__}: {e}")
+        best = min(v for v in row[1:] if v == v)
+        print(f"{B:>4} {row[0]:9.3f} {row[1]:9.3f} {row[2]:9.3f} {row[0] / best:7.2f}x "
+              f"{best / passes * 1000 / B:13.2f} {rl2:10.3e}")
 
 
 @torch.inference_mode()
@@ -89,6 +171,8 @@ def main():
     ap.add_argument("--sweep", action="store_true", help="sweep grid size / threads on the stack")
     ap.add_argument("--pair-sweep", action="store_true", help="sweep CF_CUDA_PAIR_G on integrate()")
     ap.add_argument("--no-numerics", action="store_true")
+    ap.add_argument("--batches", default="", help="e.g. 1,2,4,8,16,32,64: run the batch ladder")
+    ap.add_argument("--batch-only", action="store_true", help="skip the batch-1 sections")
     args = ap.parse_args()
 
     import dataclasses
@@ -152,6 +236,11 @@ def main():
 
     ctx = torch.randn(1, C, D, device=dev, dtype=dtype)
     z0 = d.init_latents(ctx)
+
+    if args.batch_only:
+        batch_ladder(d, experts, D, C, L, passes, wbytes, bw, dcfg, args.mode,
+                     [int(v) for v in args.batches.split(",")])
+        return
 
     # ---- numerics: fused block stack vs PyTorch block stack, per expert / S / mask -------
     if not args.no_numerics:
@@ -297,6 +386,10 @@ def main():
         print(f"    best {best[1]} {best[0]:.3f} ms")
         os.environ.pop("CF_CUDA_PAIR_G", None)
         cuda_block._PAIR_GRIDS.clear()
+
+    if args.batches:
+        batch_ladder(d, experts, D, C, L, passes, wbytes, bw, dcfg, args.mode,
+                     [int(v) for v in args.batches.split(",")])
 
 
 if __name__ == "__main__":

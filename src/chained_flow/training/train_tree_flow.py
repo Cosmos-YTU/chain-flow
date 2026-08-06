@@ -66,6 +66,11 @@ class TreeModelArguments:
     anchor_token: bool = False
     sched_sampling_p: float = 0.0
     prev_token_cond: bool = True
+    # Warm start: a finished drafter checkpoint (local dir or HF repo id) whose weights -- drafter
+    # AND the jointly-trained VAE, which lives in the same model.safetensors -- are loaded into the
+    # freshly-built module before training. Not `resume_from_checkpoint`: no optimizer/scheduler
+    # state is restored, so this is a fine-tune from step 0 with a new dataset and LR.
+    init_from: str | None = None
 
 
 def tree_config_from_args(a: TreeModelArguments) -> TreeFlowConfig:
@@ -214,6 +219,54 @@ class TreeFlowTrainingModule(nn.Module):
         return output
 
 
+def warm_start_from(module: nn.Module, init_from: str, *, local_files_only: bool = False) -> str:
+    """Load a finished drafter's weights into `module` and PROVE which file they came from.
+
+    Prints the sha256 of the actual `model.safetensors` bytes, not the config string that named
+    it: a config can point anywhere, and a stale default that silently trained from scratch is
+    exactly the failure this print exists to make impossible. Every parameter that does NOT get
+    overwritten is listed, because a silent shape/name drift here is a from-scratch run wearing a
+    warm-start config.
+    """
+    import hashlib
+
+    src = Path(init_from)
+    if not (src / "model.safetensors").exists():
+        from huggingface_hub import snapshot_download
+        src = Path(snapshot_download(init_from, local_files_only=local_files_only))
+    weights = src / "model.safetensors"
+    if not weights.exists():
+        raise FileNotFoundError(f"init_from={init_from!r} resolved to {src}, which has no model.safetensors")
+
+    h = hashlib.sha256()
+    with weights.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+
+    from safetensors.torch import load_file
+    sd = load_file(str(weights), device="cpu")
+    missing, unexpected = module.load_state_dict(sd, strict=False)
+    # lm_head_* are non-persistent buffers rebuilt from the frozen LM; they are never in a ckpt.
+    missing = [m for m in missing if not (m.endswith("lm_head_weight") or m.endswith("lm_head_bias"))]
+
+    print(f"WARM START from {init_from}", flush=True)
+    print(f"  resolved       : {weights}", flush=True)
+    print(f"  sha256         : {digest}", flush=True)
+    print(f"  tensors loaded : {len(sd) - len(unexpected)} of {len(sd)} in file", flush=True)
+    if unexpected:
+        print(f"  UNEXPECTED ({len(unexpected)}, ignored): {unexpected[:8]}", flush=True)
+    if missing:
+        print(f"  NOT INITIALISED ({len(missing)}, random): {missing[:8]}", flush=True)
+    else:
+        print("  every trainable parameter was initialised from the checkpoint", flush=True)
+    if len(sd) and len(unexpected) == len(sd):
+        raise RuntimeError(
+            f"warm start loaded NOTHING: all {len(sd)} tensors in {weights} were unexpected. "
+            f"The checkpoint architecture does not match this config.")
+    return digest
+
+
 def train_tree_with_trainer(model_args, data_args, loss_args, training_args) -> dict[str, Any]:
     torch.manual_seed(training_args.seed)
     print(f"loading tree-flow backbone: {model_args.model_id} device={model_args.device}", flush=True)
@@ -233,6 +286,8 @@ def train_tree_with_trainer(model_args, data_args, loss_args, training_args) -> 
               "the vLLM proposer can actually supply at draft time", flush=True)
     print(f"tree-flow dataset windows={len(dataset)} valid_rows={len(dataset.valid_rows)}", flush=True)
     model = TreeFlowTrainingModule(frozen_lm, tree_config_from_args(model_args), loss_args)
+    if getattr(model_args, "init_from", None):
+        warm_start_from(model, model_args.init_from, local_files_only=model_args.local_files_only)
     tot = sum(p.numel() for p in model.parameters()); tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"tree-flow params={tot} trainable={tr} path_order={model_args.path_order} "
           f"lambda_cov={model_args.lambda_cov} cov_b={model_args.cov_b}", flush=True)
@@ -278,5 +333,5 @@ def load_tree_module(flow_dir, *, frozen_lm, device):
     return module, config
 
 
-__all__ = ["TreeModelArguments", "TreeFlowTrainingModule", "tree_config_from_args",
+__all__ = ["TreeModelArguments", "TreeFlowTrainingModule", "tree_config_from_args", "warm_start_from",
            "train_tree_with_trainer", "load_tree_module"]

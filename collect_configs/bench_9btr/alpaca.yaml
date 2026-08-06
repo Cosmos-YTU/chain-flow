@@ -1,0 +1,13 @@
+model_id: Qwen/Qwen3.5-9B
+generation_max_new_tokens: 256
+generation_batch_size: 48
+hidden_batch_size: 24
+storage_dtype: float16
+dtype: float16
+device: cuda:0
+dataset_name: json
+data_files: /home/shadeform/chained-flow/data/turkish_prompts/bench_turkish_alpaca_100.jsonl
+split: train
+source: alpaca
+format_name: raw_prompt
+output_dir: teacher_states/bench-9btr-alpaca

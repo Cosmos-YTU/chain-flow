@@ -1826,3 +1826,49 @@ pooled from a contaminated 1.793x to the correct 1.750x).
   reproduces but throughput does not, suspect contention, not the code.
 - **Never `pkill -f <pattern>`** on a shared box; it is not GPU-scoped and has killed
   another run mid-flight. Scope cleanup to your own PIDs.
+
+## 0b. Two rules for any speculative measurement (added 2026-08-06)
+
+**1. Never extrapolate across conditions.** Do not predict a number in one condition from a fit made in
+another. Measure it in the condition you intend to report. Every restatement this project has had to make
+came from cross-condition mixing: pooled vs mean-of-domain, base-async-on vs off, a 5-domain published
+reference compared against a 6-domain mean, a windows/token ratio fitted on long-prompt shards then applied
+to a short-prompt mix (2.1x off), and the estimator mismatch below. The `speedup ~= 0.635 x accept` law is
+real but was fitted on forced-256 data; break-even is **1.574 forced-256 vs 1.593 natural-EOS**, so even
+that must be refit per condition.
+
+**2. Never use `ignore_eos`.** It forces a fixed output length, so measurement continues past the model's
+natural stopping point into text the model did not want to produce. That tail is far less predictable, so
+it **systematically depresses accept**: measured **-0.19** overall, with `tr_toolcall` 2.247 -> 2.546 and
+`tr_funccall` 2.231 -> 2.598 once disabled. On those domains ~40% of measured tokens were post-EOS, the
+model restarting a new turn in English. Correlation between forced-tail fraction and the residual gap:
+**-0.988**. It was used to give both arms equal work for a clean tok/s comparison; that convenience is not
+worth a biased accept number. At concurrency 1 prefill is 1-2% of wall time, so tok/s stays valid without
+it -- just note that arms then emit different token counts.
+
+### The estimator mismatch: offline accept is NOT comparable to served accept
+`diff_plugin_vs_harness.py` averages run length over every token **position**. vLLM averages over draft
+**steps**, and steps land where the last run ended (`i -> i + L_i + 1`). Uniform sampling is length-biased:
+an easy 50-token stretch contributes 50 windows each with a large run length, but the server crosses it in
+~8 steps. Running the identical run-length values through both estimators gives **uniform 2.611 vs renewal
+2.211** -- same data, different denominator, worth **-0.40**.
+
+Full decomposition, 4B Turkish Set A, offline headline to served number:
+
+    offline tree K=8            3.40
+    offline chain K=8           2.63   -0.77   draft geometry
+    offline chain K=5           2.61   -0.02   K truncation is nearly free
+    per-draft-step estimator    2.21   -0.40   the metric vLLM reports
+    served, natural EOS         2.193  -0.02   <- ACTUAL serving fidelity
+    served, forced ignore_eos   2.006  -0.19   benchmark condition
+
+**The serving path loses 0.02, not 0.6.** Record the estimator in the results file itself (an `estimator`
+field) so a number cannot later be lifted out and set beside an incomparable one.
+
+### Losslessness is not byte-identity against no-speculation decode
+Spec output is **172/200** byte-identical to plain decode at 4B, not 200/200 -- but two different drafters
+(different weights, accept 2.19 vs 1.27) are byte-identical to **each other** 200/200, and each arm is
+exactly reproducible across repeats. That isolates the difference to the target's own fp16 arithmetic: the
+verify pass evaluates K+1 query positions where plain decode evaluates 1, so near-ties break differently.
+Do not claim byte-identity against base; claim exactness with respect to the target's own logits.
+

@@ -213,7 +213,10 @@ class TreeFlowDrafter(nn.Module):
         if any(fb is None for fb in fbs):
             return None
         Ss = [x.shape[1] for x, _, _ in pre]
-        grids = cuda_block.pair_grids(fbs, Ss, context.shape[1])
+        # The two kernels each launch B slices, so the co-residency budget is per-slice: see
+        # cuda_block.pair_grids.  A batch too large for BOTH grids returns None and falls back
+        # to the serial fused path, which owns the whole machine and fits twice the batch.
+        grids = cuda_block.pair_grids(fbs, Ss, context.shape[1], pre[0][0].shape[0])
         if grids is None:
             return None
         # Dynamo must not trace into the extension (inference-mode version counters) -- same

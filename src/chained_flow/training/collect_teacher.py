@@ -156,6 +156,22 @@ def _apply_user_chat(tokenizer: Any, content: str | None) -> str | None:
     return f"{content}\n"
 
 
+def format_pretemplated(example: dict[str, Any], tokenizer: Any) -> str | None:
+    """Pass a prompt that is ALREADY chat-templated through verbatim.
+
+    For corpora whose rows carry a full `<|im_start|>...<|im_start|>assistant\\n` prefix
+    (multi-turn, or a system turn carrying tool definitions), re-wrapping the raw text as a
+    single user message -- what `prompt_chat` does -- would flatten the roles and change the
+    prompt distribution. This handler keeps the prefix exactly as stored. Only valid when the
+    prefix was produced by the SAME chat template this tokenizer applies.
+    """
+    # No stripping: the generation prefix legitimately ends in whitespace
+    # (`<think>\n\n</think>\n\n` in Qwen3.5 non-thinking mode), and trimming it would
+    # move the first generated token off-distribution.
+    prompt = example.get("prompt") or ""
+    return prompt if len(prompt.strip()) >= 8 else None
+
+
 def format_mbpp_prompt(example: dict[str, Any], tokenizer: Any) -> str | None:
     return _apply_user_chat(tokenizer, example.get("prompt"))
 
@@ -211,11 +227,15 @@ def format_translate_en_fr(example: dict[str, Any], tokenizer: Any) -> str | Non
 
 FORMAT_HANDLERS = {
     "qwen_chat_qa": format_gsm8k_prompt,
+    # alias: the Turkish 9B collect configs were written against this name before
+    # `pretemplated` landed. Same behaviour -- one implementation, two names.
+    "raw_prompt": format_pretemplated,
     "nemotron_messages": format_nemotron_prompt,
     "mbpp": format_mbpp_prompt,
     "dolly": format_dolly_prompt,
     "alpaca": format_alpaca_prompt,
     "prompt_chat": format_prompt_chat,
+    "pretemplated": format_pretemplated,
     "summarize_article": format_summarize_article,
     "writingprompt": format_writingprompt,
     "translate_en_fr": format_translate_en_fr,

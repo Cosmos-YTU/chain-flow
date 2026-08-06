@@ -108,6 +108,12 @@ DRAFTER: dict[str, str] = {
     # the two chunk-experts on two streams.  Gate: CF_CUDA_BLOCK engaged + exactly 2 experts.
     # Accept-IDENTICAL (it only changes the issue order of two independent kernels).
     "CF_CUDA_PAIR": "1",
+    # run a DECODE BATCH as gridDim.y slices of the fused kernel instead of falling through to
+    # the PyTorch/cutlass stack.  DEFAULT OFF -- not because it is unmeasured but because it is a
+    # win only up to a batch (8 at D=640, 4 at D=1024) and the arm it helps is already cut off
+    # at 4 by CF_SPEC_MAX_BATCH, so turning it on ships a flag that changes nothing at most
+    # decode batches.  Gate: CF_CUDA_BLOCK engaged.  Accept-neutral (same arithmetic, per-slice).
+    "CF_CUDA_BLOCK_BATCH": "0",
     # skip PathHead offsets that provably have no ancestor.  BIT-EXACT, no gate.
     "CF_PATH_TRIM": "1",
     # narrow the context-ring append to the slots a TREE step can fill.  BIT-EXACT.
@@ -424,7 +430,10 @@ def apply(force: bool = False) -> None:
     for flag, val in DRAFTER.items():
         if flag == "CF_SHORTLIST":
             continue
-        _set(flag, val, "default on")
+        # The reason string has to match the value: the table is no longer uniformly "on by
+        # default" (CF_CUDA_BLOCK_BATCH ships OFF), and printing "cuda_batch(default on)" in the
+        # OFF list is exactly the kind of self-contradicting banner this module exists to avoid.
+        _set(flag, val, "default on" if val not in ("", "0") else "default off")
 
     fk = fork()
     for flag, val in TREE.items():
@@ -477,6 +486,7 @@ def finalize_cuda_block(drafter) -> None:
     if not truthy(os.environ.get("CF_CUDA_BLOCK")):
         note("CF_CUDA_BLOCK", False, state("CF_CUDA_BLOCK")[1])
         disable("CF_CUDA_PAIR", "needs CF_CUDA_BLOCK")
+        disable("CF_CUDA_BLOCK_BATCH", "needs CF_CUDA_BLOCK")
         return
 
     try:
@@ -506,6 +516,7 @@ def finalize_cuda_block(drafter) -> None:
     if bad:
         disable("CF_CUDA_BLOCK", "shape unsupported: " + "; ".join(bad))
         disable("CF_CUDA_PAIR", "needs CF_CUDA_BLOCK")
+        disable("CF_CUDA_BLOCK_BATCH", "needs CF_CUDA_BLOCK")
         return
 
     # --- build gate: does the extension actually compile on this box? -----------------
@@ -514,6 +525,7 @@ def finalize_cuda_block(drafter) -> None:
         disable("CF_CUDA_BLOCK",
                 f"CUDA extension failed to build ({err}); falling back to PyTorch")
         disable("CF_CUDA_PAIR", "needs CF_CUDA_BLOCK")
+        disable("CF_CUDA_BLOCK_BATCH", "needs CF_CUDA_BLOCK")
         return
 
     ex0 = experts[0]
@@ -528,6 +540,19 @@ def finalize_cuda_block(drafter) -> None:
         disable("CF_CUDA_PAIR", f"{len(experts)} chunk experts, run_pair needs exactly 2")
     else:
         note("CF_CUDA_PAIR", True, f"2 experts S={Ss}")
+
+    # CF_CUDA_BLOCK_BATCH: run a decode batch as gridDim.y slices instead of falling through to
+    # the PyTorch/cutlass stack above batch 1.  DEFAULT OFF.  The banner has to carry the
+    # CROSSOVER, not just on/off: this flag is a win only up to a measured batch (8 at D=640,
+    # 4 at D=1024) and hands everything above it back to cutlass, which is genuinely faster
+    # there -- see cuda_block.batch_limit.  A reader who sees only "ON" would expect it to be
+    # doing something at a decode batch of 32, and it is not.
+    if not truthy(os.environ.get("CF_CUDA_BLOCK_BATCH")):
+        note("CF_CUDA_BLOCK_BATCH", False, state("CF_CUDA_BLOCK_BATCH")[1])
+    else:
+        note("CF_CUDA_BLOCK_BATCH", True,
+             f"batches 2..{cuda_block.batch_limit(D)} run as one kernel; above that the "
+             f"PyTorch stack is faster and takes over")
 
 
 def finalize_compile(p) -> bool:
@@ -690,6 +715,7 @@ def finalize_tree(p) -> None:
 _SHORT = {
     "CF_SHORTLIST": "shortlist", "CF_COMPILE": "compile",
     "CF_CUDA_BLOCK": "cuda_block", "CF_CUDA_PAIR": "cuda_pair",
+    "CF_CUDA_BLOCK_BATCH": "cuda_batch",
     "CF_PATH_TRIM": "path_trim", "CF_RING_TRIM": "ring_trim", "CF_TWOPASS_M": "twopass",
     "CF_TWOPASS_SHARED": "twopass_shared", "CF_DRAFT_EARLY": "draft_early",
     "CF_FUSE_PATH": "fuse_path", "CF_GDN_DEFER": "gdn_defer", "CF_GDN_BV": "gdn_bv",

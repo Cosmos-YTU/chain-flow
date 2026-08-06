@@ -86,7 +86,16 @@ async def _one(sess, base, model, prompt, args, idx, sem, results, err):
             "stream_options": {"include_usage": True},
             # ignore_eos: equal WORK per arm. Without it a faster arm that hits EOS earlier
             # looks slower per token and the arms are not comparable.
-            "ignore_eos": True,
+            #
+            # DEFAULT ON, and every published forced-256 number was measured with it on. Turn it
+            # OFF (--ignore-eos 0) to measure the NATURAL-EOS condition -- what a deployment
+            # actually serves. The arms then emit different token counts, so `tokens` is no
+            # longer equal across arms and only the RATES (tps, tps_per_req) are comparable;
+            # acceptance is unaffected by that since it is a per-draft-step ratio. Forcing 256
+            # tokens runs the model well past its natural stop into out-of-distribution
+            # continuation, which is measurably harder to draft -- 4B-tr tr_toolcall reads
+            # accept 2.247 forced vs 2.546 natural -- so the two conditions must never be mixed.
+            "ignore_eos": bool(args.ignore_eos),
         }
         if args.temperature > 0:
             body["seed"] = 1234 + idx
@@ -175,6 +184,11 @@ async def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top-p", type=float, default=None)
+    ap.add_argument("--ignore-eos", type=int, default=1, choices=(0, 1),
+                    help="1 (default, and the condition every published forced-256 number was "
+                         "measured in) = emit exactly --max-tokens per request, equal work per "
+                         "arm. 0 = stop at EOS, the natural-serving condition. Recorded in the "
+                         "output json; NEVER pool the two.")
     ap.add_argument("--warmup", type=int, default=8,
                     help="requests to burn before measuring, at EACH concurrency: our draft "
                          "cudagraph is captured lazily PER BATCH BUCKET, so the first step at "
@@ -217,7 +231,7 @@ async def main() -> int:
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     json.dump({"model": args.model, "base": args.base, "data": args.data,
                "max_tokens": args.max_tokens, "temperature": args.temperature,
-               "phases": phases}, open(args.out, "w"))
+               "ignore_eos": bool(args.ignore_eos), "phases": phases}, open(args.out, "w"))
     print(f"[bench_serve] wrote {args.out}", flush=True)
     return 1 if any(p["nerrors"] for p in phases) else 0
 
