@@ -38,8 +38,11 @@ SPID=$!
 # setsid detaches, so the process group to clean up is the server's own; record it.
 trap 'kill -TERM -"$(ps -o pgid= "$SPID" 2>/dev/null | tr -d " ")" 2>/dev/null; kill "$SPID" 2>/dev/null' EXIT
 
+# `grep -q` on THIS arm's log as well as the health probe: the port answering is not proof that
+# the process answering is the one this script started.
 for _ in $(seq 1 180); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
+  if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 \
+     && grep -q "attention block size to" "$SRV"; then break; fi
   sleep 5
 done
 if ! curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
@@ -57,11 +60,20 @@ echo "[reach] server up, attention block size = $BLOCK" | tee -a "$CLI"
   --block "$BLOCK" --rounds "${CF_ROUNDS:-3}" --maxlen "$CF_MAXLEN" 2>&1 | tee -a "$CLI"
 RC=${PIPESTATUS[0]}
 
+# SHUT THE SERVER DOWN BEFORE READING THE COUNTERS.  `note_spec_step` prints on the first few
+# stale steps immediately, but the TOTAL (`spec steps N | stale rows M`) only lands from the
+# atexit hook -- and a SIGKILLed engine never runs it, so a clean arm produced no total at all
+# and "no output" had to be argued rather than read.  TERM and wait.
+PGID=$(ps -o pgid= "$SPID" 2>/dev/null | tr -d " ")
+[ -n "$PGID" ] && kill -TERM -"$PGID" 2>/dev/null
+for _ in $(seq 1 30); do kill -0 "$SPID" 2>/dev/null || break; sleep 2; done
 sleep 3
 echo "[reach] ---- engine-core accounting ----" | tee -a "$CLI"
 grep -E "cf-tree-fallback|spec-slot guard|GDN conv state BUILT|attention block size to" "$SRV" \
   | tail -20 | tee -a "$CLI"
 echo "[reach] ---- did the engine die? ----" | tee -a "$CLI"
-grep -E "stale-tree fallback|EngineDeadError|RuntimeError|EngineCore .* died" "$SRV" \
+# Anchored on the RAISE's own first words, not on the phrase "stale-tree fallback" -- the
+# spec-slot guard's own startup banner contains that phrase and matched itself.
+grep -E "took the stale-tree fallback|EngineDeadError|EngineCore .* died|device-side assert" "$SRV" \
   | tail -8 | tee -a "$CLI"
 echo "[reach] $SIZE/$TAG repro rc=$RC" | tee -a "$CLI"

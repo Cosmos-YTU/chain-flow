@@ -837,23 +837,58 @@ the tree conv kernel never wrote — it writes columns 0, 1, 2 of the node's own
 else — so the wide window is not obviously load-bearing there either. Making the step unreachable
 is the better answer in both directions.
 
+#### Measured — the hole is real, and the fix closes it
+
+`vllm/cnd_reach.sh <gpu> 4b <tag> [env…]` serves the 4B tree arm with `CF_TREE_FALLBACK_LOG=1`
+and drives `cnd_stale_repro.py` at it. The **positive control runs first on purpose**: an arm that
+records zero stale rows proves nothing unless the same workload can be shown to produce them.
+
+| arm | `CF_SPEC_SLOT_GUARD` | conv | `STALE STEP` lines | result |
+|---|---|---|---|---|
+| `ctl` | 0 (stock) | wide | **2** (`6/6 spec rows`) | every row stale — exactly the shape that takes `TreeStep.branching` to False |
+| `ctl2` | 0 (stock) | wide | **5** (`6/6`, then four `1/1`) | reproduces; `1/1` is a single spec row that *is* the whole step |
+| `haz` | 0 (stock) | narrow | 1 (`6/8`) | **the engine dies** — `Triton Error: device-side assert`, `EngineDeadError`, clients get 500s |
+| `fix` / `fix2` | on (default) | narrow | **0** | 126 requests each, zero errors |
+| `fixcut2` | on, `CF_SPEC_MAX_BATCH=2` | narrow | **0** | 126 requests, zero errors |
+| `fixnocut` | on, `CF_SPEC_MAX_BATCH=0` | narrow | **0** | 126 requests, engine healthy |
+
+Zero lines means zero stale steps, not zero logging: `note_spec_step` prints on the *first*
+occurrence with `flush=True`, and every arm logged `[cf-tree-fallback] accounting ENABLED in this
+process` from the engine core. The counter also covers exactly the steps that *can* be stale — the
+canonical GPU-tree hand-off skips it, and that path requires every row to carry exactly `_Nc` spec
+tokens *and* the published draft-time `req_id`s to equal this step's, which neither a padded
+newcomer (41 slots, not in the published set) nor a truncated request (<40 slots) can satisfy.
+
+The `haz` row is the one worth reading twice. Six **one-token prompts** sent into a loaded tree
+server were each handed 41 spec slots nothing had drafted — and that is not merely the *all*-stale
+step the conv width was argued about: a **partial**-stale step, where `branching` survives and the
+tree GDN kernels do run, still killed the engine. So on a narrowed engine a stale row is fatal
+*loudly*, which is the property that decides the default: the failure mode of narrowing is a dead
+engine and an HTTP 500, and the failure mode of the wide default is silently different text.
+
 #### Measured — losslessness, 7 domains × 256 greedy tokens, batch 1, 3 repeats
 
-Reference is the **async-off base arm**, never another spec run. Establish the null first: base
-against itself is **3/3 identical at all three sizes** in this session. (`base_aon`, async
-scheduling ON, is *not* a valid reference — it flips 4B domain 4 at token 63 against async-off
-base, reproducibly.)
+Reference is the **async-off base arm**, never another spec run, and the null comes first: base
+against itself is **3/3 identical at 4B and 9B and 5/5 at 27B** in this session. (`base_aon`,
+async scheduling ON, is *not* a valid reference — it flips 4B domain 4 at token 63 against
+async-off base, reproducibly, on both repeats.)
 
 | size | `CF_TREE_CONV_NARROW=1` (new default) | `=0` (old default) | base null |
 |---|---|---|---|
 | 4B  | **7/7, 7/7, 7/7** — and byte-identical run to run | 5/7, 5/7 — d3 @ tok 129 both times | 3/3 identical |
 | 9B  | **7/7, 7/7, 7/7** — and byte-identical run to run | 6/7, 6/7 — d1 @ tok 44 both times | 3/3 identical |
-| 27B | 7/7, 6/7, 6/7 — d4 @ tok 161 | 7/7, 6/7 — d4 @ tok 161 | 3/3 identical |
+| 27B | 7/7, 6/7, 6/7, 7/7, 7/7 — d4 @ tok 161 | 7/7, 6/7 — d4 @ tok 161 | 5/5 identical |
 
-So narrowing makes the 4B and 9B tree **lossless and deterministic**, and the widened block size
-is what the old default's divergences were. **27B is unchanged by the flag** and flips domain 4 at
-token 161 between its own repeats — the fp16 tie this project has recorded the 27B base arm
-flipping against *itself*; see below for the extended null.
+So narrowing makes the 4B and 9B tree **lossless and deterministic** — the widened block size *was*
+the old default's divergences — while at 4B it is also *more* faithful to async-off base than
+vLLM's own async base arm is (7/7 against `base_aon`'s 6/7).
+
+**27B is unchanged by the flag and is not clean.** The 27B tree lands on either side of the
+domain-4 / token-161 fp16 tie across its own repeats (3 of 5 identical to base, and r2/r3 differ
+from r1 at exactly that position), and the WIDE arm does the same (1 of 2). Five async-off base
+repeats never flip it, so **this is not inside a null established here** — it is a real
+nondeterminism in the 27B tree arm, it is one token at one tie, and narrowing neither causes nor
+fixes it. Do not read the 27B row as a losslessness result for either setting of the flag.
 
 #### Measured — batch-1 throughput, pooled over 7 domains
 
@@ -866,6 +901,39 @@ flipping against *itself*; see below for the extended null.
 Narrowing is worth +5.4% at 4B (the +30% KV blocks buy nothing at batch 1; the block-size change
 does), +0.8% at 9B and nothing at 27B — and it is the lossless arm at all three. Every figure
 reproduces the recorded headline (187.7 / 117.4 / 46.5 against 140.0 / 82.6 / 26.2).
+
+**The chain arm is untouched**, which is the check that matters for a guard that installs on
+*every* speculative engine and not only the tree: 4B chain reads **157.9** against the recorded
+157.8. Both halves of the guard are unreachable at batch 1 by construction — padding requires a
+non-empty running batch, truncation requires being within K of `max_model_len` — so this is a
+measurement of something that was already provable.
+
+#### Measured — the 4B concurrency ladder, `serve_ladder.sh`, narrowing on
+
+| conc | 1 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|
+| base | 138.9 | 498.5 | 936.1 | 1763.8 | 2970.1 | 4525.8 |
+| tree | 187.0 | 382.7 | 887.9 | 1653.0 | 1973.0 | 1983.2 |
+| | **1.35×** | 0.77× | 0.95× | 0.94× | 0.66× | 0.44× |
+
+Every rung reproduces the recorded narrow ladder (1.34 / 0.95 / 0.93 / 0.93 / 0.63 / 0.43) except
+**c=4, which reads 0.77× against 0.95×**, with a 565 ms TTFT against 74 ms at c=8.
+
+**That is not the slot guard, and it was worth checking rather than explaining away** — the guard
+*does* take a step that admits a request into a running decode batch off the FULL cudagraph, and
+c=4 is where joins are most frequent relative to the work. The low rungs, run twice with the guard
+and once without:
+
+| conc | base | tree, guard ON | tree, guard OFF (`CF_SPEC_SLOT_GUARD=0`) |
+|---|---|---|---|
+| 1 | 139.0 | 187.1 (1.35×) | 186.9 (1.34×) |
+| 4 | 486.0 | 384.7 (0.79×), TTFT 550 ms | 389.6 (0.80×), TTFT 518 ms |
+| 8 | 936.6 | 888.1 (0.95×) | 895.9 (0.96×) |
+
+The guard costs 1.3% at c=4 and 0.9% at c=8, both inside run-to-run noise, and the c=4 deficit is
+there with stock scheduler behaviour too. So **c=4 needs its own attribution** — the recorded run
+read 466.6 tok/s there at a 62 ms TTFT and this engine reads 385–390 at ~530 ms, which is a change
+somewhere else — but nothing on this page's ladder is attributable to the spec-slot guard.
 
 ### Sampled (`temperature > 0`) requests
 

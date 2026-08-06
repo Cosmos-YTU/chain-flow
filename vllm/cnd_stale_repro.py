@@ -173,7 +173,10 @@ async def run():
         if dead():
             break
         tail = ids(A.maxlen - 900, seed=5_000_000 + rnd)
-        r = await go({"prompt": tail, "max_tokens": 4000})
+        # EXACTLY the remaining context.  Asking for more is a 400 from the API server before
+        # the scheduler ever sees it, which is how the first version of this trigger silently
+        # tested nothing.
+        r = await go({"prompt": tail, "max_tokens": A.maxlen - len(tail) - 1})
         calls += 1
         if "error" in r:
             errors.append(r["error"])
@@ -184,7 +187,8 @@ async def run():
         bg = [go({"prompt": ids(600, seed=8_000_000 + 31 * rnd + i), "max_tokens": 300})
               for i in range(A.load)]
         await asyncio.sleep(1.5)
-        r = await go({"prompt": ids(A.maxlen - 900, seed=6_000_000 + rnd), "max_tokens": 4000})
+        _t2 = ids(A.maxlen - 900, seed=6_000_000 + rnd)
+        r = await go({"prompt": _t2, "max_tokens": A.maxlen - len(_t2) - 1})
         calls += 1
         if "error" in r:
             errors.append(r["error"])
