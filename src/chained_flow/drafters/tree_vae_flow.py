@@ -55,11 +55,31 @@ def _load_frozen_vae(cfg: TreeVAEFlowConfig, hidden_size: int) -> nn.Module:
     )
     vae = build_hidden_vae(cfg.vae_type, vae_cfg)
     if cfg.vae_dir:
+        import os
         from safetensors.torch import load_file
-        d = Path(cfg.vae_dir)
+
+        # CF_VAE_DIR overrides the config. `vae_dir` is written into every checkpoint as a
+        # MACHINE-ABSOLUTE path at training time (e.g. /home/shadeform/chained-flow/out/vae/...),
+        # and the published repos carry it verbatim, so the first person to clone this on another
+        # box -- or run it in a container with a different root -- has no other way to point it
+        # somewhere real. The `vae/` directory shipped inside a drafter repo is for humans; nothing
+        # here reads it.
+        override = os.environ.get("CF_VAE_DIR")
+        d = Path(override or cfg.vae_dir)
         sp = d / "model.safetensors"
         if not sp.exists():
             cks = sorted(d.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1]))
+            if not cks:
+                # This used to be a bare IndexError on cks[-1], which says nothing about which
+                # path was tried or why. Name both.
+                src = "CF_VAE_DIR" if override else f"vae_dir in the checkpoint config"
+                raise FileNotFoundError(
+                    f"VAE not found for the drafter.\n"
+                    f"  looked in : {d}   (from {src})\n"
+                    f"  expected  : {d/'model.safetensors'}, or a checkpoint-N/model.safetensors under it\n"
+                    f"  exists    : {'yes, but neither of the above is in it' if d.is_dir() else 'no -- the directory itself is missing'}\n"
+                    f"  fix       : set CF_VAE_DIR to a directory holding the VAE for this drafter."
+                )
             sp = cks[-1] / "model.safetensors"
         sd = load_file(str(sp))
         vsd = {k[len("vae."):]: v for k, v in sd.items() if k.startswith("vae.")}
