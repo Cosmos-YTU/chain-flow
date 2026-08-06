@@ -32,12 +32,22 @@ def load(root: str, size: str, arm: str, tag: str = "") -> dict:
     that is measurably harder to draft.
     """
     out: dict[str, list] = {}
-    for f in sorted(glob.glob(f"{root}/{size}_{arm}{tag}/*_r*.json")):
+    d = f"{root}/{size}_{arm}{tag}"
+    files = sorted(glob.glob(f"{d}/*_r*.json"))
+    # An arm that RAN AND FAILED and an arm that was NEVER RUN used to be indistinguishable: both
+    # produced an empty dict and were dropped from the report without comment. Over a multi-hour
+    # four-arm campaign that means a dead arm silently prints as a three-arm table.
+    if os.path.isdir(d) and not files:
+        print(f"WARNING: {d} exists but holds no *_r*.json -- the arm ran and produced NOTHING "
+              f"(server died? driver errored?). It is NOT simply unrun.", flush=True)
+    for f in files:
         name = os.path.basename(f)[:-5]
         s, _, _rep = name.rpartition("_r")
         try:
             j = json.load(open(f))
-        except Exception:
+        except Exception as e:
+            # Was a bare `continue`: a truncated write from a dying arm vanished without trace.
+            print(f"WARNING: unreadable result file {f}: {type(e).__name__}: {e}", flush=True)
             continue
         for p in j["phases"]:
             out.setdefault(s, []).append(p)
@@ -83,11 +93,32 @@ def main() -> None:
 
     report: dict = {}
     for size in args.sizes.split(","):
+        # A typo'd --sizes is a bare directory prefix and used to yield an empty section with
+        # exit 0. Say when a requested size has no run directories at all.
+        if not glob.glob(f"{args.root}/{size}_*{args.tag}"):
+            print(f"\nWARNING: --sizes '{size}' matched no run directories under {args.root} "
+                  f"(tag={args.tag!r}). Typo, or nothing has run for it.", flush=True)
+        # Run dirs present for arms this script does not know about are silently invisible; ARMS is
+        # a fixed list and an arm added to the campaign but not here would never appear.
+        known = {f"{size}_{a}{args.tag}" for a in ARMS}
+        for p in sorted(glob.glob(f"{args.root}/{size}_*{args.tag}")):
+            if os.path.basename(p) not in known:
+                print(f"WARNING: {p} is not in ARMS={ARMS}; it will NOT appear in this report.",
+                      flush=True)
         data = {a: load(args.root, size, a, args.tag) for a in ARMS}
         data = {a: d for a, d in data.items() if d}
         if "base" not in data:
             print(f"\n### {size.upper()}: no base arm yet, skipping")
             continue
+        # An arm that completed only part of its sets is still truthy, so it used to print as a
+        # normal arm over fewer sets -- a crashed-halfway run reported as a clean one.
+        expected = set(SET_A if args.tag == "_nateos" else SET_A + SET_B)
+        for a, d in data.items():
+            missing = expected - set(d)
+            if missing:
+                print(f"WARNING: {size}_{a}{args.tag} is INCOMPLETE -- missing sets "
+                      f"{sorted(missing)}. Its numbers cover fewer sets than the other arms.",
+                      flush=True)
         report[size] = {}
         for label, sets in (("SET A -- chained-flow Turkish holdouts", SET_A),
                             ("SET B -- turkishdspark benchmark", SET_B)):

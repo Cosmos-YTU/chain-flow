@@ -150,11 +150,18 @@ def main():
           f"num_flow_steps={dcfg.num_flow_steps}", flush=True)
 
     from datasets import load_from_disk
+    # A --states glob that matches NOTHING used to print the header, no rows, no MEAN, and exit 0 --
+    # an empty-but-clean table that looks like a run rather than a typo. This decides what gets
+    # measured, so it fails loudly.
+    _paths = sorted(glob.glob(args.states))
+    if not _paths:
+        raise SystemExit(f"--states {args.states!r} matched no directories; nothing to evaluate.")
     rows = []
-    for path in sorted(glob.glob(args.states)):
+    for path in _paths:
         dom = os.path.basename(path).split("-", 2)[-1]
         ds = load_from_disk(path)
         rows.append((dom, ds))
+    print(f"[diff] states: {len(rows)} domains -> {[d for d, _ in rows]}", flush=True)
 
     print(f"\n{'domain':<18} {'n':>6} {'harness TREE':>12} {'harness chain':>14} "
           f"{'plugin chain':>13} {'delta':>7}")
