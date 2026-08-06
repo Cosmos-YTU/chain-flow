@@ -25,7 +25,7 @@ from chained_flow import tree_patch as tp
 
 
 def test_shipped_patch_touches_exactly_the_documented_files():
-    """6 modified + 8 added, and every path inside the vllm package.
+    """7 modified + 8 added, and every path inside the vllm package.
 
     The count is asserted rather than merely listed because the patch shipped for a while with
     the three ``.cu`` sources MISSING while their ``.py`` JIT loaders were present: applying it
@@ -39,6 +39,11 @@ def test_shipped_patch_touches_exactly_the_documented_files():
     assert mod == [
         "config/vllm.py",
         "model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+        # CF_TREE_CONV_NARROW: the GDN conv state is built without the speculative columns
+        # the tree never touches, which is what restores the base engine's attention block
+        # size. Added by c0f2203 and defaulted ON later; the list was not updated then, so
+        # this assertion was failing on the shipped patch rather than guarding it.
+        "model_executor/layers/mamba/mamba_utils.py",
         "v1/attention/backends/flash_attn.py",
         "v1/sample/rejection_sampler.py",
         "v1/spec_decode/metadata.py",

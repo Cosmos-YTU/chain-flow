@@ -141,6 +141,18 @@ def register() -> None:
     except Exception as e:                                  # noqa: BLE001 - advisory only
         print(f"[cf-plugin] batch cutoff not installed ({e!r})", flush=True)
 
+    # THE SPEC-SLOT INVARIANT, and NOT gated on the cutoff being on: one of the two holes it
+    # closes (`pad_spec_decode`) is exposed by the cutoff, but the other (truncation against
+    # max_model_len) fires with `CF_SPEC_MAX_BATCH=0` and at any K. Both hand a request a spec
+    # width it was not drafted at, which on a tree engine is a STALE ROW and, if it is the only
+    # one in the step, the stale-tree fallback. See batch_cutoff.install_slot_guard().
+    try:
+        from chained_flow.vllm_plugin import batch_cutoff
+
+        batch_cutoff.install_slot_guard()
+    except Exception as e:                                  # noqa: BLE001 - advisory only
+        print(f"[cf-plugin] spec-slot guard not installed ({e!r})", flush=True)
+
     # MEASUREMENT ONLY, default off. `CF_VPROF=1` was reachable only from the offline harness
     # (`vllm/test_plugin_native.py` calls `vprof.install()` itself), so the step breakdown could
     # not be taken on the path whose numbers this project actually reports -- `vllm serve` at a

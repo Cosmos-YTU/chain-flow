@@ -303,3 +303,173 @@ def test_the_scheduler_patch_carries_a_k_ladder_not_only_a_zero(monkeypatch):
     for nreq in (4, 5, 16, 17):
         fn(object(), _FakeOutput(nreq, 5))
     assert seen == [5, 1, 1, 0]
+
+
+
+# ======================================================================================
+# THE SPEC-SLOT INVARIANT: a request is scheduled its FULL drafted width, or none.
+#
+# Both halves are checked here because both fail SILENTLY on a chain (a junk draft token is
+# verified and rejected, costing only a query position) and both are WRONG TEXT on a
+# CF_TREE_CONV_NARROW tree: the row misses the out-of-band tree registry, which matches on
+# LENGTH, the step goes all-stale, and the GDN layer leaves the tree conv kernel for a sliding
+# window this engine did not allocate.
+# ======================================================================================
+class _FakeRequest:
+    def __init__(self, num_tokens, spec, computed, placeholders=0):
+        self._n = num_tokens
+        self.spec_token_ids = spec
+        self.num_computed_tokens = computed
+        self.num_output_placeholders = placeholders
+
+    @property
+    def num_tokens(self):
+        return self._n
+
+    @property
+    def num_tokens_with_spec(self):
+        return self._n + len(self.spec_token_ids)
+
+
+def _guarded(monkeypatch, **overrides):
+    """A FRESH stand-in `Scheduler` with the guard installed on it.
+
+    Injected as `vllm.v1.core.sched.scheduler.Scheduler` so this runs with no vLLM present --
+    these are the tests that say what the guard does to a request, and they should not be the
+    ones that get skipped on a machine without a GPU.  A fresh class per call because
+    `install_slot_guard` is idempotent by a marker on `__init__`, so a reused class would be
+    patched once and then silently skipped.
+    """
+    import sys
+    import types
+
+    attrs = dict(
+        num_spec_tokens=41,
+        num_sampled_tokens_per_step=1,
+        max_model_len=2048,
+        max_num_scheduled_tokens=16384,
+        scheduler_config=type("C", (), {"max_num_seqs": 64})(),
+        # What stock vLLM leaves this as unless `num_speculative_tokens_per_batch_size` is set.
+        __init__=lambda self, running=(): (setattr(self, "running", list(running)),
+                                           setattr(self, "dynamic_sd_lookup", None))[0],
+        schedule=lambda self, *a, **k: ("ORIGINAL RAN", a, k)[0],
+    )
+    attrs.update(overrides)
+    cls = type("_FakeScheduler", (), attrs)
+
+    mod = types.ModuleType("vllm.v1.core.sched.scheduler")
+    mod.Scheduler = cls
+    for name in ("vllm", "vllm.v1", "vllm.v1.core", "vllm.v1.core.sched"):
+        monkeypatch.setitem(sys.modules, name, sys.modules.get(name) or types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.sched.scheduler", mod)
+    monkeypatch.setattr(batch_cutoff, "SLOT_GUARD_INSTALLED", False)
+    monkeypatch.setattr(batch_cutoff, "_TRUNC_AVOIDED", [0])
+    batch_cutoff.install_slot_guard()
+    assert batch_cutoff.SLOT_GUARD_INSTALLED, batch_cutoff.SLOT_GUARD_REASON
+    return cls
+
+
+def test_full_width_survives_untouched(monkeypatch):
+    """The guard must be a NO-OP in steady state, or it is just a slower way to not speculate."""
+    spec = [-1] * 40
+    reqs = [_FakeRequest(num_tokens=100, spec=spec, computed=100) for _ in range(4)]
+    cls = _guarded(monkeypatch)
+    assert cls(reqs).schedule(True) == "ORIGINAL RAN", "extra scheduler args pass through"
+    assert all(len(r.spec_token_ids) == 40 for r in reqs)
+    assert batch_cutoff._TRUNC_AVOIDED[0] == 0
+
+
+def test_a_request_that_would_be_truncated_by_max_model_len_loses_its_spec(monkeypatch):
+    """scheduler.py clamps `num_new_tokens` to `max_model_len - computed - 1` and then SHORTENS
+    `spec_token_ids` to fit.  A short tree cannot match the registry, so it must not be
+    scheduled at all -- the request decodes without speculation for its last ~K tokens."""
+    spec = [-1] * 40
+    ok = _FakeRequest(num_tokens=2000, spec=spec, computed=2000)      # 2040 <= 2047
+    edge = _FakeRequest(num_tokens=2007, spec=spec, computed=2007)    # 2047 <= 2047, exact fit
+    doomed = _FakeRequest(num_tokens=2008, spec=spec, computed=2008)  # 2048  > 2047
+    _guarded(monkeypatch)([ok, edge, doomed]).schedule()
+    assert len(ok.spec_token_ids) == 40
+    assert len(edge.spec_token_ids) == 40, "the boundary must be inclusive, not off by one"
+    assert doomed.spec_token_ids == []
+    assert batch_cutoff._TRUNC_AVOIDED[0] == 1
+
+
+def test_the_shared_placeholder_list_is_rebound_not_mutated(monkeypatch):
+    """`AsyncScheduler` hands EVERY running request the same list object, so clearing one by
+    mutation would silently unspeculate the whole batch."""
+    shared = [-1] * 40
+    doomed = _FakeRequest(num_tokens=2100, spec=shared, computed=2100)
+    safe = _FakeRequest(num_tokens=10, spec=shared, computed=10)
+    _guarded(monkeypatch)([doomed, safe]).schedule()
+    assert doomed.spec_token_ids == []
+    assert len(shared) == 40 and safe.spec_token_ids is shared
+
+
+def test_the_token_budget_half_errs_towards_dropping_spec(monkeypatch):
+    """The other clamp that truncates is `min(num_new_tokens, token_budget)`.  This walk cannot
+    know which requests the real loop will skip, so it must OVER-count the budget: dropping spec
+    from a request that would have kept it is a lost draft, keeping it on one the real loop
+    truncates is wrong text."""
+    spec = [-1] * 40
+    reqs = [_FakeRequest(num_tokens=100, spec=spec, computed=100) for _ in range(8)]
+    # Room for three full-width rows, not eight.
+    _guarded(monkeypatch, max_num_scheduled_tokens=41 * 3)(reqs).schedule()
+    kept = [r for r in reqs if r.spec_token_ids]
+    assert 0 < len(kept) < 8
+    assert all(len(r.spec_token_ids) == 40 for r in kept), "kept rows keep the FULL width"
+
+
+def test_a_non_speculative_engine_is_untouched(monkeypatch):
+    """This runs in every vLLM process that merely has chained-flow installed."""
+    spec = [-1] * 40
+    r = _FakeRequest(num_tokens=9999, spec=spec, computed=9999)
+    cls = _guarded(monkeypatch, num_spec_tokens=0)
+    s = cls([r])
+    s.schedule()
+    assert r.spec_token_ids is spec
+    assert s.dynamic_sd_lookup is None, "no table on an engine that never speculates"
+
+
+def test_pad_spec_decode_is_disabled_by_an_identity_lookup(monkeypatch):
+    """HALF 1.  `pad_spec_decode` is gated on `dynamic_sd_lookup is None`, so declaring the
+    schedule dynamic is how vLLM's own guard is asked to stand down -- and the table is the
+    IDENTITY so the only other reader (the seed of `num_spec_tokens_to_schedule`) is unchanged
+    and the single place that decides K stays `_update_after_schedule`."""
+    s = _guarded(monkeypatch)()
+    assert s.dynamic_sd_lookup is not None, "the padding branch would still be live"
+    assert set(s.dynamic_sd_lookup) == {41}, "the table must not change any scheduled K"
+    assert len(s.dynamic_sd_lookup) == 65, "1-indexed by decode batch, up to max_num_seqs"
+
+
+def test_an_engine_with_its_own_schedule_keeps_it(monkeypatch):
+    """Only ever ADD a table where vLLM left None: a user who really did configure
+    `num_speculative_tokens_per_batch_size` must not have it overwritten."""
+    cls = _guarded(
+        monkeypatch,
+        __init__=lambda self, running=(): (setattr(self, "running", list(running)),
+                                           setattr(self, "dynamic_sd_lookup", [0, 5, 5, 1, 1]))[0],
+    )
+    assert cls().dynamic_sd_lookup == [0, 5, 5, 1, 1]
+
+
+def test_the_guard_can_be_turned_off_for_measurement(monkeypatch):
+    monkeypatch.setenv("CF_SPEC_SLOT_GUARD", "0")
+    assert batch_cutoff.slot_guard_on() is False
+    monkeypatch.setenv("CF_SPEC_SLOT_GUARD", "1")
+    assert batch_cutoff.slot_guard_on() is True
+    monkeypatch.delenv("CF_SPEC_SLOT_GUARD")
+    assert batch_cutoff.slot_guard_on() is True, "default ON"
+
+
+def test_a_partial_k_rung_is_refused_on_a_tree(monkeypatch):
+    """A tree's shape is matched by LENGTH, so scheduling a slice of it makes every row stale --
+    the same failure the two scheduler holes produce, arrived at by configuration."""
+    monkeypatch.setenv("CF_SPEC_K_SCHEDULE", "4:full,16:1")
+    monkeypatch.setenv("VLLM_SPEC_TREE", "1")
+    with pytest.raises(ValueError, match="TREE engine"):
+        batch_cutoff.ladder()
+    monkeypatch.setenv("CF_SPEC_K_SCHEDULE", "4:full")
+    assert batch_cutoff.ladder() == ((4, batch_cutoff.FULL),), "a pure cliff is fine on a tree"
+    monkeypatch.setenv("VLLM_SPEC_TREE", "0")
+    monkeypatch.setenv("CF_SPEC_K_SCHEDULE", "4:full,16:1")
+    assert batch_cutoff.ladder() == ((4, batch_cutoff.FULL), (16, 1)), "a chain is unaffected"

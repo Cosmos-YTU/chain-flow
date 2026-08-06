@@ -732,6 +732,141 @@ and `ctx_hist` against the live set every step. No leak found on the default pat
 `CF_ORACLE` diagnostic dicts are keyed by `req_id` and never pruned — diagnostics only, off by
 default, but do not leave it on in a long-running server.)
 
+### `CF_TREE_CONV_NARROW` is ON by default, and the scheduler hole that kept it off is closed
+
+The tree's GDN **conv** state used to be allocated at `conv_kernel-1 + num_speculative_tokens`
+columns per slot, because that is what the CHAIN spec path needs. The tree conv kernel
+(`tree_gdn._tree_conv_kernel`) keeps a per-NODE window and reads and writes only columns 0, 1, 2,
+so 41 of 44 columns × 126 slots per request were never touched — and the conv width sets the mamba
+page size, which sets the engine's **attention block size**. `CF_TREE_CONV_NARROW` reclaims them.
+
+**That is a correctness lever, not a tuning one.** At the 8×5 tree the widened state moves the 4B
+engine's attention block from base's 528 to 688, and *at 688 the tree deterministically decodes
+different text from base*. So this flag decides whether the tree is lossless. It nevertheless
+shipped OFF, because narrowing removes the sliding window the **stale-tree fallback** reads, and
+that fallback could not be shown to be unreachable. It now can be.
+
+#### What a stale row is, and the two places vLLM manufactures one
+
+The tree's *shape* travels out of band: the proposer registers `req_id -> (tokens, parents,
+depths)` and `_prepare_inputs` looks it up by req_id **and length**. A row whose lookup misses is a
+STALE ROW — chain parents `[-1, 0, 1, …]` are synthesised for it — and a step in which *every* spec
+row is stale has `TreeStep.branching == False`, which takes the GDN layer off the tree conv kernel
+and onto the wide-window `causal_conv1d_update`. On a narrowed engine that call would read 41
+columns that were never allocated, so it raises instead.
+
+A row is stale exactly when the width the scheduler gave it is not the width the proposer drafted
+it at. Stock vLLM 0.25.1 produces that in two places, both in `Scheduler.schedule`:
+
+1. **`pad_spec_decode`.** A request scheduled out of the WAITING queue with `num_new_tokens == 1`
+   is padded to the uniform spec width and given `[-1] * self.num_spec_tokens` slots — the
+   engine's **static** K, not the cut `num_spec_tokens_to_schedule`, for a request that was not in
+   the previous step's batch and so was never drafted. With `CF_SPEC_MAX_BATCH` engaged every
+   RUNNING request has zero slots, so the newcomer is the *only* spec row and the step is all
+   stale. vLLM itself disables this branch once K is dynamic (`… and self.dynamic_sd_lookup is
+   None`); it stayed live for us only because our cutoff writes `num_spec_tokens_to_schedule` in
+   `_update_after_schedule` rather than configuring `num_speculative_tokens_per_batch_size`, which
+   we must not do because it downgrades `cudagraph_mode` engine-wide.
+2. **Truncation.** `num_new_tokens` is clamped to `max_model_len - num_computed_tokens - 1` and
+   `spec_token_ids` is then *shortened* to whatever survived, so any tree request that comes within
+   `num_spec_tokens` of the context limit is served a SHORT tree the registry cannot match. At a
+   decode batch of 1 that single row is the whole step. **This one owes nothing to the cutoff and
+   fires at `CF_SPEC_MAX_BATCH=0`**; it was not in the previous analysis.
+
+#### `num_new_tokens == 1` is common, and the old reproduction was looking for the wrong thing
+
+The previous reproduction primed a prompt into the prefix cache and re-sent it under load, and
+recorded zero stale rows. Neither reason was "the hole is closed":
+
+- The prefix-cache hit is **block aligned** (`get_computed_blocks` caps the hit at `num_tokens - 1`
+  and then rounds down to a block boundary), so a fully cached prompt only lands on
+  `num_new_tokens == 1` when its length is exactly `k·block_size + 1`. At a 528-token block that is
+  a 1-in-528 chance for an arbitrary prompt, and the script used one arbitrary prompt.
+- vLLM turns prefix caching **off** for this hybrid + speculative engine anyway
+  (`enable_prefix_caching=False` in the startup config line).
+
+The trigger that needs neither is a **one-token prompt**: `num_new_tokens = num_tokens −
+num_computed_tokens` is `1 − 0` for any fresh single-token request, on any engine, cache or no
+cache. `vllm/cnd_stale_repro.py` now drives that, the block-aligned cache hit, and the
+`max_model_len` truncation; `vllm/cnd_reach.sh` runs it against three server arms.
+
+#### The fix: schedule the full drafted width, or schedule none
+
+`chained_flow.vllm_plugin.batch_cutoff.install_slot_guard()`, installed unconditionally from the
+plugin entry point — it is *not* gated on the cutoff, because hole 2 fires without it:
+
+1. Give the scheduler instance an **identity `dynamic_sd_lookup`** (`self.num_spec_tokens` at every
+   batch). vLLM's own padding guard stands down; the only other reader of that table seeds
+   `num_spec_tokens_to_schedule` with exactly what it computed before, so the single place that
+   decides K remains `_update_after_schedule`. It is set on the *instance*, so `SpeculativeConfig`
+   is untouched and `_maybe_override_dynamic_sd_cudagraph_mode` — which reads the config, not this
+   attribute — cannot downgrade the engine to PIECEWISE.
+2. Before each `schedule()`, **drop `spec_token_ids`** on any RUNNING request whose full width
+   would not survive the clamps. The `max_model_len` clamp is reproduced exactly; the token-budget
+   one conservatively, because this walk cannot know which requests the real loop will skip —
+   over-estimating costs a draft, under-estimating leaves a truncated tree.
+
+A K-schedule rung of K=1 is the same failure by configuration (1 slot for a 40-node draft), so
+`ladder()` now refuses a partial-K rung on a tree engine. `CF_SPEC_SLOT_GUARD=0` restores stock
+behaviour, and exists so the old behaviour can be *measured*.
+
+#### Why the fallback is unreachable — the argument, not the absence of a reproduction
+
+`scheduled_spec_decode_tokens` is written in exactly two places and one of them is now dead. So on
+any step with at least one spec row, every such row belongs to a request that
+
+- had `spec_token_ids` set by `_update_after_schedule` in the previous step ⇒ was scheduled then
+  and was **not** a prefill chunk;
+- was therefore **not discarded** — `discard_request_mask` *is* the not-last-prefill-chunk mask —
+  so it is in the proposer's `rows`;
+- was scheduled a **non-zero** width ⇒ that step was under the cutoff ⇒ the proposer drafted, since
+  `rows` is a subset of the scheduled requests and the proposer is therefore only ever *more*
+  willing to draft than the scheduler is to schedule;
+- was drafted, hence registered, at exactly `draft_width` — which is the width it is then
+  scheduled, because the truncation branch can no longer shorten it.
+
+Every spec row hits the registry. No all-stale step, no fallback. And the residual is **loud**: if
+some path not covered above ever did produce one, the GDN call site raises with an actionable
+message. That asymmetry is what makes the default flip right — narrow fails loudly and has never
+been seen to fail, while wide fails **silently** and demonstrably does.
+
+One correction to the record while we are here. `CF_TREE_FORCE_STALE=1` being 7/7 established that
+the fallback is correct *when every step takes it*, i.e. against a conv state the chain path has
+itself been maintaining. A **single** stale step in the middle of tree steps would read a window
+the tree conv kernel never wrote — it writes columns 0, 1, 2 of the node's own slot and nothing
+else — so the wide window is not obviously load-bearing there either. Making the step unreachable
+is the better answer in both directions.
+
+#### Measured — losslessness, 7 domains × 256 greedy tokens, batch 1, 3 repeats
+
+Reference is the **async-off base arm**, never another spec run. Establish the null first: base
+against itself is **3/3 identical at all three sizes** in this session. (`base_aon`, async
+scheduling ON, is *not* a valid reference — it flips 4B domain 4 at token 63 against async-off
+base, reproducibly.)
+
+| size | `CF_TREE_CONV_NARROW=1` (new default) | `=0` (old default) | base null |
+|---|---|---|---|
+| 4B  | **7/7, 7/7, 7/7** — and byte-identical run to run | 5/7, 5/7 — d3 @ tok 129 both times | 3/3 identical |
+| 9B  | **7/7, 7/7, 7/7** — and byte-identical run to run | 6/7, 6/7 — d1 @ tok 44 both times | 3/3 identical |
+| 27B | 7/7, 6/7, 6/7 — d4 @ tok 161 | 7/7, 6/7 — d4 @ tok 161 | 3/3 identical |
+
+So narrowing makes the 4B and 9B tree **lossless and deterministic**, and the widened block size
+is what the old default's divergences were. **27B is unchanged by the flag** and flips domain 4 at
+token 161 between its own repeats — the fp16 tie this project has recorded the 27B base arm
+flipping against *itself*; see below for the extended null.
+
+#### Measured — batch-1 throughput, pooled over 7 domains
+
+| size | base (async off) | base_aon (deployment baseline) | tree, narrow | tree, wide |
+|---|---|---|---|---|
+| 4B  | 127.8 | 140.3 | **187.5 (1.336×)** | 177.9 (1.268×) |
+| 9B  |  78.4 |  82.6 | **117.7 (1.426×)** | 116.8 (1.414×) |
+| 27B |  25.8 |  26.2 | **46.6 (1.777×)**  |  46.6 (1.778×) |
+
+Narrowing is worth +5.4% at 4B (the +30% KV blocks buy nothing at batch 1; the block-size change
+does), +0.8% at 9B and nothing at 27B — and it is the lossless arm at all three. Every figure
+reproduces the recorded headline (187.7 / 117.4 / 46.5 against 140.0 / 82.6 / 26.2).
+
 ### Sampled (`temperature > 0`) requests
 
 - **chain: fine.** Verified against a live 4B server: a sampled request alone, a sampled

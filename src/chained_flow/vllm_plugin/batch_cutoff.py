@@ -441,10 +441,36 @@ def ladder() -> tuple[tuple[int, int], ...]:
     if spec and spec.lower() not in _OFF_WORDS:
         # An EXPLICIT schedule supersedes `CF_SPEC_MAX_BATCH` rather than being gated by it: its
         # last rung IS the cutoff, so obeying both would mean two thresholds for one boundary.
-        return parse_schedule(spec)
+        return _refuse_partial_k_on_a_tree(parse_schedule(spec))
     if _mode() == "off":
         return ()
-    return _RESOLVED_LADDER
+    return _refuse_partial_k_on_a_tree(_RESOLVED_LADDER)
+
+
+def _refuse_partial_k_on_a_tree(lad):
+    """A tree may be scheduled its FULL width or none -- never a slice of it.
+
+    The K-schedule's narrowing works by handing the target the first `K` COLUMNS of whatever
+    the proposer returned, which for a chain is the first K links in order and is exactly what
+    K=1 has to mean.  For a TREE it is the first K nodes of a level-major tree, and the tree's
+    shape travels out of band: `tree_state.lookup` matches on LENGTH, so a request drafted 40
+    nodes and scheduled 1 slot misses the registry and becomes a stale row -- the same failure
+    the `pad_spec_decode` and truncation holes produce, arrived at by configuration.  A K=0
+    rung is fine, and is what the implicit top rung already is.
+
+    (A prefix of a level-major tree IS a valid tree, so this could in principle be made to work
+    by registering the prefix.  It is refused rather than implemented because no ladder has
+    ever measured a K rung worth having -- `_AUTO_K1` is empty -- so the feature would be
+    untested code on the one path where being wrong is silent wrong text.)
+    """
+    if lad and _tree_engine() and any(k != FULL for _, k in lad):
+        raise ValueError(
+            f"{_KFLAG}={os.environ.get(_KFLAG, '')!r} names a partial K on a TREE engine "
+            f"(VLLM_SPEC_TREE=1). A tree is verified against a shape the proposer registered "
+            f"out of band and matched by LENGTH, so scheduling a slice of it makes every row "
+            f"stale. Use rungs of `full` (a pure CF_SPEC_MAX_BATCH cliff) on a tree, or run "
+            f"the chain arm.")
+    return lad
 
 
 def set_resolved_ladder(rungs, why: str) -> None:
@@ -592,6 +618,213 @@ def should_cut(nreq: int) -> bool:
         return nreq > lad[-1][0]
     n = max_batch()
     return n > 0 and nreq > n
+
+
+# ======================================================================================
+# THE UNDRAFTED-SPEC-SLOT HOLE, AND WHY IT IS THE SAME BUG TWICE
+# ======================================================================================
+# EVERYTHING ABOVE decides HOW MANY speculative tokens a step is scheduled.  This section is
+# about a different and stricter property, which the cutoff exposed but did not create:
+#
+#     A REQUEST MUST NEVER BE HANDED SPECULATIVE SLOTS IT WAS NOT DRAFTED FOR,
+#     AND NEVER A DIFFERENT NUMBER OF THEM THAN IT WAS DRAFTED FOR.
+#
+# On a CHAIN that property is merely tidy -- an undrafted slot holds a junk token id, the
+# target rejects it, and the only cost is a wasted query position.  On the TREE it is a
+# CORRECTNESS property, because the tree's shape travels out of band: the proposer registers
+# `req_id -> (tokens, parents, depths)` in `vllm/v1/spec_decode/tree_state.py` and
+# `_prepare_inputs` looks it up by req_id AND LENGTH.  A row whose lookup misses is a STALE
+# ROW: `_prepare_inputs` synthesises chain parents `[-1, 0, 1, ...]` for it, and a step in
+# which EVERY spec row is stale has `TreeStep.branching == False`, which takes the GDN layer
+# off the tree conv kernel and onto the wide-window chain `causal_conv1d_update`.  That is
+# the one step `CF_TREE_CONV_NARROW` cannot serve (it reads `conv_kernel-1 + num_spec`
+# columns and a narrowed engine allocated `conv_kernel-1`), so it is the whole reason the
+# flag was opt-in.  See `mamba_utils.cf_gdn_conv_spec_width`.
+#
+# STOCK vLLM 0.25.1 BREAKS THE PROPERTY IN EXACTLY TWO PLACES, both in `Scheduler.schedule`:
+#
+#   1. `pad_spec_decode` (scheduler.py:814-826, :990-993).  A request scheduled out of the
+#      WAITING queue with `num_new_tokens == 1` is padded to the uniform spec width so the
+#      step can keep a full cudagraph, and is then given
+#      `scheduled_spec_decode_tokens[req_id] = [-1] * self.num_spec_tokens`.  That width is
+#      the ENGINE'S STATIC K.  It is not the width the step is actually scheduling
+#      (`num_spec_tokens_to_schedule`, which `CF_SPEC_MAX_BATCH` cuts to 0), and the request
+#      was never drafted for at ANY width -- it was not in the previous step's batch at all.
+#      With the cutoff engaged this produces the fatal shape directly: every RUNNING request
+#      has zero spec slots, so the padded newcomer is the ONLY spec row, and it is stale.
+#      TWO WAYS TO GET `num_new_tokens == 1`, and the second is the one that matters.  A full
+#      PREFIX-CACHE HIT is the documented one, but it is block-aligned, so only a prompt of
+#      exactly `k * block_size + 1` tokens lands on it -- and vLLM turns prefix caching OFF
+#      for this hybrid+speculative engine anyway.  The unconditional one is a prompt of ONE
+#      TOKEN: `num_new_tokens = num_tokens - num_computed_tokens` is `1 - 0` for any fresh
+#      request whose prompt is a single token, on any engine, with or without a cache.
+#      Note vLLM ITSELF considers this branch unsafe once K is dynamic -- the condition is
+#      `self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None`.  It stays live for us
+#      only because our cutoff expresses the schedule in `_update_after_schedule` instead of
+#      through `num_speculative_tokens_per_batch_size` (which we must not set: it downgrades
+#      `cudagraph_mode` engine-wide, see above).
+#
+#   2. TRUNCATION (scheduler.py:601-605).  `num_scheduled_spec_tokens` is recomputed from the
+#      possibly-clamped `num_new_tokens`, and a request whose full width does not fit gets
+#      `spec_token_ids[:num_scheduled_spec_tokens]`.  The clamp that actually bites is
+#      `max_model_len - num_computed_tokens - num_sampled_tokens_per_step` (scheduler.py:484),
+#      so ANY tree request that comes within `num_spec_tokens` of the context limit is served
+#      a SHORT tree -- `lookup` sees 41 registered against 17 scheduled and misses.  At a
+#      decode batch of 1 that single stale row IS the whole step.  This one owes nothing to
+#      the cutoff and fires with `CF_SPEC_MAX_BATCH=0`; it was not in the previous analysis.
+#
+# THE FIX FOR BOTH IS "SCHEDULE THE FULL WIDTH OR SCHEDULE NONE", and both halves are cheap:
+#
+#   1. Declare the schedule dynamic by giving the scheduler instance a `dynamic_sd_lookup`.
+#      vLLM's own padding guard then stands down.  The table we install is the IDENTITY
+#      (`self.num_spec_tokens` at every batch), so the only other reader -- scheduler.py:1086,
+#      which seeds `num_spec_tokens_to_schedule` -- computes exactly what it computed before
+#      and the single place that decides K remains `_update_after_schedule`.  This is set on
+#      the INSTANCE after `__init__`, so `SpeculativeConfig.num_speculative_tokens_per_batch_size`
+#      is untouched and `_maybe_override_dynamic_sd_cudagraph_mode` (which reads the CONFIG,
+#      not this attribute) cannot downgrade the engine to PIECEWISE.
+#   2. Before each `schedule()`, drop `spec_token_ids` on any RUNNING request whose full width
+#      would not survive the clamps.  `num_tokens_with_spec` then equals `num_tokens`, the
+#      request is scheduled as a plain 1-token decode, and the truncation branch is
+#      unreachable for it.  A request at the end of its context decodes without speculation
+#      for its last ~K tokens, which costs nothing it was going to get anyway.  The
+#      `max_model_len` clamp is reproduced EXACTLY (it is per-request); the `token_budget` one
+#      is reproduced CONSERVATIVELY, because this walk cannot know which requests the real
+#      loop will skip -- and over-estimating the budget only costs a draft, while
+#      under-estimating it leaves a truncated tree.
+#
+# COST: a step that admits a one-token (or fully-prefix-cached) decode request now runs
+# PIECEWISE instead of FULL.  That step cannot occur at a decode batch of 1 (`pad_spec_decode`
+# requires a non-empty `scheduled_running_reqs`), so the batch-1 headline is untouched by
+# construction, and under load it trades one graph dispatch against `num_spec_tokens` verify
+# positions that were being spent on a draft that did not exist.
+#
+# WHAT THIS DOES NOT DO: it does not make a K-SCHEDULE safe on a tree engine.  A rung of K=1
+# schedules 1 slot for a request the proposer drafted 40 nodes for, which is the truncation
+# failure by another route -- so `ladder()` refuses one on a tree.
+_SLOT_GUARD_FLAG = "CF_SPEC_SLOT_GUARD"
+SLOT_GUARD_INSTALLED = False
+SLOT_GUARD_REASON = "not attempted"
+
+
+def slot_guard_on() -> bool:
+    """Default ON.  `CF_SPEC_SLOT_GUARD=0` restores stock vLLM's two behaviours.
+
+    An escape hatch rather than a knob: it exists so the OLD behaviour can be measured (that
+    is how the hole was reproduced at all), and turning it off on a `CF_TREE_CONV_NARROW`
+    engine re-arms a hard RuntimeError.
+    """
+    return (os.environ.get(_SLOT_GUARD_FLAG, "") or "").strip().lower() not in _OFF_WORDS
+
+
+def _tree_engine() -> bool:
+    return os.environ.get("VLLM_SPEC_TREE", "0") == "1"
+
+
+def install_slot_guard() -> None:
+    """Make "scheduled spec width == drafted spec width" a scheduler invariant.
+
+    Installed unconditionally from `async_guard.register()` -- NOT gated on the cutoff, because
+    hole 2 above fires with the cutoff off and hole 1 fires at any K on a tree engine.  Inert on
+    a non-speculative engine (`num_spec_tokens == 0` short-circuits both halves).
+
+    Never raises: like `install()`, this runs in every vLLM process that merely has
+    chained-flow installed.
+    """
+    global SLOT_GUARD_INSTALLED, SLOT_GUARD_REASON
+    if SLOT_GUARD_INSTALLED:
+        return
+    if not slot_guard_on():
+        SLOT_GUARD_REASON = (
+            f"{_SLOT_GUARD_FLAG}=0 -- stock behaviour restored: undrafted requests can be given "
+            f"spec slots by `pad_spec_decode`, and a request near max_model_len can be given a "
+            f"TRUNCATED tree. On a CF_TREE_CONV_NARROW engine either one is a hard RuntimeError")
+        print(f"[cf-plugin] spec-slot guard DISABLED ({SLOT_GUARD_REASON})", flush=True)
+        return
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler
+    except Exception as e:                                   # noqa: BLE001
+        SLOT_GUARD_REASON = f"Scheduler not importable ({e!r})"
+        return
+
+    orig_init = Scheduler.__init__
+    orig_schedule = Scheduler.schedule
+    if getattr(orig_init, "_cf_slot_guard", False):
+        SLOT_GUARD_INSTALLED = True
+        return
+
+    def __init__(self, *a, **k):
+        orig_init(self, *a, **k)
+        # HALF 1.  Only ever ADDS a table where vLLM left None, so an engine that really did
+        # configure `num_speculative_tokens_per_batch_size` keeps its own schedule untouched.
+        if getattr(self, "num_spec_tokens", 0) > 0 and self.dynamic_sd_lookup is None:
+            n = int(self.scheduler_config.max_num_seqs)
+            # 1-indexed by `dynamic_sd_lookup[len(num_scheduled_tokens)]`, exactly as
+            # `build_dynamic_sd_schedule_lookup` builds it; index 0 is never read (the
+            # call site guards `len(num_scheduled_tokens) > 0`).
+            self.dynamic_sd_lookup = [self.num_spec_tokens] * (n + 1)
+            self._cf_pad_disabled = True
+            print(f"[cf-plugin] spec-slot guard: `pad_spec_decode` DISABLED "
+                  f"(identity dynamic_sd_lookup of {self.num_spec_tokens} over batches 1..{n}). "
+                  f"A request entering from WAITING with one new token (a one-token prompt, or "
+                  f"a full prefix-cache hit) is now scheduled as a plain decode instead of "
+                  f"being given {self.num_spec_tokens} spec slots nothing drafted for.",
+                  flush=True)
+
+    def schedule(self, *a, **k):
+        # `*a` because `Scheduler.schedule` grew a `should_throttle_prefills` argument in 0.25.1
+        # and a wrapper that pins today's signature is a startup crash on the next version.
+        #
+        # HALF 2.  Runs before the RUNNING loop reads `num_tokens_with_spec`, so a request that
+        # would have been truncated is simply scheduled as a 1-token decode.  O(len(running))
+        # integer arithmetic on a path that is already O(len(running)) dict work.
+        #
+        # Both clamps that can truncate are reproduced here, and the TOKEN BUDGET one is
+        # reproduced CONSERVATIVELY on purpose.  The real loop skips requests this walk cannot
+        # know about (the `num_output_placeholders` early-exit, `next_decode_eligible_step`,
+        # deferred prefill chunks) and can preempt mid-loop, so the budget consumed here is an
+        # OVER-estimate.  Over-estimating only drops speculation from a request that would have
+        # kept it, which is safe in the direction that matters; under-estimating would leave a
+        # truncated tree, which is not.
+        if getattr(self, "num_spec_tokens", 0) > 0:
+            nspt = self.num_sampled_tokens_per_step
+            limit = self.max_model_len - nspt
+            budget = self.max_num_scheduled_tokens
+            for request in self.running:
+                computed = request.num_computed_tokens
+                want = request.num_tokens_with_spec + request.num_output_placeholders
+                fits = want <= limit and (want - computed) <= budget
+                # Never let the running total go BACKWARDS: a request the real loop skips
+                # entirely (`num_new_tokens == 0`) must not hand budget back to the next one.
+                budget -= max(0, min(want - computed, self.max_model_len - computed - nspt))
+                if request.spec_token_ids and not fits:
+                    # Rebind, never mutate: under async scheduling every running request shares
+                    # ONE placeholder list object (`AsyncScheduler._spec_token_placeholders`).
+                    request.spec_token_ids = []
+                    _TRUNC_AVOIDED[0] += 1
+        return orig_schedule(self, *a, **k)
+
+    __init__._cf_slot_guard = True                            # type: ignore[attr-defined]
+    schedule._cf_slot_guard = True                            # type: ignore[attr-defined]
+    Scheduler.__init__ = __init__                             # type: ignore[assignment]
+    Scheduler.schedule = schedule                             # type: ignore[assignment]
+    SLOT_GUARD_INSTALLED = True
+    SLOT_GUARD_REASON = ""
+    print("[cf-plugin] spec-slot guard INSTALLED: a request is scheduled its FULL drafted spec "
+          "width or none at all. Closes `pad_spec_decode` (undrafted slots for a request with "
+          "one new token) and the max_model_len truncation (a short tree the registry cannot "
+          "match) -- both of which are stale tree rows, i.e. the stale-tree fallback.",
+          flush=True)
+
+
+#: How many times half 2 fired.  A list so the closure can bump it without a `global`.
+_TRUNC_AVOIDED = [0]
+
+
+def slot_guard_status() -> str:
+    if not SLOT_GUARD_INSTALLED:
+        return f"not installed ({SLOT_GUARD_REASON})"
+    return f"installed (max_model_len spec drops: {_TRUNC_AVOIDED[0]})"
 
 
 def install() -> None:

@@ -1,6 +1,11 @@
 """Roll up the CF_TREE_CONV_NARROW default-ON verification matrix into two tables.
 
   cnd_report.py            -- everything present under logs/cnd/
+  cnd_report.py <ns>       -- only the runs tagged with namespace <ns>, with <ns> stripped
+                              from the arm names.  `cnd_matrix.sh ... <ns><variant>` is how a
+                              session keeps its matrix from being mixed with an older one:
+                              `pf` selects `basepf` / `basepfaon` / `treepf` / `treepfwide`
+                              and reports them as base / base_aon / tree / tree_wide.
 
 TABLE 1 is LOSSLESSNESS: every tree repeat against the BASE arm at the same size, token for
 token, 7 domains.  The reference is always base, never another spec run, because two spec runs
@@ -17,6 +22,7 @@ import glob
 import json
 import os
 import re
+import sys
 
 ROOT = "/home/shadeform/chained-flow/logs/cnd"
 
@@ -44,13 +50,20 @@ def ident(a, b):
 
 
 def main():
+    # Namespace: only runs whose `extra` tag starts with it, and the rest of the tag is the
+    # arm variant.  Without one the reference `base` arm of one session can silently become
+    # the losslessness reference for another session's tree.
+    ns = sys.argv[1] if len(sys.argv) > 1 else ""
     runs = {}
     for p in sorted(glob.glob(os.path.join(ROOT, "res_cnd*.json"))):
         m = re.match(r"res_cnd(.*)_(4b|9b|27b)_(base|tree|chain)_r(\d+)\.json", os.path.basename(p))
         if not m:
             continue
         extra, size, arm, rep = m.group(1), m.group(2), m.group(3), int(m.group(4))
-        runs[(size, arm + extra, rep)] = load(p)
+        if not extra.startswith(ns):
+            continue
+        variant = extra[len(ns):]
+        runs[(size, arm + ("_" + variant if variant else ""), rep)] = load(p)
 
     sizes = [s for s in ("4b", "9b", "27b") if any(k[0] == s for k in runs)]
 
@@ -94,12 +107,16 @@ def main():
         for a in arms:
             v = [pooled(runs[(size, a, r)]) for r in (1, 2, 3) if (size, a, r) in runs]
             vals[a] = v
+            if not v:
+                continue
             if a == "base":
                 base_mean = sum(v) / len(v)
             if a == "base_aon":
                 aon_mean = sum(v) / len(v)
         for a in arms:
             v = vals[a]
+            if not v:
+                continue                       # an arm run at one size and not another
             m = sum(v) / len(v)
             cells = " ".join(f"{v[i]:>8.1f} " if i < len(v) else f"{'-':>8} " for i in range(3))
             r1 = f"{m / base_mean:.3f}x" if base_mean else "-"

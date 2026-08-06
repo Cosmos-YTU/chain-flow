@@ -80,6 +80,16 @@ def _truthy(v) -> bool:
     return v is not None and str(v) not in ("0", "", "false", "False", "FALSE", "no", "off", "OFF")
 
 
+def _sampled_nospec() -> bool:
+    """CF_TREE_SAMPLED_NOSPEC: serve sampled requests unspeculated instead of refusing them."""
+    try:
+        from chained_flow.vllm_plugin import tree_sampling
+
+        return tree_sampling.enabled()
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
 def offending(params) -> str:
     """"" if this request is fine for a tree, else a human phrase naming the FIRST problem.
 
@@ -96,7 +106,11 @@ def offending(params) -> str:
     if not isinstance(params, SamplingParams):
         return ""                                           # pooling / embedding: no drafting
     t = getattr(params, "temperature", 0.0)
-    if t is not None and float(t) > 0.0:
+    if t is not None and float(t) > 0.0 and not _sampled_nospec():
+        # CF_TREE_SAMPLED_NOSPEC=1 (prototype, default off): temperature is no longer a reason
+        # to refuse -- the request is admitted and served UNSPECULATED alongside the greedy
+        # tree requests. Everything below still refuses, because the tree verify path returns
+        # no logprobs and applies no penalties for anyone. See tree_sampling.py.
         return f"temperature={t}"
     if getattr(params, "logprobs", None) is not None:
         return f"logprobs={params.logprobs}"
@@ -124,6 +138,15 @@ def install() -> None:
     global INSTALLED, REASON
     if INSTALLED:
         return
+    # Before the guard's own flag checks: the sampled-no-spec prototype must install in the
+    # WORKER process too (it patches the rejection sampler and the proposer), and it is what
+    # decides whether `offending()` still refuses temperature. Default OFF, cannot raise.
+    try:
+        from chained_flow.vllm_plugin import tree_sampling
+
+        tree_sampling.install()
+    except Exception as e:                                  # noqa: BLE001 - advisory only
+        print(f"[cf-plugin] tree sampled-no-spec not installed ({e!r})", flush=True)
     if not _truthy(os.environ.get(_FLAG, _DEFAULT)):
         REASON = f"{_FLAG}=0 (explicitly disabled; the engine WILL die on a non-greedy request)"
         return
