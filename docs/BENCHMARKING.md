@@ -115,14 +115,69 @@ they are deliberate batch-1 specialisations that the flag report has no vocabula
 
 | flag | still on at batch > 1? | why not |
 |---|---|---|
-| `CF_CUDA_BLOCK` | **no, from B ≥ 2** | `chunked_flow._cf_fused_runner` requires `x.shape[0] == 1`; the drafter's `x.shape[0]` is the cudagraph *bucket*, so only bucket 1 qualifies. Falls back to the bit-identical PyTorch block stack. |
-| `CF_CUDA_PAIR` | **no, from B ≥ 2** | rides on `CF_CUDA_BLOCK`. |
+| `CF_CUDA_BLOCK` | **no, from B ≥ 2** — unless `CF_CUDA_BLOCK_BATCH=1`, and then only to B ≤ 8 (D=640) / 4 (D=1024) | `chunked_flow._cf_fused_runner` used to require `x.shape[0] == 1`; the drafter's `x.shape[0]` is the cudagraph *bucket*, so only bucket 1 qualified. `CF_CUDA_BLOCK_BATCH` (default OFF) instead runs the batch as `gridDim.y` slices — see below. Above the crossover it still falls back, and there the PyTorch stack is genuinely the faster path. |
+| `CF_CUDA_PAIR` | **no, from B ≥ 2** — with batching, to the batch where each expert still gets ≥ 4 blocks per slice | rides on `CF_CUDA_BLOCK`. Splitting an already B-way-split machine two more ways starves both grids; measured, the pair loses to the serial fused kernel by 2× from B = 16. |
 | `CF_GDN_DEFER` / `CF_GDN_BV` | **no, from B ≥ 2** (tree) | `tree_gdn.defer_rows(T)` caps at `CF_GDN_DEFER_MAXROWS` = 64 rows. An 8×5 tree is 41 rows per request, so B = 1 fits and B = 2 (82 rows) does not. The cap is a *memory* decision — a deferred stash pins that layer's k/v inside the cudagraph pool — not a correctness one. |
 | draft cudagraph | degrades, but no longer **off** | buckets are powers of two **up to `max_num_seqs`** (`[1,2,4,8,16,32,64]` at the default 64); B = 5 replays the bucket-8 graph, i.e. three whole drafts on padding rows. It used to stop at 32, above which the draft ran eager *and* recompiled per batch size — see the ladder fix below. |
 | `CF_DRAFT_EARLY` (side-stream prelaunch) | intermittent | the steady-state guard requires every input-batch slot to hold the *same request as last step*, which continuous batching breaks whenever a request joins or leaves. It is also tree-only: in chain mode `_prelaunch` returns immediately and the flag's remaining job is publishing the GPU counts for `CF_ASYNC_SPEC`. |
 | `CF_TREE_FUSED_ATTN` | yes | its `N < 128` limit is the per-request tree width, not the batch. |
 | `CF_TREE_FULLCG` | yes | a uniform multi-request decode still dispatches FULL. |
 | `CF_SHORTLIST`, `CF_COMPILE`, `CF_TWOPASS_M`, `CF_PATH_TRIM`, `CF_FUSE_PATH`, `CF_RING_TRIM`, `CF_ASYNC_SPEC` | yes | batch-agnostic. |
+
+#### `CF_CUDA_BLOCK_BATCH` — the fused kernel at batch, and where it stops paying (default OFF)
+
+The kernel is written for one draft; a batch is B independent copies of it, so B rides on
+`gridDim.y` and only the pointers move. Shared memory depends on `(D, S, C)` alone — `S` is a
+draft's *row count*, never the batch — so there are no new template instantiations. Each slice
+keeps its **own** grid-barrier counter (`bar + blockIdx.y`), which means the caller must hold
+`G_per_slice × B` inside the resident-block cap or the kernel *hangs*; `grid_for` computes
+`G = min(default, cap // B)` and refuses the batch when that reaches 0.
+
+It works, and above a point it is the wrong thing to do. `integrate()`, compiled + cudagraphed,
+ms, best fused config vs the PyTorch/cutlass fallback:
+
+| B | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| D=640 torch | 2.035 | 2.195 | 2.234 | 2.516 | 3.438 | 3.771 | 4.421 |
+| D=640 fused | **0.803** | **0.945** | **1.399** | 2.444 | 3.900 | 7.865 | 18.33 |
+| ratio | 2.53× | 2.32× | 1.60× | 1.03× | 0.88× | 0.48× | 0.24× |
+| D=1024 torch | 2.734 | 2.900 | 2.940 | 3.257 | 4.512 | 5.062 | — |
+| D=1024 fused | **1.364** | **1.668** | **2.381** | 4.111 | 8.035 | 15.96 | — |
+| ratio | 2.00× | 1.74× | 1.23× | 0.79× | 0.56× | 0.32× | — |
+
+**ncu says the slicing did exactly what it was designed to do and then hit a different wall.**
+DRAM throughput falls from 19.4 % to 1.5 % of peak (D=640, B = 1 → 64) — the 128 MB L2 does
+dedupe the weight stream every slice shares — and the "no eligible instruction" stall falls from
+0.29 to 0.04 per issue-active cycle, which is the latency-bound diagnosis being cured. What never
+moves is **occupancy**: `sm__warps_active` is pinned at 33.33 % at *every* batch, because ~45 KB
+(D=640) / 69 KB (D=1024) of shared memory allows one 16-warp block per SM. Issue-active tops out
+at 55–61 %, IPC at 0.61, `sm__throughput` at 44–47 %. cutlass has neither constraint: it is not
+co-residency-pinned, and at M = 8·B it reaches tensor cores where this kernel is committed to
+scalar fp32-accumulate FMA at M = 8 per slice, forever. Widening the per-warp column tile
+(`CF_CUDA_BLOCK_NCOL=4`) was tried against exactly this and lost: −8 % at B ≤ 4, +5 % at B ≥ 32,
+with ptxas still spill-free — shared-memory bandwidth is not the binding constraint either.
+
+So the flag hands every batch above the crossover back to cutlass (`cuda_block.batch_limit`).
+**In-engine, 4B chain, `serve_ladder.sh`, same ladder and the same `4b_base_lad` baseline:**
+
+| conc | base | `chain_cut4` | `chain_cut4batch` | `chain_cut8batch` |
+|---|---|---|---|---|
+| 1 | 138.3 | 165.6 a=1.86 1.20× | 165.4 a=1.86 1.20× | — |
+| 4 | 498.0 | 500.0 a=1.86 1.00× | **529.9 a=1.87 1.06×** | 528.9 a=1.86 1.06× |
+| 8 | 954.8 | 905.2 0.95× | 904.4 0.95× | **841.5 0.88×** |
+| 16 | 1745.3 | 1660.8 0.95× | 1654.3 0.95× | 1648.1 0.95× |
+| 32 | 2967.0 | 2836.4 0.96× | 2829.0 0.95× | — |
+| 64 | 4519.8 | 4274.1 0.95× | 4264.9 0.94× | — |
+
+One rung moves: concurrency 4, 1.00× → **1.06×**, at unchanged acceptance (1.86 → 1.87). Every
+other rung is inside noise, because `CF_SPEC_MAX_BATCH=4` already stops the drafter above a
+decode batch of 4, so buckets 2 and 4 are the only ones the kernel ever sees. **The cutoff
+threshold does not move**: raising it to 8 *with* batching gives 0.88× at concurrency 8, worse
+than the 0.95× the cutoff buys by not drafting at all — the batched kernel is only break-even
+against cutlass at B = 8, which is not enough to make drafting at batch 5–8 profitable.
+
+That narrowness is why the flag ships OFF: it is a +6 % at one rung of one arm, and the 9B/27B
+ladders have not been re-run with it.
 
 ### The first request at a new batch size stalls the engine
 

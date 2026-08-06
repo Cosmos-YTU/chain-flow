@@ -12,13 +12,20 @@ small kernel per expert-forward that hoists the cross-attention K/V (constant ac
 block-passes of a draft) out of the inner loop.
 
 Covered shapes (anything else silently falls back to PyTorch -- see ``supported()``):
-    batch 1, fp16, heads 8, ffn multiplier 6, S in {4, 8}, C <= 16, and
+    fp16, heads 8, ffn multiplier 6, S in {4, 8}, C <= 16, and
     D = 640  (Flow-Drafter-4B-v2)
     D = 1024 (Flow-Drafter-9B-v2, Flow-Drafter-Qwen3.5-27B-v2)
 
+``CF_CUDA_BLOCK_BATCH`` (DEFAULT OFF) additionally runs a DECODE BATCH as gridDim.y slices of
+one kernel instead of dropping to the PyTorch stack the moment batch > 1.  It is a win only up
+to a measured batch and hands everything above it back to cutlass -- see ``batch_limit``, which
+carries the table and the ncu explanation.
+
 Tunables (env): ``CF_CUDA_BLOCK_G`` grid size, ``CF_CUDA_BLOCK_T`` threads/block,
-``CF_CUDA_BLOCK_LB`` launch-bound variant (0 = (512,1), 1 = (512,2), 2 = (1024,1); the
-default follows the thread count),
+``CF_CUDA_BLOCK_LB`` launch-bound variant (0 = (512,1), 1 = (512,2), 2 = (1024,1), 3 = (256,1);
+the default follows the thread count; 1 and 2 SPILL ~590 B/thread at D=1024),
+``CF_CUDA_BLOCK_MAXB`` batch crossover override, ``CF_CUDA_BLOCK_NCOL`` columns per warp
+(compile-time; 4 was measured and lost, see the .cu),
 ``CF_CUDA_BLOCK_STAGES`` profiling hook, ``100*onebar + 10*skip + n``: run only the first n of the
 6 stages per block; skip the attention (skip=1) or attention plus its staging (skip=2); drop 5 of
 the 6 grid barriers while keeping all the work (onebar=1, a stopwatch -- the result is wrong).
@@ -202,6 +209,13 @@ def _load():
 
     os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", _arch_list())
+    # CF_CUDA_BLOCK_NCOL is compile-time (it sets the accumulator register budget), so it has to
+    # go in as a -D and it gets its own build directory -- otherwise ninja's timestamp check
+    # would happily reuse an .so built with a different NCOL.
+    ncol = os.environ.get("CF_CUDA_BLOCK_NCOL", "")
+    if ncol and ncol != "2":
+        os.environ["TORCH_EXTENSIONS_DIR"] = os.path.join(
+            build_dir(), os.pardir, f"ncol{ncol}")
     bd = build_dir()
     # A cache HIT must be silent (it is ~10 ms and happens on every engine start); a cache MISS
     # takes ~60 s of ninja and MUST say so, because an unexplained one-minute stall at model
@@ -217,7 +231,8 @@ def _load():
     _MOD = load(
         name=_NAME,
         sources=[str(_SRC)],
-        extra_cuda_cflags=["-O3", "-lineinfo", "--expt-relaxed-constexpr"],
+        extra_cuda_cflags=["-O3", "-lineinfo", "--expt-relaxed-constexpr"]
+        + ([f"-DCF_NCOL={ncol}"] if ncol else []),
         verbose=False,
     )
     if not cached:
@@ -225,20 +240,26 @@ def _load():
     return _MOD
 
 
-def _scratch(device, D, FD):
-    """Statically allocated cross-stage buffers.  Allocated once per expert, outside any graph
-    capture, so the kernel path does no dynamic allocation and no host sync.
+def _scratch(device, D, FD, B=1):
+    """Statically allocated cross-stage buffers for a batch of ``B`` drafts.
+
+    Allocated once per (expert, B), outside any graph capture, so the kernel path does no dynamic
+    allocation and no host sync.
 
     PER EXPERT, not shared: under ``CF_CUDA_PAIR`` the two chunk-experts run CONCURRENTLY, so a
     shared residual/qkv/hf scratch would have them overwrite each other.  The whole set is
-    ~130 KB, so privacy is free."""
+    ~130 KB per slice, so privacy is free.
+
+    PER B, never grown in place: a CUDA graph captures the BUFFER ADDRESS, so reallocating a
+    bigger scratch when a larger batch arrives would leave every already-captured bucket
+    replaying into freed memory.  Buckets therefore each keep their own (see ``_scratch_for``)."""
     h = dict(device=device, dtype=torch.float16)
     return dict(
-        res=torch.zeros(MAXS * D, device=device, dtype=torch.float32),
-        qkv=torch.zeros(MAXS * 3 * D, **h),
-        t1=torch.zeros(MAXS * D, **h),
-        hf=torch.zeros(MAXS * FD, **h),
-        xout=torch.zeros(MAXS * D, **h),
+        res=torch.zeros(B * MAXS * D, device=device, dtype=torch.float32),
+        qkv=torch.zeros(B * MAXS * 3 * D, **h),
+        t1=torch.zeros(B * MAXS * D, **h),
+        hf=torch.zeros(B * MAXS * FD, **h),
+        xout=torch.zeros(B * MAXS * D, **h),
     )
 
 
@@ -287,47 +308,87 @@ class FusedExpertBlocks:
         self.w, self.p = w, p
         self.mod = mod
         self._kv_cache = None
-        self._scratch = _scratch(device, D, lay.FD)
+        self._scratch_cache = {1: _scratch(device, D, lay.FD)}
         self.threads = int(os.environ.get("CF_CUDA_BLOCK_T", "512"))
         # launch-bound variant: 0 = (512,1) 128 regs, 1 = (512,2) 64 regs, 2 = (1024,1) 64 regs
         self.tb = int(os.environ.get("CF_CUDA_BLOCK_LB", "2" if self.threads > 512 else "0"))
         self._gcfg = int(os.environ.get("CF_CUDA_BLOCK_G", "0"))
         self._stages = int(os.environ.get("CF_CUDA_BLOCK_STAGES", "6"))
         self._grid = {}
+        self._caps = {}
 
-    def can_run(self, S: int, C: int) -> bool:
-        return supported(self.D, self.FM, NUM_HEADS, S, C, self.device)
+    def can_run(self, S: int, C: int, B: int = 1) -> bool:
+        if not supported(self.D, self.FM, NUM_HEADS, S, C, self.device):
+            return False
+        if B == 1:
+            return True
+        lim = batch_limit(self.D)
+        if lim and B > lim:       # economics, not capability -- see batch_limit
+            return False
+        return self.grid_for(S, C, B) > 0    # co-residency
 
     def cap(self, S, C) -> int:
         """Resident-block cap: the largest grid whose blocks are ALL guaranteed co-resident.
         The grid barrier spins, so a grid larger than this deadlocks."""
-        return int(self.mod.max_grid(self.threads, self.D, self.FM, S, C, self.tb))
+        key = (S, C)
+        v = self._caps.get(key)
+        if v is None:
+            v = int(self.mod.max_grid(self.threads, self.D, self.FM, S, C, self.tb))
+            self._caps[key] = v
+        return v
 
-    def _cfg(self, S, C, g=None):
-        cfg = self._grid.get((S, C, g))
+    def default_grid(self, S, C) -> int:
+        """Per-slice grid we would use at batch 1.
+
+        At most one threadblock per SM, and in fact FEWER than the 188 available: swept on an
+        RTX PRO 6000 (188 SM), 128 blocks won at D=640 and 96 at D=1024, both by ~10% over a full
+        188-block grid.  Past that point the grid barrier (6 per block-pass) costs more than the
+        extra streaming warps return -- the wide stages already have more columns than warps.
+        Two blocks per SM was measured and lost at both widths."""
+        sm = torch.cuda.get_device_properties(self.device).multi_processor_count
+        if self._gcfg > 0:
+            return self._gcfg
+        return min(sm, 128 if self.D <= 640 else 96)
+
+    def grid_for(self, S, C, B) -> int:
+        """Per-slice grid for a batch of B, or 0 when the batch cannot be run at all.
+
+        THE CONSTRAINT IS CO-RESIDENCY, and it is a hard one: each slice spins on its own grid
+        barrier, so all G*B blocks must be resident simultaneously or the kernel HANGS -- there
+        is no error, no fallback, just a wedged GPU.  Hence ``G = min(want, cap // B)``, and a
+        batch past ``cap`` (G would be 0) is refused here so the caller can take the PyTorch
+        path.  ``cap`` is the occupancy-derived resident-block count for this shape."""
+        cap = self.cap(S, C)
+        if cap <= 0:
+            return 0
+        return min(self.default_grid(S, C), cap // max(1, B))
+
+    def _cfg(self, S, C, B=1, g=None):
+        cfg = self._grid.get((S, C, B, g))
         if cfg is None:
-            cap = self.cap(S, C)
-            if cap <= 0:
+            G = min(g, self.cap(S, C) // B) if g else self.grid_for(S, C, B)
+            if G <= 0:
                 raise RuntimeError(
-                    f"fused block kernel has no instantiation that fits D={self.D} ffn=x{self.FM} "
-                    f"S={S} C={C} threads={self.threads}; can_run() should have rejected it")
-            # At most one threadblock per SM, and in fact FEWER than the 188 available: swept on
-            # an RTX PRO 6000 (188 SM), 128 blocks won at D=640 and 96 at D=1024, both by ~10%
-            # over a full 188-block grid.  Past that point the grid barrier (6 per block-pass)
-            # costs more than the extra streaming warps return -- the wide stages already have
-            # more columns than warps.  Two blocks per SM was measured and lost at both widths.
-            sm = torch.cuda.get_device_properties(self.device).multi_processor_count
-            default_g = min(sm, 128 if self.D <= 640 else 96)
-            want = g if g else (self._gcfg if self._gcfg > 0 else default_g)
-            G = min(want, cap)
-            # One barrier counter per grid size: the counter is monotonic (never reset, so it is
-            # CUDA-graph safe) and its bucket arithmetic is only valid while G stays fixed.
-            cfg = (G, torch.zeros(1, device=self.device, dtype=torch.int64))
-            self._grid[(S, C, g)] = cfg
+                    f"fused block kernel cannot fit D={self.D} ffn=x{self.FM} S={S} C={C} B={B} "
+                    f"threads={self.threads} in {self.cap(S, C)} resident blocks; "
+                    f"can_run() should have rejected it")
+            # One barrier counter PER SLICE, per grid size: each counter is monotonic (never
+            # reset, so it is CUDA-graph safe) and its bucket arithmetic is only valid while the
+            # per-slice G stays fixed.
+            cfg = (G, torch.zeros(B, device=self.device, dtype=torch.int64))
+            self._grid[(S, C, B, g)] = cfg
         return cfg
 
+    def _scratch_for(self, B):
+        """Per-B scratch, allocated once and never resized -- see ``_scratch``."""
+        s = self._scratch_cache.get(B)
+        if s is None:
+            s = _scratch(self.device, self.D, self.lay.FD, B)
+            self._scratch_cache[B] = s
+        return s
+
     def cross_kv(self, context_hidden):
-        """[1,C,D] -> [L,2,C,D] fp16.  Cached on tensor identity so the two Euler steps of a
+        """[B,C,D] -> [B,L,2,C,D] fp16.  Cached on tensor identity so the two Euler steps of a
         draft share one evaluation; recomputed during graph capture so the work is baked in."""
         D = self.D
         ctx = context_hidden.reshape(-1, D).to(torch.float16).contiguous()
@@ -335,9 +396,10 @@ class FusedExpertBlocks:
         c = self._kv_cache
         if not capturing and c is not None and c[0] is context_hidden and c[1] == _ver(context_hidden):
             return c[2]
-        C = ctx.shape[0]
-        out = torch.empty(self.L, 2, C, D, device=self.device, dtype=torch.float16)
-        self.mod.cross_kv(self.p, ctx, out, D, C, self.L, 40, 256)
+        B = max(1, context_hidden.shape[0]) if context_hidden.ndim == 3 else 1
+        C = ctx.shape[0] // B
+        out = torch.empty(B, self.L, 2, C, D, device=self.device, dtype=torch.float16)
+        self.mod.cross_kv(self.p, ctx, out, D, C, self.L, 40, 256, B)
         if not capturing:
             self._kv_cache = (context_hidden, _ver(context_hidden), out)
         return out
@@ -346,27 +408,27 @@ class FusedExpertBlocks:
         """Everything the launch needs, done on the CALLER's stream: cross K/V, the contiguous
         input copy, the mask cast, and the grid config.  Split out of ``forward`` so ``run_pair``
         can keep every allocation on the main stream and put only the kernel on the side one."""
-        S = x.shape[1]
+        B, S = x.shape[0], x.shape[1]
         kv = self.cross_kv(context_hidden)
-        C = kv.shape[2]
+        C = kv.shape[3]
         xin = x.reshape(-1, self.D).to(torch.float16).contiguous()
         m = attn_mask.to(torch.float16).contiguous() if attn_mask is not None else None
-        return (kv, xin, m, S, C) + self._cfg(S, C, g)
+        return (kv, xin, m, S, C, B) + self._cfg(S, C, B, g)
 
-    def launch(self, kv, xin, m, S, C, G, bar):
+    def launch(self, kv, xin, m, S, C, B, G, bar):
         """The kernel launch alone -- no allocation, no host sync, safe on any stream."""
-        s = self._scratch
-        xout = s["xout"][: S * self.D]
+        s = self._scratch_for(B)
+        xout = s["xout"][: B * S * self.D]
         self.mod.expert(self.w, kv, xin, xout, m, s["res"], s["qkv"], s["t1"], s["hf"], bar,
-                        self.D, self.FM, S, C, self.L, G, self.threads, self._stages, self.tb)
+                        self.D, self.FM, S, C, self.L, G, self.threads, self._stages, self.tb, B)
         return xout
 
     def forward(self, x, context_hidden, attn_mask=None):
-        """x [1,S,D] fp16 -> [1,S,D] fp16, running the whole L-block stack in one kernel."""
-        kv, xin, m, S, C, G, bar = self.prepare(x, context_hidden, attn_mask)
-        xout = self.launch(kv, xin, m, S, C, G, bar)
+        """x [B,S,D] fp16 -> [B,S,D] fp16, running the whole L-block stack in one kernel."""
+        p = self.prepare(x, context_hidden, attn_mask)
+        xout = self.launch(*p)
         # clone: xout is a reused static scratch buffer, so the caller must not alias it
-        return xout.view(1, S, self.D).to(x.dtype).clone()
+        return xout.view(x.shape[0], p[3], self.D).to(x.dtype).clone()
 
 
 def attach(expert) -> "FusedExpertBlocks | None":
@@ -409,6 +471,60 @@ def attach(expert) -> "FusedExpertBlocks | None":
 # matters more than the total -- 64/124 and 60/128 both hit 370 us, an even 94/94 only 409,
 # because chunk 0 is the S=4 expert and needs less.  128/128 (over the cap) fell back to
 # serial execution at 609 us, which is the benign failure but also proof the budget is real.
+def batch_enabled() -> bool:
+    """``CF_CUDA_BLOCK_BATCH`` -- run a decode batch as gridDim.y slices of one kernel.
+
+    DEFAULT OFF.  Batch >1 used to fall straight through to the PyTorch stack (the gate was
+    literally ``x.shape[0] == 1``), which is why the fused kernel only ever helped batch-1
+    serving.  Kept as a bare env read for the same reason as ``enabled()``: it is evaluated
+    inside a torch.compile'd forward and must not import or probe."""
+    return os.environ.get("CF_CUDA_BLOCK_BATCH", "0") not in ("0", "", "false", "False")
+
+
+# THE KERNEL DOES NOT WIN AT EVERY BATCH, and the co-residency cap is not where it stops paying.
+# Two different limits are in play and only the second one binds:
+#   * co-residency:  G >= 1 per slice needs B <= cap (188, or 376 for the 2-blocks/SM variants),
+#     so the kernel CAN run a batch of 188.  Past that it must refuse or it deadlocks.
+#   * economics:  the fused stack does plain fp32-accumulate FMA because M=8 underfills a
+#     tensor-core tile.  At batch 1 that is free -- there is no tile to fill and the whole thing
+#     is a weight stream.  As B grows, cutlass gets M=8*B rows against one weight tile and moves
+#     onto tensor cores, while THIS kernel keeps M=8 per slice and only gets its weight reads
+#     deduplicated by L2.  So the fused kernel improves sub-linearly in B and cutlass improves
+#     almost linearly, and they cross.
+# MEASURED on integrate(), ms (PyTorch compiled+cudagraphed vs the best fused config):
+#     D= 640  B=      1      2      4      8      16     32     64
+#             torch   2.035  2.195  2.234  2.516  3.438  3.771  4.421
+#             fused   0.803  0.945  1.399  2.444  3.900  7.865  18.33
+#             ratio   2.53x  2.32x  1.60x  1.03x  0.88x  0.48x  0.24x
+#     D=1024  B=      1      2      4      8      16     32
+#             torch   2.734  2.900  2.940  3.257  4.512  5.062
+#             fused   1.364  1.668  2.381  4.111  8.035  15.96
+#             ratio   2.00x  1.74x  1.23x  0.79x  0.56x  0.32x
+# so the honest ceiling is B<=8 at D=640 and B<=4 at D=1024; past it the PyTorch fallback is the
+# FASTER path, not a degradation.
+#
+# NCU SAYS WHY, and it is not the thing the design was aimed at.  Slicing worked exactly as
+# intended -- DRAM throughput collapses from 19.4% to 1.5% of peak (D=640, B=1 -> 64) because the
+# 128 MB L2 dedupes the weight stream every slice shares, and the "no eligible instruction" stall
+# falls from 0.29 to 0.04 per issue-active cycle.  What does not move is OCCUPANCY:
+# sm__warps_active is pinned at 33.33% at EVERY batch, because ~45 KB (D=640) / 69 KB (D=1024) of
+# shared memory allows one 16-warp block per SM.  So issue-active tops out at 55-61%, IPC at
+# 0.55-0.61, sm__throughput at 44-47%, and there it stops.  cutlass has neither constraint: it is
+# not co-resident-pinned, and at M=8*B it gets to use tensor cores where this kernel is committed
+# to scalar fp32-accumulate FMA (M=8 per slice, forever).  That is the crossover, and it cannot be
+# closed by tuning the launch -- see the NCOL=4 result in the .cu for one attempt that failed.
+#
+# `CF_CUDA_BLOCK_MAXB` overrides; 0 means "co-residency only", which is what to use when
+# re-measuring the crossover rather than trusting this table.
+def _maxb_default(D: int) -> int:
+    return 8 if D <= 640 else 4
+
+
+def batch_limit(D: int = 640) -> int:
+    v = os.environ.get("CF_CUDA_BLOCK_MAXB")
+    return _maxb_default(D) if v is None else int(v)
+
+
 def pair_enabled() -> bool:
     # DEFAULT ON behind CF_CUDA_BLOCK; `defaults.finalize_cuda_block` writes it down to "0"
     # whenever the block kernel itself is off or there are not exactly 2 chunk experts.
@@ -423,10 +539,10 @@ def _announce(fbs, prepped):
     a shape gate is how CF_CUDA_BLOCK once looked enabled while doing nothing."""
     global _PAIR_ANNOUNCED
     _PAIR_ANNOUNCED = True
-    d = " ".join(f"chunk{i}: S={p[3]} G={p[5]}/{fb.cap(p[3], p[4])}"
+    d = " ".join(f"chunk{i}: S={p[3]} G={p[6]}/{fb.cap(p[3], p[4])}"
                  for i, (fb, p) in enumerate(zip(fbs, prepped)))
-    print(f"[cf] CF_CUDA_PAIR engaged: D={fbs[0].D} C={prepped[0][4]} threads={fbs[0].threads} "
-          f"lb={fbs[0].tb}  {d}", flush=True)
+    print(f"[cf] CF_CUDA_PAIR engaged: D={fbs[0].D} C={prepped[0][4]} B={prepped[0][5]} "
+          f"threads={fbs[0].threads} lb={fbs[0].tb}  {d}", flush=True)
 
 
 _SIDE_STREAM: dict = {}
@@ -443,8 +559,8 @@ def _side_stream(device):
     return s
 
 
-def pair_grids(fbs, Ss, C):
-    """(G0, G1) for a concurrent pair, or None if the pair does not fit.
+def pair_grids(fbs, Ss, C, B=1):
+    """(G0, G1) PER SLICE for a concurrent pair, or None if the pair does not fit.
 
     Both grids occupy the machine at once, so the budget is the FRACTIONAL one:
     G0/cap0 + G1/cap1 <= 1, where cap_i is that shape's own resident-block cap (the two shapes
@@ -459,11 +575,16 @@ def pair_grids(fbs, Ss, C):
     default grid is smaller (96 vs 128): past that point chunk 1's own barrier costs more than
     its extra streaming warps return.
 
+    AT BATCH B the budget is per-slice: B*G0/cap0 + B*G1/cap1 <= 1, since both kernels launch B
+    slices.  A batch large enough to drive either grid below 1 block/slice does not fit and the
+    pair is refused (the caller then tries the serial fused path, which has the whole machine to
+    itself and so tolerates twice the batch).
+
     Memoised: ``cap`` is an extension call, and this runs inside the compiled flow_velocity."""
-    key = (id(fbs[0]), id(fbs[1]), tuple(Ss), C)
+    key = (id(fbs[0]), id(fbs[1]), tuple(Ss), C, B)
     if key in _PAIR_GRIDS:
         return _PAIR_GRIDS[key]
-    g = _pair_grids(fbs, Ss, C)
+    g = _pair_grids(fbs, Ss, C, B)
     _PAIR_GRIDS[key] = g
     return g
 
@@ -471,24 +592,32 @@ def pair_grids(fbs, Ss, C):
 _PAIR_GRIDS: dict = {}
 
 
-def _pair_grids(fbs, Ss, C):
-    caps = [fb.cap(S, C) for fb, S in zip(fbs, Ss)]
+def _pair_grids(fbs, Ss, C, B=1):
+    caps = [fb.cap(S, C) // max(1, B) for fb, S in zip(fbs, Ss)]
     if min(caps) <= 0:
         return None
     env = os.environ.get("CF_CUDA_PAIR_G", "")
     if env:
-        g = tuple(int(v) for v in env.split(","))
-        if len(g) != 2 or g[0] / caps[0] + g[1] / caps[1] > 1.0 + 1e-9:
+        g = tuple(int(v) // max(1, B) for v in env.split(","))
+        if len(g) != 2 or min(g) < 1 or g[0] / caps[0] + g[1] / caps[1] > 1.0 + 1e-9:
             return None
         return g
     f0 = 0.33 if fbs[0].D <= 640 else 0.40   # measured; see pair_grids
-    g0 = max(16, int(caps[0] * f0))
-    g1 = max(16, int(caps[1] * (1.0 - g0 / caps[0])))
+    g0 = max(1, min(caps[0], int(caps[0] * f0)))
+    g1 = max(1, int(caps[1] * (1.0 - g0 / caps[0])))
+    # A PAIR OF STARVED GRIDS IS WORSE THAN ONE HEALTHY ONE.  Splitting the machine two ways on
+    # top of an already B-way split leaves each expert a handful of blocks, and the concurrency
+    # stops paying for the halved grid.  MEASURED on integrate() at D=640 (ms, pair vs serial
+    # fused): B=1 0.803/1.249, B=2 0.945/1.383, B=4 1.399/1.637 -- pair wins; B=16 5.445/4.168,
+    # B=32 15.029/7.865 -- pair loses by 2x once g0 drops to 3.  Below 4 blocks per slice per
+    # expert, fall back to the serial fused path.
+    if min(g0, g1) < 4:
+        return None
     return (g0, g1) if g0 / caps[0] + g1 / caps[1] <= 1.0 + 1e-9 else None
 
 
 def run_pair(fbs, xs, context_hidden, masks, grids):
-    """Run two independent expert block-stacks concurrently; returns their [1,S,D] outputs.
+    """Run two independent expert block-stacks concurrently; returns their [B,S,D] outputs.
 
     Every allocation (cross K/V, the input copies, the output clones) happens on the CALLER's
     stream; the side stream carries only fbs[1]'s kernel, so nothing is freed on a stream other
@@ -504,5 +633,5 @@ def run_pair(fbs, xs, context_hidden, masks, grids):
         o1 = fbs[1].launch(*prepped[1])
     o0 = fbs[0].launch(*prepped[0])
     main.wait_stream(side)
-    return [o.view(1, p[3], fb.D).to(x.dtype).clone()
+    return [o.view(x.shape[0], p[3], fb.D).to(x.dtype).clone()
             for fb, o, p, x in zip(fbs, (o0, o1), prepped, xs)]

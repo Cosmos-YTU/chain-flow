@@ -4,7 +4,10 @@
 // transformer block, and loops over all L blocks of an expert internally, so an entire
 // HiddenKVFlowExpert block stack becomes ONE launch.
 //
-// Specialised for batch-1 serving.  Templated over the expert width D so all three shipped
+// A BATCH of drafts is B independent copies of that stack, carried on gridDim.y: only the
+// pointers move, so shared memory and every template parameter are unchanged (`S` is a draft's
+// ROW COUNT, never the batch).  The grid barrier is per-slice; the caller must therefore keep
+// G*B within the resident-block cap.  Templated over the expert width D so all three shipped
 // drafters are covered:
 //     4B  : D= 640, heads 8 (head_dim  80), ffn x6 (3840)
 //     9B  : D=1024, heads 8 (head_dim 128), ffn x6 (6144)
@@ -34,6 +37,10 @@
 #include <cuda_runtime.h>
 
 #define NH 8  // all shipped drafters use 8 heads
+
+#ifndef CF_NCOL
+#define CF_NCOL 2  // output columns per warp in the wide projections; see cf_fused_expert
+#endif
 
 // ---- packed per-pass weight layout (offsets in halves), derived from D and the ffn multiplier.
 // Must match the identical arithmetic in cuda_block.py.
@@ -337,17 +344,20 @@ __device__ __forceinline__ void small_attn(const __half* __restrict__ q, int ldq
 }
 
 // ------------------------------------------------------------------------------------------
+// BATCH lives on gridDim.y (see the slicing block at the top of cf_fused_expert).  Every buffer
+// below except `w` and `mask` is per-slice and carries a leading batch dimension; `bar` carries
+// one counter PER SLICE, because each slice's blocks synchronise only among themselves.
 struct Args {
   const __half* __restrict__ w;   // packed per-pass weights, L blocks x WL::STRIDE halves
-  const __half* __restrict__ kv;  // precomputed cross K/V: [L][2][C][D]
-  const __half* __restrict__ xin;
-  __half* __restrict__ xout;
-  const __half* __restrict__ mask;  // [S][S] additive fp16, or null
-  float* __restrict__ res;          // [S][D] fp32 residual stream
-  __half* __restrict__ qkv;         // [S][3*D]
-  __half* __restrict__ t1;          // [S][D]
-  __half* __restrict__ hf;          // [S][FD]
-  unsigned long long* bar;
+  const __half* __restrict__ kv;  // precomputed cross K/V: [B][L][2][C][D]
+  const __half* __restrict__ xin;   // [B][S][D]
+  __half* __restrict__ xout;        // [B][S][D]
+  const __half* __restrict__ mask;  // [S][S] additive fp16, or null -- SHARED across the batch
+  float* __restrict__ res;          // [B][S][D] fp32 residual stream
+  __half* __restrict__ qkv;         // [B][S][3*D]
+  __half* __restrict__ t1;          // [B][S][D]
+  __half* __restrict__ hf;          // [B][S][FD]
+  unsigned long long* bar;          // [B]
   int C, L, G;
   // Profiling hook, `100*onebar + 10*skip + n`: run only the first n of the 6 stages (6 = a full
   // block); skip attention (skip=1) or attention plus its smem staging (skip=2); n=0 runs the bare
@@ -366,9 +376,13 @@ struct Args {
 //   0 = (512, 1)  128 registers, 16 warps/block
 //   1 = (512, 2)   64 registers, lets two blocks share an SM where smem allows
 //   2 = (1024, 1)  64 registers, 32 warps/block
+//   3 = (256, 1)  255 registers, 8 warps/block -- the only variant with register headroom for
+//                 a wider NCOL (128 regs at 512 threads is already the whole 64K file).
+// SPILLS (ptxas -v, sm_120): variants 1 and 2 are CLEAN at D=640 (4 B) but spill ~590 B/thread
+// at D=1024 -- do not use them at the wide width without re-measuring.
 template <int TB>
 struct LB {
-  static constexpr int T = (TB == 2) ? 1024 : 512;
+  static constexpr int T = (TB == 2) ? 1024 : (TB == 3) ? 256 : 512;
   static constexpr int B = (TB == 1) ? 2 : 1;
 };
 
@@ -379,7 +393,21 @@ __global__ __launch_bounds__(LB<TB>::T, LB<TB>::B) void cf_fused_expert(Args a) 
   // Column tiling for the three wide projections (qkv, ffn-up, ffn-down).  The narrow D-column
   // stages keep NCOL=1: they already have fewer columns than resident warps, so tiling them
   // would only shrink the parallelism.
-  constexpr int NCOL = 2;
+  //
+  // NCOL is what amortises the SHARED-MEMORY side of the inner loop: per 128-wide k-chunk a warp
+  // does S smem loads and S*NCOL*4 FFMAs, so smem bytes per FMA go as 1/NCOL.  It is compile-time
+  // tunable (``CF_CUDA_BLOCK_NCOL`` -> -DCF_NCOL) because raising it costs S more accumulator
+  // registers per column and variant 0 is already pinned at the 128-register cap.
+  //
+  // NCOL=4 WAS MEASURED AT BATCH AND REFUTED (D=640, us/block-pass per slice, best config per B):
+  //     B=      1      4      8     16     32     64
+  //     NCOL=2  38.25  12.90  9.48  7.49   6.92   6.90
+  //     NCOL=4  41.49  14.06  9.32  7.62   6.58   6.52
+  // i.e. -8% at the batches that matter and +5% at batches where the kernel loses to cutlass
+  // anyway.  ptxas keeps variant 0 spill-free at NCOL 4 and 6, so this is not a spill effect:
+  // smem bandwidth simply is not the binding constraint.  NCOL must also divide into D, 3D and
+  // FM*D after multiplying by nwarps, which rules out 6 at D=640.
+  constexpr int NCOL = CF_NCOL;
   constexpr int LDQ = 3 * D + 8;  // padded smem row stride for staged qkv (bank-conflict free)
   constexpr int LDS = D + 8;      // padded smem row stride for staged q / k / v
   extern __shared__ __half smem[];
@@ -395,6 +423,30 @@ __global__ __launch_bounds__(LB<TB>::T, LB<TB>::B) void cf_fused_expert(Args a) 
   const int stages = a.stages % 10;        // 1..6 = run only the first N stages
   const int skip = (a.stages / 10) % 10;   // profiling: 1 = no attention, 2 = no attention/staging
   const bool onebar = a.stages >= 100;     // profiling: drop 5 of the 6 barriers (see Args)
+
+  // ---- BATCH SLICING ------------------------------------------------------------------
+  // The kernel is written for ONE draft; a batch is B independent copies of it, so slice `a`
+  // and let gridDim.y carry the batch.  Nothing here depends on B: shared memory is a function
+  // of (D, S, C) only, and `S` is a draft's ROW COUNT, not the batch -- so no new template
+  // instantiation.  The two shared buffers (`w`, `mask`) are deliberately NOT offset: every
+  // slice streams the same weights, which is the whole point (128 MB of L2 turns B-1 of the B
+  // weight reads into L2 hits).
+  //
+  // THE BARRIER IS PER SLICE.  A slice's blocks synchronise only among themselves, so each
+  // gets its own counter and `Gu` stays the PER-SLICE grid.  A shared counter would need all
+  // G*B blocks to arrive and would serialise the slices for no reason.  The caller must keep
+  // G*B <= the resident-block cap or every slice deadlocks -- see FusedExpertBlocks._cfg.
+  if (blockIdx.y) {
+    const long b = blockIdx.y;
+    a.xin += b * S * D;
+    a.xout += b * S * D;
+    a.res += b * S * D;
+    a.qkv += b * S * 3 * D;
+    a.t1 += b * S * D;
+    a.hf += b * S * FD;
+    a.kv += b * a.L * 2 * (long)C * D;
+    a.bar += b;
+  }
 #define GBAR() grid_bar(a.bar, Gu)
 
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < S * D; i += G * blockDim.x)
@@ -553,7 +605,7 @@ __global__ __launch_bounds__(LB<TB>::T, LB<TB>::B) void cf_fused_expert(Args a) 
 }
 
 // ------------------------------------------------------------------------------------------
-// Precompute cross-attention K/V for every block of an expert: out[l][0]=K, out[l][1]=V.
+// Precompute cross-attention K/V for every block of an expert: out[b][l][0]=K, out[b][l][1]=V.
 // Runs once per draft (context_hidden is constant across all 32 block-passes) and evaluates
 // context_norm ONCE instead of the two identical calls in the PyTorch block.
 template <int D>
@@ -565,6 +617,10 @@ __global__ void cf_cross_kv(const __half* __restrict__ pw, const __half* __restr
   const int nwarps = blockDim.x >> 5;
   const int lane = threadIdx.x & 31;
   const int l = blockIdx.y;
+  // blockIdx.z is the batch slice.  There is no grid barrier in this kernel, so the batch
+  // dimension costs nothing but pointer arithmetic and needs no co-residency budget.
+  ctx += (long)blockIdx.z * C * D;
+  out += (long)blockIdx.z * L * 2 * (long)C * D;
   const __half* P = pw + (long)l * PL<D>::STRIDE;
 
   for (int s = (threadIdx.x >> 5); s < C; s += nwarps) {
@@ -625,7 +681,10 @@ static const void* kfun() {
 
 template <int D, int FM, int S>
 static const void* kfun_v(int tb) {
-  return tb == 2 ? kfun<D, FM, S, 2>() : tb == 1 ? kfun<D, FM, S, 1>() : kfun<D, FM, S, 0>();
+  return tb == 3 ? kfun<D, FM, S, 3>()
+       : tb == 2 ? kfun<D, FM, S, 2>()
+       : tb == 1 ? kfun<D, FM, S, 1>()
+                 : kfun<D, FM, S, 0>();
 }
 
 template <int D, int FM, int S>
@@ -640,17 +699,20 @@ static int64_t max_grid_impl(int threads, int C, int tb) {
 }
 
 template <int D, int FM, int S>
-static void launch_impl(const Args& a, int C, int G, int threads, int tb) {
+static void launch_impl(const Args& a, int C, int G, int B, int threads, int tb) {
   const int sb = smem_halves<D, S>(C) * 2;
   auto stream = at::cuda::getCurrentCUDAStream();
   const void* f = kfun_v<D, FM, S>(tb);
   cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, sb);
-  if (tb == 2)
-    cf_fused_expert<D, FM, S, 2><<<G, threads, sb, stream>>>(a);
+  const dim3 grid((unsigned)G, (unsigned)B);
+  if (tb == 3)
+    cf_fused_expert<D, FM, S, 3><<<grid, threads, sb, stream>>>(a);
+  else if (tb == 2)
+    cf_fused_expert<D, FM, S, 2><<<grid, threads, sb, stream>>>(a);
   else if (tb == 1)
-    cf_fused_expert<D, FM, S, 1><<<G, threads, sb, stream>>>(a);
+    cf_fused_expert<D, FM, S, 1><<<grid, threads, sb, stream>>>(a);
   else
-    cf_fused_expert<D, FM, S, 0><<<G, threads, sb, stream>>>(a);
+    cf_fused_expert<D, FM, S, 0><<<grid, threads, sb, stream>>>(a);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -669,7 +731,7 @@ void cf_expert(torch::Tensor w, torch::Tensor kv, torch::Tensor xin, torch::Tens
                c10::optional<torch::Tensor> mask, torch::Tensor res, torch::Tensor qkv,
                torch::Tensor t1, torch::Tensor hf, torch::Tensor bar, int64_t D, int64_t FM,
                int64_t S, int64_t C, int64_t L, int64_t G, int64_t threads, int64_t stages,
-               int64_t tb) {
+               int64_t tb, int64_t B) {
   Args a;
   a.w = (const __half*)w.data_ptr();
   a.kv = (const __half*)kv.data_ptr();
@@ -685,18 +747,23 @@ void cf_expert(torch::Tensor w, torch::Tensor kv, torch::Tensor xin, torch::Tens
   a.L = (int)L;
   a.G = (int)G;
   a.stages = (int)stages;
-  TORCH_CHECK(threads % 32 == 0 && threads <= (tb == 2 ? 1024 : 512),
+  TORCH_CHECK(threads % 32 == 0 && threads <= (tb == 2 ? 1024 : tb == 3 ? 256 : 512),
               "cf_expert: threads exceeds the launch-bound variant");
   TORCH_CHECK(D % (threads / 32) == 0, "cf_expert: nwarps must divide D");
-  // NCOL=2 column tiling: every threadblock must consume a whole multiple of nwarps*NCOL columns
+  // NCOL column tiling: every threadblock must consume a whole multiple of nwarps*NCOL columns
   // so no warp runs off the end and the ffn-down k-slice index stays block-uniform.
-  TORCH_CHECK((D % (2 * threads / 32) == 0) && (3 * D % (2 * threads / 32) == 0),
-              "cf_expert: 2*nwarps must divide D");
+  TORCH_CHECK((D % (CF_NCOL * threads / 32) == 0) && (3 * D % (CF_NCOL * threads / 32) == 0)
+                  && (FM * D % (CF_NCOL * threads / 32) == 0),
+              "cf_expert: NCOL*nwarps (", CF_NCOL * threads / 32, ") must divide D, 3D and FM*D");
   TORCH_CHECK(C < PLD && S < PLD, "cf_expert: S and C must be < ", PLD);
-#define F(d, fm, s)                                                     \
-  if (D == d && FM == fm && S == s) {                                   \
-    launch_impl<d, fm, s>(a, (int)C, (int)G, (int)threads, (int)tb);     \
-    return;                                                             \
+  // The grid barrier spins, so EVERY block of EVERY slice has to be resident at once.  A too-big
+  // grid is a silent hang, not an error, so the budget is checked here as well as in Python.
+  TORCH_CHECK(B >= 1 && bar.numel() >= B, "cf_expert: bar needs one counter per batch slice (B=",
+              B, ", got ", bar.numel(), ")");
+#define F(d, fm, s)                                                            \
+  if (D == d && FM == fm && S == s) {                                          \
+    launch_impl<d, fm, s>(a, (int)C, (int)G, (int)B, (int)threads, (int)tb);    \
+    return;                                                                    \
   }
   CF_FOR_EACH_INST(F)
 #undef F
@@ -704,9 +771,9 @@ void cf_expert(torch::Tensor w, torch::Tensor kv, torch::Tensor xin, torch::Tens
 }
 
 void cf_kv(torch::Tensor pw, torch::Tensor ctx, torch::Tensor out, int64_t D, int64_t C, int64_t L,
-           int64_t G, int64_t threads) {
+           int64_t G, int64_t threads, int64_t B) {
   const int sb = (int)((C + 7) / 8 * 8) * (int)D * 2;
-  dim3 grid((unsigned)G, (unsigned)L);
+  dim3 grid((unsigned)G, (unsigned)L, (unsigned)B);
   auto stream = at::cuda::getCurrentCUDAStream();
   if (D == 640) {
     cudaFuncSetAttribute((const void*)cf_cross_kv<640>,
