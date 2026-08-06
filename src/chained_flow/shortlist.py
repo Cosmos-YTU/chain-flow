@@ -52,6 +52,18 @@ def packaged_path() -> Path:
 # ------------------------------------------------------------------ load / guard
 
 
+def ids_content_sha(ids) -> str:
+    """sha256 of the SORTED int32 ids -- an identity for the list's CONTENT, not its bytes.
+
+    The same set of ids saved by two code paths differs byte-wise (metadata, tensor layout) while
+    naming identical tokens, so a file hash would reject a correct list. This is what the loader
+    compares against a checkpoint's declared identity.
+    """
+    import hashlib, torch
+    t = ids if hasattr(ids, "to") else torch.as_tensor(ids)
+    return hashlib.sha256(t.to(torch.int32).flatten().sort().values.numpy().tobytes()).hexdigest()
+
+
 def load(path: str):
     """``(ids int64 CPU tensor, meta dict)``.
 

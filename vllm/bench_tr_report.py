@@ -124,6 +124,14 @@ def main() -> None:
                             ("SET B -- turkishdspark benchmark", SET_B)):
             cond = ("natural EOS, max 256 tok" if args.tag == "_nateos"
                     else "256 tok forced, ignore_eos")
+            # A collection that was never run printed a header and a POOLED row of 0.0 with every
+            # other cell "-". That is the "ran and produced nothing" ambiguity the warnings above
+            # exist to kill, reintroduced as a table: 0.0 tok/s is indistinguishable from a real
+            # arm that collapsed. Say it was not run, and print no numbers.
+            if not any(s in d for d in data.values() for s in sets):
+                print(f"\n### {size.upper()}  {label}: NOT RUN (no result files for "
+                      f"{', '.join(sets)}) -- no numbers to report")
+                continue
             print(f"\n### {size.upper()}  {label}   (concurrency 1, greedy, {cond})")
             hdr = f"| {'set':13s} |"
             for a in data:

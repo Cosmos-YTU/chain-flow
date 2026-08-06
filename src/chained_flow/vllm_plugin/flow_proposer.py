@@ -715,12 +715,40 @@ class FlowDrafterProposer:
                 rejected.append(f"{src} {path}: {bad}")
                 continue
             sl = ids[(ids >= 0) & (ids < V)].unique().to(self.dev)
+            # IDENTITY CHECK. A checkpoint may declare which shortlist it was trained and measured
+            # with; if resolution landed on a different one, that is a silent accept loss (-0.41 at
+            # 27B, -0.70 at 9B, invisible without an A/B) and never something to proceed through.
+            # Keyed on a CONTENT hash of the sorted ids, not the file bytes: the same list saved by
+            # two code paths differs byte-wise while naming identical tokens, and a file-hash check
+            # would raise on that.
+            decl = self._declared_shortlist()
+            if decl:
+                got = _slmod.ids_content_sha(sl.detach().cpu())
+                want_rows, want_sha = decl.get("rows"), decl.get("ids_sha256")
+                if (want_rows and int(want_rows) != sl.numel()) or (want_sha and want_sha != got):
+                    raise RuntimeError(
+                        "shortlist does not match what this drafter declares.\n"
+                        f"  resolved : {path}  [{src}]\n"
+                        f"             {sl.numel()} rows, ids-sha256 {got}\n"
+                        f"  declared : {want_rows} rows, ids-sha256 {want_sha}\n"
+                        "  This drafter was trained and measured against the declared list; a\n"
+                        "  different one silently costs acceptance. Fix by letting the drafter's\n"
+                        "  own shortlist.pt resolve (it ships in the model repo), or set\n"
+                        "  CF_SHORTLIST to the declared list if you know what you are doing.")
             self._sl, self._sl_src = sl, f"{src} {os.path.basename(path)}"
             self._hw = lm_w[sl].contiguous()
             self._w2 = d.markov.w2.weight[sl].contiguous()
             print(f"[chained-flow] shortlist head: {sl.numel()} of {V} rows "
                   f"({V / max(sl.numel(), 1):.2f}x less head traffic) from {path} [{src}]",
                   flush=True)
+            # A list that did NOT come with the drafter is a guess, even when it loads cleanly.
+            # Published drafters ship their own, so this should be unreachable for them; say so
+            # rather than letting an unrelated list pass silently, which was the original bug.
+            if src not in ("drafter checkpoint", "CF_SHORTLIST"):
+                print(f"[chained-flow] WARNING: this shortlist did NOT come from the drafter "
+                      f"({src}). The drafter did not ship one and declares no identity, so this "
+                      f"is a guess; acceptance may be silently below what the model can do.",
+                      flush=True)
             break
         if rejected:
             # Loud, and loud even when a later candidate DID load: "the packaged list was
@@ -974,6 +1002,18 @@ class FlowDrafterProposer:
         except Exception:
             pass
         return depth
+
+    def _declared_shortlist(self) -> dict:
+        """`shortlist` block from the drafter's own config, if it declares one.
+
+        Optional by design: checkpoints published before this field existed simply do not have it,
+        and must keep loading. Its presence turns a silent mismatch into a hard failure.
+        """
+        try:
+            with open(os.path.join(self.ckd, "chained_flow_tree_config.json")) as f:
+                return json.load(f).get("shortlist") or {}
+        except Exception:
+            return {}
 
     class _DS:
         def __init__(s, h): s.final_hidden = h
