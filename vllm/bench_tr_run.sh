@@ -37,13 +37,24 @@ export CUDA_VISIBLE_DEVICES=$GPU
 CF_PY=${CF_PY:-/home/shadeform/vllm/.venv/bin/python}
 export PYTHONPATH=$ROOT/src
 
-if [ "$SIZE" = "4b" ]; then
-  CF_MODEL=Qwen/Qwen3.5-4B; V2=selimaktas/Flow-Drafter-4B-v2; TR=selimaktas/Flow-Drafter-4B-tr
-  GMU=${CF_GMU:-0.55}
-else
-  CF_MODEL=Qwen/Qwen3.5-9B; V2=selimaktas/Flow-Drafter-9B-v2; TR=selimaktas/Flow-Drafter-9B-tr
-  GMU=${CF_GMU:-0.70}
-fi
+# An unrecognised SIZE is a HARD EXIT, not a fallback. This was `if 4b ... else <9b>`, so any other
+# size -- `27b`, a typo, anything -- was silently served as the 9B stack with the 9B drafters, while
+# the output directory, the log lines and the report were all labelled with the size that was asked
+# for. That is wrong-and-plausible, which is strictly worse than a crash: a crash costs an hour, a
+# plausible wrong number can reach a model card. It produced correct results for 4b and 9b only
+# because those were the only two call sites, which is luck, not safety.
+case "$SIZE" in
+  4b)
+    CF_MODEL=Qwen/Qwen3.5-4B; V2=selimaktas/Flow-Drafter-4B-v2; TR=selimaktas/Flow-Drafter-4B-tr
+    GMU=${CF_GMU:-0.55} ;;
+  9b)
+    CF_MODEL=Qwen/Qwen3.5-9B; V2=selimaktas/Flow-Drafter-9B-v2; TR=selimaktas/Flow-Drafter-9B-tr
+    GMU=${CF_GMU:-0.70} ;;
+  *)
+    echo "[bench_tr] FATAL: unsupported size '$SIZE'. This script serves only: 4b, 9b." >&2
+    echo "[bench_tr] For 27B use vllm/bench_tr27b_run.sh (different model, drafters and GMU)." >&2
+    exit 2 ;;
+esac
 
 # CF_SHORTLIST must be decided BEFORE `defaults.py --sh` runs: `was_explicit()` is keyed on
 # whether the variable was already in the environment, and an explicit value skips the
