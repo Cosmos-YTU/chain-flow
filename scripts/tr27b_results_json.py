@@ -26,7 +26,7 @@ import re
 #   lang: EN | TR (in-distribution Turkish holdout) | TRO (out-of-distribution Turkish)
 #   ckpt: v2 | tr300 | tr600 | tr900 | tr1500  -- finalists are carried, never one
 #   head: enSL | trSL | full
-SECTION = re.compile(r"^#+\s*\d+\.\s*(EN|TRO|TR)\s*/\s*(v2|tr300|tr600|tr900|tr1500|tr1800|tr2100)\s*/\s*(enSL|trSL|full)")
+SECTION = re.compile(r"^#+\s*\d+\.\s*(EN|TRO|TR)\s*/\s*(v2|tr300|tr600|tr900|tr1500|tr1800|tr2100|tr2400|tr2553)\s*/\s*(enSL|trSL|full)")
 ROW = re.compile(
     r"^(?P<dom>\S+)\s+(?P<n>\d+)\s+(?P<tree>[\d.]+)\s+(?P<hchain>[\d.]+)\s+"
     r"(?P<pchain>[\d.]+)\s+(?P<delta>[+-][\d.]+)(?:\s+PLUGIN-TREE\s+(?P<ptree>[\d.]+))?"
@@ -96,6 +96,67 @@ def parse(path: str) -> dict[str, dict[str, dict[str, float]]]:
     return out
 
 
+TRO_CORPORA = ("turkish_alpaca_100", "wikirag_tr_100")
+
+
+def _tro_ladder(s: dict) -> str | None:
+    """Apply the selection rule MECHANICALLY, and show the evidence that licenses it.
+
+    RULE, fixed before the numbers landed:
+      Maximise TRO. A candidate replaces the incumbent only if it improves in BOTH OOD corpora
+      independently. Otherwise it is a TIE and the EARLIER checkpoint wins.
+
+    Why both-corpora and not a threshold: the eval is DETERMINISTIC (init_mode=delta, fixed-step
+    Euler, no sampling anywhere in the inference path), so re-running is bit-identical and there is
+    no run-to-run noise to set a threshold against. The open question is not "would I measure this
+    again" but "is this window subset representative of Turkish generally". A move in one corpus is
+    exactly the subset artifact the two-corpus construction exists to catch; a move in two unrelated
+    corpora is the evidence that licensed preferring 1500 over 600 in the first place. Promoting
+    that same standard to the tie-break costs nothing and removes the discretion that would
+    otherwise let "tie" be decided after seeing which way it points.
+    """
+    order = ["tr300", "tr600", "tr900", "tr1500", "tr1800", "tr2100", "tr2400", "tr2553"]
+    rows = []
+    for ck in order:
+        d = s.get(f"TRO:{ck}:trSL", {})
+        t = s.get(f"TR:{ck}:trSL", {})
+        if not d:
+            continue
+        vals = {c: d[c]["plugin_chain"] for c in TRO_CORPORA if c in d}
+        if len(vals) != len(TRO_CORPORA):
+            print(f"  ({ck}: only {sorted(vals)} present -- cannot apply the both-corpora rule)")
+            continue
+        tr = sum(v["plugin_chain"] for v in t.values()) / len(t) if t else None
+        rows.append((ck, vals, sum(vals.values()) / len(vals), tr))
+    if not rows:
+        return None
+
+    print(f"\n{'ckpt':<8} {'alpaca':>8} {'wikirag':>8} {'TRO':>7} {'TR':>7}   verdict vs incumbent")
+    print("-" * 74)
+    inc, inc_vals, inc_tro, _ = rows[0]
+    print(f"{rows[0][0]:<8} {inc_vals[TRO_CORPORA[0]]:8.2f} {inc_vals[TRO_CORPORA[1]]:8.2f} "
+          f"{inc_tro:7.3f} {rows[0][3]:7.3f}   (incumbent: earliest measured)")
+    for ck, vals, tro, tr in rows[1:]:
+        d0 = vals[TRO_CORPORA[0]] - inc_vals[TRO_CORPORA[0]]
+        d1 = vals[TRO_CORPORA[1]] - inc_vals[TRO_CORPORA[1]]
+        both = d0 > 0 and d1 > 0
+        verdict = (f"BEATS {inc} (alpaca {d0:+.2f}, wikirag {d1:+.2f})" if both
+                   else f"tie vs {inc} (alpaca {d0:+.2f}, wikirag {d1:+.2f}) -> earlier keeps it")
+        print(f"{ck:<8} {vals[TRO_CORPORA[0]]:8.2f} {vals[TRO_CORPORA[1]]:8.2f} {tro:7.3f} "
+              f"{tr:7.3f}   {verdict}")
+        if both:
+            inc, inc_vals, inc_tro = ck, vals, tro
+    # TR is a FLOOR, not a selector: it is flat across the plateau so it should never bind, but a
+    # material in-distribution drop while TRO rises would be strange enough to investigate.
+    trs = [r[3] for r in rows if r[3] is not None]
+    win_tr = next((r[3] for r in rows if r[0] == inc), None)
+    if trs and win_tr is not None and win_tr < max(trs) - 0.05:
+        print(f"\n  FLOOR WARNING: {inc} TR={win_tr:.3f} is >0.05 below the best TR ({max(trs):.3f}). "
+              f"In-distribution Turkish dropping while TRO rises is odd -- investigate, do not ship blind.")
+    print(f"\n  SELECTED: {inc}  (maximise TRO; a candidate must improve in BOTH corpora to advance)")
+    return inc
+
+
 def merge(before: dict, after: dict) -> dict:
     doms = list(before) + [d for d in after if d not in before]
     return {d: {"before": (before.get(d) or {}).get("plugin_chain"),
@@ -113,7 +174,7 @@ def main() -> int:
     # Which finalist the card is built from. Set it from the FINALIST COMPARISON table,
     # not by default -- the whole point of carrying two is that the choice is evidence-led.
     ap.add_argument("--ship", default="tr600",
-                    choices=["tr300", "tr600", "tr900", "tr1500", "tr1800", "tr2100"])
+                    choices=["tr300", "tr600", "tr900", "tr1500", "tr1800", "tr2100", "tr2400", "tr2553"])
     args = ap.parse_args()
 
     s = parse(args.log)
@@ -144,7 +205,7 @@ def main() -> int:
           f"{'EN free':>8} {'dfree':>7}")
     print("-" * 86)
     fin = {}
-    for ck in ("v2", "tr300", "tr600", "tr900", "tr1500", "tr1800", "tr2100"):
+    for ck in ("v2", "tr300", "tr600", "tr900", "tr1500", "tr1800", "tr2100", "tr2400", "tr2553"):
         row = {ax: hmean(f"{ax}:{ck}:trSL") for ax in ("TR", "TRO", "EN")}
         en = s.get(f"EN:{ck}:trSL", {})
         # `/ max(count, 1)` here used to turn "no free-form domain matched" into 0.00 rather than
@@ -164,8 +225,9 @@ def main() -> int:
         print(f"{ck:<8} {f(row['TR'])} {d(row['TR'], base['TR'])} {f(row['TRO'])} "
               f"{d(row['TRO'], base['TRO'])} {f(row['EN'])} {d(row['EN'], base['EN'])} "
               f"{f(row['EN_free'])} {d(row['EN_free'], bf)}")
-    print("\nDecide on TRO and EN free-form: TR is an in-distribution holdout drawn from the same")
-    print("corpus as training, so it flatters later checkpoints; TRO and EN are independent of it.")
+    print("\nDecide on TRO: TR is an in-distribution holdout drawn from the same corpus as training,")
+    print("so it flatters later checkpoints; TRO is independent of it.")
+    _tro_ladder(s)
 
     # ---- three-head A/B on the shipped checkpoint ----------------------------------------------
     ship = args.ship  # which finalist the card is built from

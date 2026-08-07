@@ -119,6 +119,9 @@ def main():
     ap.add_argument("--keep", type=int, default=8)
     ap.add_argument("--depth", type=int, default=5)
     ap.add_argument("--topb", type=int, default=8)
+    ap.add_argument("--dump-windows", default=None,
+                    help="write per-window (row_index, accepted_len) for the plugin arm to this "
+                         "json, for row-level bootstrap of the subset-composition spread")
     args = ap.parse_args()
 
     dev, dtype = "cuda", torch.float16
@@ -167,9 +170,16 @@ def main():
           f"{'plugin chain':>13} {'delta':>7}")
     print("-" * 76)
     tot = {"h": [], "p": []}
+    # --dump-windows: per-window (row_index, accepted_length) for the PLUGIN arm, so the mean's
+    # dependence on subset composition can be measured by cluster-bootstrapping whole rows.
+    per_window = {} if args.dump_windows else None
     for dom, ds in rows:
         wins = []
-        for ex in ds:
+        # Row provenance per window. Windows inside one sequence are strongly correlated, so any
+        # resampling estimate of "how much does this mean depend on WHICH sequences landed in the
+        # subset" has to resample whole rows, not windows. Resampling windows independently would
+        # understate the spread badly.
+        for _row_idx, ex in enumerate(ds):
             ids = ex["input_ids"]
             fh = torch.tensor(ex["final_hidden"], dtype=dtype)
             T = min(len(ids), fh.shape[0])
@@ -179,7 +189,7 @@ def main():
             # published per-domain accept, which is measured during generation.
             start = max(C, int(ex.get("prompt_length", 0)))
             for i in range(start, T - K - 1):
-                wins.append((fh[i - C: i + 1], ids[i], ids[i + 1: i + 1 + K]))
+                wins.append((fh[i - C: i + 1], ids[i], ids[i + 1: i + 1 + K], _row_idx))
                 if len(wins) >= args.per_domain:
                     break
             if len(wins) >= args.per_domain:
@@ -260,6 +270,8 @@ def main():
                     while d < len(ch) and d < len(t) and int(ch[d]) == int(t[d]):
                         d += 1
                     acc[key] += d
+                    if key == "p" and per_window is not None:
+                        per_window.setdefault(dom, []).append((int(chunk[j][3]), d))
         ah, apl, at = 1 + acc["h"] / n, 1 + acc["p"] / n, 1 + acc["t"] / n
         tot["h"].append(ah); tot["p"].append(apl); tot.setdefault("t", []).append(at)
         extra = ""
