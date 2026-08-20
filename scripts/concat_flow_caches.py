@@ -55,14 +55,20 @@ def load_shard(d: Path) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--shards", required=True, help="glob of cache dirs")
+    # Repeatable, and ORDER IS PRESERVED across occurrences (each glob sorted internally).
+    # That matters for the v2 extension: passing the finished v1 cache first keeps the v2 store a
+    # true prefix extension of v1, so row i means the same thing in both.
+    ap.add_argument("--shards", required=True, action="append",
+                    help="glob of cache dirs; repeatable, earlier globs land first")
     ap.add_argument("--verify", type=int, default=64, help="rows to re-read and compare")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    dirs = [Path(p) for p in sorted(glob.glob(args.shards))]
+    dirs = [Path(p) for g in args.shards for p in sorted(glob.glob(g))]
     if not dirs:
         raise SystemExit(f"no cache dirs matched {args.shards!r}")
+    if len(dirs) != len(set(dirs)):
+        raise SystemExit(f"overlapping globs would duplicate rows: {[str(d) for d in dirs]}")
 
     shards = []
     tot_tokens = tot_rows = 0
@@ -146,7 +152,7 @@ def main() -> int:
     torch.save(orig_idx, out / FILES["original_row_indices"])
     md = dict(shards[0]["metadata"])
     md.update(num_rows=tot_rows, total_tokens=tot_tokens,
-              source_rows=row_cursor, dataset_path=args.shards,
+              source_rows=row_cursor, dataset_path=",".join(args.shards),
               merged_from=[d.name for d in dirs])
     with (out / METADATA).open("w", encoding="utf-8") as f:
         json.dump(md, f, indent=2)

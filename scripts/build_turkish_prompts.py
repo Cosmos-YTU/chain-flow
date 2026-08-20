@@ -42,7 +42,17 @@ def main() -> int:
     ap.add_argument("--out", default="bench_data_tr")
     ap.add_argument("--tokenizer", default="Qwen/Qwen3.5-27B")
     ap.add_argument("--seed", type=int, default=0)
+    # v2 EXPANSION. The key order comes from a seeded shuffle and HOLDOUT fills first, so raising
+    # `train` yields the SAME holdout and the SAME existing train rows followed by new ones -- the
+    # old collection stays valid and only the tail needs collecting. Verify that, do not assume it.
+    ap.add_argument("--plan-override", default=None,
+                    help='JSON {"source": train_rows} raising per-source train counts')
     args = ap.parse_args()
+    if args.plan_override:
+        for k, v in json.loads(args.plan_override).items():
+            if k not in PLAN:
+                raise SystemExit(f"unknown source {k!r}; known: {sorted(PLAN)}")
+            PLAN[k] = dict(PLAN[k], train=int(v))
 
     from transformers import AutoTokenizer
 
