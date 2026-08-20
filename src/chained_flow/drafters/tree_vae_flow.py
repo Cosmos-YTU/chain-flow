@@ -176,7 +176,7 @@ class TreeVAEFlowDrafter(TreeFlowDrafter):
 
     def forward_teacher(self, context: torch.Tensor, target_hidden: torch.Tensor,
                         future_tokens: torch.Tensor, prev_token: torch.Tensor | None = None,
-                        anchor_token: torch.Tensor | None = None):
+                        anchor_token: torch.Tensor | None = None, *, fused_head: bool = False):
         anchor = self.anchor_embed(anchor_token)
         ctx_lat = self._encode(context.to(self._dtype))
         tgt_lat = self._encode(target_hidden.to(self._dtype))
@@ -187,6 +187,34 @@ class TreeVAEFlowDrafter(TreeFlowDrafter):
         v_star = tgt_lat - z0                                    # flow matching in LATENT space
         v_pred = self.flow_velocity(z_tau, tau, ctx_lat, previous=tgt_lat, anchor=anchor)
         pred_hidden = self._decode(self.integrate(ctx_lat, z0, anchor=anchor))  # decoded marginal hidden
+        # FUSED-HEAD FAST PATH. `base_logits`/`cond_logits` are [B, K, 248320]; at 27B that is
+        # 254 MB apiece in bf16, and the markov bias is a third one. The three losses that consume
+        # them only need per-row reductions (logsumexp, the true-token logit, the (b+1)-th largest),
+        # so when the loss module asks for it we hand back the HIDDENS and the markov factor and
+        # let it reduce in chunks -- see training/fused_head.py.
+        if fused_head:
+            if self.training and float(getattr(self.config, "sched_sampling_p", 0.0)) > 0.0:
+                raise RuntimeError(
+                    "fused_head cannot serve sched_sampling_p>0: scheduled sampling needs "
+                    "base_logits.argmax over the full vocabulary. Set CF_FUSED_HEAD=0 for that run.")
+            residual = self._path_residual(future_tokens, prev_token)
+            prev = torch.zeros_like(future_tokens)
+            prev[:, 1:] = future_tokens[:, :-1]
+            if prev_token is not None:
+                prev = prev.clone()
+                prev[:, 0] = prev_token
+            emb = self.markov.w1(prev)
+            if prev_token is None:
+                # reference sets bias[:, 0, :] = 0; w2 is a Linear WITHOUT bias, so a zero
+                # embedding row reproduces that exactly rather than approximately.
+                emb = emb.clone()
+                emb[:, 0, :] = 0.0
+            out = {"v_pred": v_pred, "v_star": v_star, "pred_hidden": pred_hidden,
+                   "cond_hidden": pred_hidden + residual, "markov_emb": emb}
+            if self.train_vae:
+                out["recon_hidden"] = self._decode(tgt_lat)
+            return out
+
         base_logits = self.lm_head(pred_hidden)
 
         path_tokens = future_tokens

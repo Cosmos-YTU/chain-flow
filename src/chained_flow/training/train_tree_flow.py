@@ -7,6 +7,8 @@ inside the top-b at each conditioned position so the draft tree has the right ca
 """
 from __future__ import annotations
 
+import os
+
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
@@ -97,6 +99,10 @@ def tree_config_from_args(a: TreeModelArguments) -> TreeFlowConfig:
     return TreeFlowConfig(**common)
 
 
+def _truthy(v) -> bool:
+    return v is not None and str(v) not in ("0", "", "false", "False", "FALSE", "no", "off", "OFF")
+
+
 class TreeFlowTrainingModule(nn.Module):
     def __init__(self, frozen_lm: FrozenLMWrapper, dcfg: TreeFlowConfig, loss_cfg: FlowLossArguments):
         super().__init__()
@@ -110,6 +116,29 @@ class TreeFlowTrainingModule(nn.Module):
         self.register_buffer("lm_head_weight", lm_head.weight.detach().clone(), persistent=False)
         bias = getattr(lm_head, "bias", None)
         self.lm_head_bias = None if bias is None else self.register_buffer("lm_head_bias", bias.detach().clone(), persistent=False)
+
+        # ---- TRAINING FAST PATH (both default ON; each can be turned off independently) ----
+        # CF_FUSED_HEAD: reduce the [B, K, 248320] logits in row chunks rather than materialising
+        #   them. Proven loss- and gradient-equivalent in fp64 by scripts/verify_fused_head.py.
+        #   Declines automatically when lambda_dist>0 or scheduled sampling is on, because those
+        #   genuinely need the full distribution -- it never silently drops a term.
+        # CF_FUSED_CHUNK: rows per chunk. Peak head activation is chunk x vocab, so 64 rows is
+        #   ~64 MB fp32 against 509 MB for a full 512-row microbatch.
+        # CF_COMPILE: torch.compile the drafter. The INFERENCE path already runs this module stack
+        #   under max-autotune, so it is known to compile; training was left in eager. Inductor
+        #   cannot fuse through nn.MultiheadAttention's opaque SDPA boundary, so this helps the
+        #   flow blocks (24 kernels each, 32 passes per forward) far more than the VAE.
+        self._fused_head = _truthy(os.environ.get("CF_FUSED_HEAD", "1"))
+        self._fused_chunk = int(os.environ.get("CF_FUSED_CHUNK", "64"))
+        if _truthy(os.environ.get("CF_COMPILE", "1")):
+            mode = os.environ.get("CF_COMPILE_MODE", "default")
+            try:
+                self.drafter = torch.compile(self.drafter, mode=mode, dynamic=False)
+                print(f"[chained-flow] training: torch.compile(drafter, mode={mode})", flush=True)
+            except Exception as e:                                        # noqa: BLE001
+                print(f"[chained-flow] torch.compile unavailable ({e!r}); running eager", flush=True)
+        print(f"[chained-flow] training: fused_head={self._fused_head} chunk={self._fused_chunk}",
+              flush=True)
 
     def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states.to(dtype=self.lm_head_weight.dtype)
@@ -187,19 +216,45 @@ class TreeFlowTrainingModule(nn.Module):
         context_hidden = self.drafter.build_context(context_hidden, lag_token)
         if not getattr(self.drafter.config, "prev_token_cond", True):
             prev_token = None
-        out = self.drafter.forward_teacher(context_hidden, target_hidden, future_tokens, prev_token,
-                                           anchor_token=anchor_token)
         cfg = self.loss_config
+        # FUSED HEAD: reduce the [B, K, 248320] logits in chunks instead of materialising them.
+        # Refused when lambda_dist>0: `_tv` needs the FULL drafter distribution to compare against
+        # the teacher's, which no per-row reduction can supply. Better to decline than to quietly
+        # drop a loss term.
+        use_fused = self._fused_head and float(getattr(cfg, "lambda_dist", 0.0)) <= 0.0
+        out = self.drafter.forward_teacher(context_hidden, target_hidden, future_tokens, prev_token,
+                                           anchor_token=anchor_token, fused_head=use_fused)
         th = target_hidden.to(out["pred_hidden"].dtype)
-        comp = {
-            "flow.mse": F.mse_loss(out["v_pred"], out["v_star"]),
-            "hidden.rel_mse": self._rel_mse(out["pred_hidden"], th),
-            "hidden.rel_mse_cond": self._rel_mse(out["cond_hidden"], th),   # path-conditioned hidden
-            "logit.ce": self._ce(out["cond_logits"], future_tokens),        # path-conditioned (main)
-            "logit.ce_base": self._ce(out["base_logits"], future_tokens),   # keep marginal decodable
-            "tree.coverage": self._coverage(out["cond_logits"], future_tokens),
-            "verifier.expected_accept": self._accept(out["cond_logits"], future_tokens),
-        }
+        if use_fused:
+            from chained_flow.training.fused_head import (accept_from, ce_from, coverage_from,
+                                                          head_reductions)
+            W, bs = self.lm_head_weight, self.lm_head_bias
+            lse_c, true_c, kth_c = head_reductions(
+                out["cond_hidden"], W, bs, future_tokens, markov_emb=out["markov_emb"],
+                markov_w2=self.drafter.markov.w2.weight, cov_b=self.drafter.config.cov_b,
+                chunk=self._fused_chunk)
+            lse_b, true_b, _ = head_reductions(out["pred_hidden"], W, bs, future_tokens,
+                                               chunk=self._fused_chunk)
+            comp = {
+                "flow.mse": F.mse_loss(out["v_pred"], out["v_star"]),
+                "hidden.rel_mse": self._rel_mse(out["pred_hidden"], th),
+                "hidden.rel_mse_cond": self._rel_mse(out["cond_hidden"], th),
+                "logit.ce": ce_from(lse_c, true_c),
+                "logit.ce_base": ce_from(lse_b, true_b),
+                "tree.coverage": coverage_from(kth_c, true_c, self.drafter.config.cov_margin),
+                "verifier.expected_accept": accept_from(lse_c, true_c, cfg.gamma,
+                                                        self.loss_config.eps),
+            }
+        else:
+            comp = {
+                "flow.mse": F.mse_loss(out["v_pred"], out["v_star"]),
+                "hidden.rel_mse": self._rel_mse(out["pred_hidden"], th),
+                "hidden.rel_mse_cond": self._rel_mse(out["cond_hidden"], th),  # path-conditioned
+                "logit.ce": self._ce(out["cond_logits"], future_tokens),       # conditioned (main)
+                "logit.ce_base": self._ce(out["base_logits"], future_tokens),  # marginal decodable
+                "tree.coverage": self._coverage(out["cond_logits"], future_tokens),
+                "verifier.expected_accept": self._accept(out["cond_logits"], future_tokens),
+            }
         lam_tv = float(getattr(cfg, "lambda_dist", 0.0))
         if lam_tv > 0.0:
             comp["logit.tv"] = self._tv(out["cond_logits"], target_hidden)
