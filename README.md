@@ -6,6 +6,13 @@ over the target model's own final hidden states, then decodes the trajectory
 through the frozen `lm_head`. Verification is vLLM's, unchanged, so the output
 distribution is the target model's.
 
+## Training
+
+To train or continue a drafter (Turkish or otherwise), see **[TRAINING.md](TRAINING.md)** — clone,
+`uv venv`, `uv pip install -r requirements.txt`, fetch the prompts, run one script. That path is
+CUDA-13 and deliberately does **not** install vLLM: training imports it nowhere, and keeping the
+two environments separate avoids a second torch pin.
+
 ## Install
 
 ```bash

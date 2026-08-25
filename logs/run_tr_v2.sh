@@ -20,8 +20,17 @@ cd /home/shadeform/chained-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 
-SIZE="${1:?usage: run_tr_v2.sh <4btr|9btr|tr27b> "<gpu list>"}"
-GPUS="${2:?usage: run_tr_v2.sh <size> "<gpu list>"}"
+SIZE="${1:?usage: run_tr_v2.sh <4btr|9btr|tr27b> \"<gpus>\" [preset]}"
+GPUS="${2:?usage: run_tr_v2.sh <size> \"<gpus>\" [preset]}"
+PRESET="${3:-instruct}"
+
+# torch.compile mode. max-autotune costs several minutes of warm-up per graph and then benchmarks
+# real kernel variants; over a multi-hour run that is the right trade, which is why it is the
+# default here and only `default` in the library. CF_FUSED_HEAD/CF_FUSED_CHUNK default on in the
+# training module -- set CF_FUSED_HEAD=0 to fall back to the reference path.
+export CF_COMPILE="${CF_COMPILE:-1}"
+export CF_COMPILE_MODE="${CF_COMPILE_MODE:-max-autotune}"
+export CF_FUSED_HEAD="${CF_FUSED_HEAD:-1}"
 case "$SIZE" in
   4btr)  V1_CACHE=data/flow_cache/stage1_4btr_mix_k4  ; NEED_GB=180 ;;
   9btr)  V1_CACHE=""                                  ; NEED_GB=320 ;;  # full recollect, no reuse
@@ -29,16 +38,29 @@ case "$SIZE" in
   *) echo "unknown size $SIZE (want 4btr|9btr|tr27b)"; exit 2 ;;
 esac
 CFG_DIR=collect_configs/stage1_${SIZE}_v2
-CACHE=data/flow_cache/stage1_${SIZE}_v2_mix_k4
-LOG=logs/tr_v2_${SIZE}
+TRAIN_CFG=train_configs/recovered/joint_${SIZE}_v2_${PRESET}.yaml
+CACHE=$($PY -c "import yaml;print(yaml.safe_load(open('$TRAIN_CFG'))['dataset_path'])" 2>/dev/null)
+LOG=logs/tr_v2_${SIZE}_${PRESET}
 mkdir -p "$LOG"
 say(){ echo "[$(date -u +%F' '%H:%M:%S)] $*" | tee -a "$LOG/pipeline.log"; }
 freegb(){ df --output=avail -BG / | tail -1 | tr -dc '0-9'; }
 
-[ -d "$CFG_DIR" ] || { say "ABORT: no $CFG_DIR -- run scripts/gen_tr_v2_configs.py"; exit 1; }
+[ -f "$TRAIN_CFG" ] || { say "ABORT: no $TRAIN_CFG -- run: $PY scripts/gen_tr_v2_configs.py --preset $PRESET"; exit 1; }
+[ -d "$CFG_DIR" ] || { say "ABORT: no $CFG_DIR -- run: $PY scripts/gen_tr_v2_configs.py --preset $PRESET"; exit 1; }
+[ -n "$CACHE" ]   || { say "ABORT: could not read dataset_path from $TRAIN_CFG"; exit 1; }
+
+# Prompts. A fresh clone has no bench_data_tr_v2/ -- it is data, not source. Fetch it from the
+# published dataset rather than requiring the upstream turkishdspark corpus to be present.
+if [ ! -f bench_data_tr_v2/tr-instructurca.train.jsonl ]; then
+  say "fetching prompts from selimaktas/turkish-flow-drafter-prompts"
+  $PY scripts/fetch_tr_prompts.py || { say "ABORT: prompt fetch failed"; exit 1; }
+fi
 [ -n "$V1_CACHE" ] && [ ! -f "$V1_CACHE/metadata.json" ] && { say "ABORT: v1 cache $V1_CACHE missing; it is an INPUT, not optional"; exit 1; }
 
-say "START size=$SIZE gpus=[$GPUS] free=$(freegb)G need>=${NEED_GB}G"
+say "START size=$SIZE preset=$PRESET gpus=[$GPUS] free=$(freegb)G need>=${NEED_GB}G"
+say "  compile=$CF_COMPILE mode=$CF_COMPILE_MODE fused_head=$CF_FUSED_HEAD"
+say "  train config: $TRAIN_CFG"
+say "  cache:        $CACHE"
 [ "$(freegb)" -lt "$NEED_GB" ] && { say "ABORT: only $(freegb)G free, need ${NEED_GB}G. Free space or shard the run."; exit 1; }
 
 # ---------------------------------------------------------------- 0. restore the VAE weights
@@ -46,7 +68,7 @@ say "START size=$SIZE gpus=[$GPUS] free=$(freegb)G need>=${NEED_GB}G"
 # published drafter, so the local copies were deleted to reclaim disk. They still have to be on disk
 # before training starts, and finding that out at launch -- after waiting hours for GPUs -- is the
 # expensive way to learn it. Restore is a no-op when the file is already there.
-VDIR=$($PY -c "import yaml,sys;print(yaml.safe_load(open('train_configs/recovered/joint_${SIZE}_v2.yaml'))['vae_dir'])")
+VDIR=$($PY -c "import yaml;print(yaml.safe_load(open('$TRAIN_CFG'))['vae_dir'])")
 say "vae_dir: $VDIR"
 $PY scripts/restore_vae.py --dir "$VDIR" 2>&1 | tee -a "$LOG/pipeline.log"
 [ -f "$VDIR/model.safetensors" ] || { say "ABORT: could not restore the VAE at $VDIR"; exit 1; }
@@ -112,7 +134,7 @@ MIN=$([ "$SIZE" = "9btr" ] && echo 45000 || echo 48000)
 NG=$(set -- $GPUS; echo $#)
 say "TRAIN start ($NG GPUs)"
 CUDA_VISIBLE_DEVICES=$(echo $GPUS | tr ' ' ',') $PY -m torch.distributed.run --nproc_per_node=$NG \
-    --master_port=29531 scripts/train_tree_flow.py train_configs/recovered/joint_${SIZE}_v2.yaml \
+    --master_port=29531 scripts/train_tree_flow.py "$TRAIN_CFG" \
     2>&1 | grep -viE "it/s\]$|examples/s\]$" >>"$LOG/train.log"
 say "TRAIN rc=$? free=$(freegb)G"
 say "NEXT: sweep the checkpoints with scripts/sweep_tr27b_checkpoints.py and pick with the TRO"

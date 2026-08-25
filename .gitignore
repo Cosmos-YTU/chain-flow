@@ -82,3 +82,9 @@ vllm/_cf_backup/
 # directory, so a `!.../*.pt` rule on its own is never even evaluated.
 !src/chained_flow/data/
 !src/chained_flow/data/*.pt
+
+# Turkish prompt corpora: fetched by scripts/fetch_tr_prompts.py from the published dataset,
+# not tracked here (94 MB of jsonl that has a canonical home on the Hub).
+bench_data_tr/
+bench_data_tr_v2/
+bench_data_tr_ood/
