@@ -41,6 +41,16 @@ freegb(){ df --output=avail -BG / | tail -1 | tr -dc '0-9'; }
 say "START size=$SIZE gpus=[$GPUS] free=$(freegb)G need>=${NEED_GB}G"
 [ "$(freegb)" -lt "$NEED_GB" ] && { say "ABORT: only $(freegb)G free, need ${NEED_GB}G. Free space or shard the run."; exit 1; }
 
+# ---------------------------------------------------------------- 0. restore the VAE weights
+# `vae_dir` points at a LOCAL directory whose weights are byte-identical to the vae/ bundled in the
+# published drafter, so the local copies were deleted to reclaim disk. They still have to be on disk
+# before training starts, and finding that out at launch -- after waiting hours for GPUs -- is the
+# expensive way to learn it. Restore is a no-op when the file is already there.
+VDIR=$($PY -c "import yaml,sys;print(yaml.safe_load(open('train_configs/recovered/joint_${SIZE}_v2.yaml'))['vae_dir'])")
+say "vae_dir: $VDIR"
+$PY scripts/restore_vae.py --dir "$VDIR" 2>&1 | tee -a "$LOG/pipeline.log"
+[ -f "$VDIR/model.safetensors" ] || { say "ABORT: could not restore the VAE at $VDIR"; exit 1; }
+
 # ---------------------------------------------------------------- 1. wait for the GPUs
 # A card is FREE only if nothing at all is resident.  Checking utilisation is not enough: an idle
 # vLLM server sits at 0% while holding 88 GB, and starting a 27B collector on top of it OOMs.
