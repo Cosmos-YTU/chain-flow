@@ -63,19 +63,30 @@ INIT = {
                  "9btr": "selimaktas/Flow-Drafter-9B-v2",
                  "tr27b": "selimaktas/Flow-Drafter-Qwen3.5-27B-v2"},
 }
-# Per-size geometry and the 2xB300 batch shape. Effective batch is held at v1's 6144 windows in
-# every case -- only the microbatch/accumulation SPLIT changes, so the optimisation trajectory is
-# unchanged and only throughput moves. The fused head removes the [B, K, 248320] activation that
-# forced the 27B microbatch down to 64, and a B300 has ~288 GB, so these are far larger than v1.
-# UNVERIFIED ON B300 (no card was free to test): if a run OOMs, halve `mb` and double `accum`.
+# Per-size geometry and the 2xB300 batch shape.
+#
+# `eff` is that size's OWN v1 effective batch (per_device x accum x 2 GPUs) and is preserved
+# exactly, so only the microbatch/accumulation SPLIT changes and the optimisation trajectory is
+# untouched. They differ per size -- 4B 12,288, 9B 24,576, 27B 6,144 -- so there is no single rule;
+# `assert mb * accum * 2 == eff` below is what keeps a hand edit from silently changing the run.
+# Doubling effective batch at a constant LR is a different experiment, not a speed knob.
+#
+# The microbatch is far larger than v1 because the fused head removes the [B, K, 248320] activation
+# that forced the 27B microbatch down to 64, and a B300 has ~288 GB.
+# UNVERIFIED ON B300 (no card was free to test): if a run OOMs, halve `mb` and double `accum` --
+# the assert will tell you immediately if the pair stops matching.
 GEO = {
     "4btr":  dict(model="Qwen/Qwen3.5-4B",  ed=640,  ls=640,  vi=1920, mb=2048, accum=3,  lr=1.5e-4,
-                  vae="out/vae/ckpts/transformer-hidden-4bx-2560-latent640-fp16"),
-    "9btr":  dict(model="Qwen/Qwen3.5-9B",  ed=1024, ls=1024, vi=3072, mb=1024, accum=6,  lr=1.5e-4,
-                  vae="out/vae/ckpts/transformer-hidden-9bx-4096-latent1024-fp16"),
-    "tr27b": dict(model="Qwen/Qwen3.5-27B", ed=1024, ls=1024, vi=4096, mb=512,  accum=12, lr=1.0e-4,
-                  vae="out/vae/ckpts/transformer-hidden-q3527bx-5120-latent1024-fp16"),
+                  eff=12288, vae="out/vae/ckpts/transformer-hidden-4bx-2560-latent640-fp16"),
+    "9btr":  dict(model="Qwen/Qwen3.5-9B",  ed=1024, ls=1024, vi=3072, mb=2048, accum=6,  lr=1.5e-4,
+                  eff=24576, vae="out/vae/ckpts/transformer-hidden-9bx-4096-latent1024-fp16"),
+    "tr27b": dict(model="Qwen/Qwen3.5-27B", ed=1024, ls=1024, vi=4096, mb=512,  accum=6,  lr=1.0e-4,
+                  eff=6144, vae="out/vae/ckpts/transformer-hidden-q3527bx-5120-latent1024-fp16"),
 }
+for _s, _g in GEO.items():
+    assert _g["mb"] * _g["accum"] * 2 == _g["eff"], (
+        f"{_s}: {_g['mb']} x {_g['accum']} x 2 = {_g['mb']*_g['accum']*2}, "
+        f"but v1's effective batch was {_g['eff']}")
 
 
 def write_train_config(size, preset, init_mode, epochs):

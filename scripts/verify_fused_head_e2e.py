@@ -8,7 +8,7 @@ the algebraic claim is made in the other script.
 """
 import os, sys, torch
 
-os.environ["CF_COMPILE"] = "0"          # compile is orthogonal; test the math alone
+os.environ.setdefault("CF_COMPILE", "0")   # math is tested compile-free; CF_COMPILE=1 also works
 torch.manual_seed(0)
 
 from chained_flow.training.train_tree_flow import TreeFlowTrainingModule
@@ -74,4 +74,24 @@ print(f"  worst param-grad deviation: {worst[1]:.3e}  ({worst[0]})   params comp
 if miss: print(f"  !! extra grads in fused only: {sorted(miss)}"); ok = False
 ok &= worst[1] < 2e-5
 print("  ALL COMPONENTS + GRADS MATCH" if ok else "  !! MISMATCH")
+
+# CHECKPOINT KEY FORMAT. torch.compile(module) returns a wrapper whose parameters are renamed
+# `_orig_mod.*`, and assigning it back writes those names into model.safetensors. The published
+# checkpoints use `drafter.*`, so such a file loads into NOTHING at inference -- and
+# warm_start_from uses load_state_dict(strict=False), so the next run would warm-start from zero
+# parameters while printing success. Compiling the bound method avoids it; this asserts that.
+os.environ["CF_COMPILE"] = "1"
+import importlib
+import chained_flow.training.train_tree_flow as T
+importlib.reload(T)
+torch.manual_seed(1234)
+m = T.TreeFlowTrainingModule(_Frozen(), dcfg, loss_cfg).float()
+bad = [k for k in m.state_dict() if "_orig_mod" in k]
+print(f"\n  state_dict keys with CF_COMPILE=1: {len(m.state_dict())}, "
+      f"containing '_orig_mod': {len(bad)}")
+if bad:
+    print(f"  !! compile renamed the checkpoint keys, e.g. {bad[0]}")
+    ok = False
+else:
+    print("  key format matches the published checkpoints (drafter.*)")
 sys.exit(0 if ok else 1)

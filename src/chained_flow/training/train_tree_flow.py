@@ -130,11 +130,21 @@ class TreeFlowTrainingModule(nn.Module):
         #   flow blocks (24 kernels each, 32 passes per forward) far more than the VAE.
         self._fused_head = _truthy(os.environ.get("CF_FUSED_HEAD", "1"))
         self._fused_chunk = int(os.environ.get("CF_FUSED_CHUNK", "64"))
+        # Compile the BOUND METHOD, never `self.drafter` itself. `torch.compile(module)` returns an
+        # OptimizedModule wrapper, and assigning it back renames every parameter to
+        # `drafter._orig_mod.*` -- which would be written straight into model.safetensors. The
+        # published checkpoints use `drafter.*`, so such a file loads into nothing at inference,
+        # and `warm_start_from` uses `load_state_dict(strict=False)`, meaning the NEXT run would
+        # warm-start from zero parameters while printing success. Compiling the method keeps the
+        # module (and therefore state_dict, named_parameters and DDP) untouched.
+        self._compiled_teacher = None
         if _truthy(os.environ.get("CF_COMPILE", "1")):
             mode = os.environ.get("CF_COMPILE_MODE", "default")
             try:
-                self.drafter = torch.compile(self.drafter, mode=mode, dynamic=False)
-                print(f"[chained-flow] training: torch.compile(drafter, mode={mode})", flush=True)
+                self._compiled_teacher = torch.compile(self.drafter.forward_teacher,
+                                                       mode=mode, dynamic=False)
+                print(f"[chained-flow] training: torch.compile(drafter.forward_teacher, "
+                      f"mode={mode})", flush=True)
             except Exception as e:                                        # noqa: BLE001
                 print(f"[chained-flow] torch.compile unavailable ({e!r}); running eager", flush=True)
         print(f"[chained-flow] training: fused_head={self._fused_head} chunk={self._fused_chunk}",
@@ -222,8 +232,9 @@ class TreeFlowTrainingModule(nn.Module):
         # the teacher's, which no per-row reduction can supply. Better to decline than to quietly
         # drop a loss term.
         use_fused = self._fused_head and float(getattr(cfg, "lambda_dist", 0.0)) <= 0.0
-        out = self.drafter.forward_teacher(context_hidden, target_hidden, future_tokens, prev_token,
-                                           anchor_token=anchor_token, fused_head=use_fused)
+        _teacher = self._compiled_teacher or self.drafter.forward_teacher
+        out = _teacher(context_hidden, target_hidden, future_tokens, prev_token,
+                       anchor_token=anchor_token, fused_head=use_fused)
         th = target_hidden.to(out["pred_hidden"].dtype)
         if use_fused:
             from chained_flow.training.fused_head import (accept_from, ce_from, coverage_from,

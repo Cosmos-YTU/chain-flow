@@ -100,9 +100,13 @@ loss and gradient to machine epsilon) and end-to-end on the real training module
 rather than degrades**: `lambda_dist > 0` and scheduled sampling both fall back to the reference
 path instead of dropping a term.
 
-Effective batch is held at v1's 6144 windows in every generated config, so only throughput changes,
-not the optimisation path. **The microbatch sizes are unverified on B300** — no card was free to
-test. On an OOM, halve `per_device_train_batch_size` and double `gradient_accumulation_steps`.
+Each size's own v1 effective batch is preserved exactly — 4B 12,288 windows, 9B 24,576, 27B 6,144 —
+so only the microbatch/accumulation split changes and the optimisation trajectory is untouched.
+They differ per size, so there is no single rule; `gen_tr_v2_configs.py` asserts
+`mb × accum × 2 == eff` to stop a hand edit silently turning a speed change into a different
+experiment. **The microbatch sizes are unverified on B300** — no card was free to test. On an OOM,
+halve `per_device_train_batch_size` and double `gradient_accumulation_steps`; the assert will flag
+it immediately if the pair stops matching.
 
 ## 6. After training — do not skip
 
