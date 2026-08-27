@@ -113,8 +113,11 @@ CF_GEN_BS=64 CF_HID_BS=32 python scripts/gen_tr_v2_configs.py
 
 These are **unverified on B300** like the training batch shapes. If collection OOMs, halve them.
 
-Stopping and restarting is cheap: a shard is considered done when its flow cache exists, so a
-restart skips everything already collected. That is what makes it safe to kill a run partway and
+Stopping and restarting is cheap at two levels. A shard is done when its flow cache exists, so a
+restart skips it entirely. And within a shard, the generated answers are kept
+(`teacher_states/_tmp_<name>`) and reused, so a phase-2 failure does **not** cost the generation —
+which is the expensive half, ~24 minutes for a 4,000-row shard at 27B. That matters because phase 2
+is the phase that OOMs, so tuning `hid` is cheap to iterate on. That is what makes it safe to kill a run partway and
 come back with a bigger batch.
 
 ### Watching it

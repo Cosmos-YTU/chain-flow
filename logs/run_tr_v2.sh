@@ -190,12 +190,26 @@ for cfg in "$CFG_DIR"/*.yaml; do
     say "[skip] $name already has a shard cache"
     continue
   fi
+  # PHASE-1 REUSE. collect_teacher_states.py always writes the generated answers to
+  # teacher_states/_tmp_<output_dir_name>, but only AFTER generation finishes -- and it never reads
+  # them back unless `answer_dataset_path` says to. Generation is the expensive phase (~24 min for
+  # a 4000-row shard) and phase 2 is the one that OOMs, so without this every phase-2 retry redoes
+  # all of it. `state.json` is the completeness marker: save_to_disk writes it last, so its presence
+  # means generation ran to the end.
+  tmpd="teacher_states/_tmp_stage1-${SIZE}-v2-${name}"
+  shard_cfg="$cfg"
+  if [ -f "$tmpd/state.json" ]; then
+    shard_cfg="$LOG/resume_${name}.yaml"
+    grep -v '^answer_dataset_path:' "$cfg" > "$shard_cfg"
+    echo "answer_dataset_path: $tmpd" >> "$shard_cfg"
+    say "[g$g] REUSING phase-1 answers for $name ($tmpd) -- skipping generation"
+  fi
   ( say "[g$g] COLLECT $name START"
     # POSITIONAL, and it must be the ONLY argument: collect_teacher_states.py dispatches on
     # `len(sys.argv) == 2 and sys.argv[1].endswith(".yaml")`. A `--config` flag falls through to
     # the full argparse, which rejects it instantly -- which is what killed all 13 shards in
     # three seconds each.
-    CUDA_VISIBLE_DEVICES=$g $PY scripts/collect_teacher_states.py "$cfg" \
+    CUDA_VISIBLE_DEVICES=$g $PY scripts/collect_teacher_states.py "$shard_cfg" \
         >>"$LOG/collect_g$g.log" 2>&1
     rc=$?
     if [ $rc -eq 0 ]; then
@@ -222,8 +236,8 @@ for cfg in "$CFG_DIR"/*.yaml; do
       # doubles peak disk for no benefit. Deleted ONLY on a clean preprocess with a real cache on
       # disk -- on failure they are kept so the shard can be reprocessed without recollecting.
       if [ $prc -eq 0 ] && [ -f "data/flow_cache/_shard_${SIZE}v2_${name}/metadata.json" ]; then
-        rm -rf "teacher_states/stage1-${SIZE}-v2-${name}"
-        say "[g$g] freed teacher states for $name  free=$(freegb)G"
+        rm -rf "teacher_states/stage1-${SIZE}-v2-${name}" "teacher_states/_tmp_stage1-${SIZE}-v2-${name}"
+        say "[g$g] freed teacher states + phase-1 answers for $name  free=$(freegb)G"
       else
         say "[g$g] KEEPING teacher states for $name (preprocess rc=$prc) -- reprocess, do not recollect"
       fi
