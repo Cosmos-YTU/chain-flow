@@ -108,6 +108,10 @@ CF_GEN_BS=64 CF_HID_BS=32 python scripts/gen_tr_v2_configs.py
 
 These are **unverified on B300** like the training batch shapes. If collection OOMs, halve them.
 
+Stopping and restarting is cheap: a shard is considered done when its flow cache exists, so a
+restart skips everything already collected. That is what makes it safe to kill a run partway and
+come back with a bigger batch.
+
 ## 6. Performance knobs
 
 | variable | default | what it does |

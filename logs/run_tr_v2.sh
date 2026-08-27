@@ -132,6 +132,14 @@ i=0; pids=""
 for cfg in "$CFG_DIR"/*.yaml; do
   set -- $GPUS; shift $(( i % $# )); g=$1
   name=$(basename "$cfg" .yaml)
+  # RESUME. A shard is done when its flow cache exists -- that is the artifact the concat consumes,
+  # and it is only written after a clean preprocess. Skipping here is what makes it safe to stop a
+  # run and restart it with different batch sizes: everything already collected is kept.
+  # (`--overwrite` on the preprocess step overwrites, it does not skip; it is not a resume guard.)
+  if [ -f "data/flow_cache/_shard_${SIZE}v2_${name}/metadata.json" ]; then
+    say "[skip] $name already has a shard cache"
+    continue
+  fi
   ( say "[g$g] COLLECT $name START"
     # POSITIONAL, and it must be the ONLY argument: collect_teacher_states.py dispatches on
     # `len(sys.argv) == 2 and sys.argv[1].endswith(".yaml")`. A `--config` flag falls through to
@@ -177,6 +185,7 @@ for cfg in "$CFG_DIR"/*.yaml; do
 done
 wait $pids
 say "collection+preprocess complete free=$(freegb)G"
+say "  shard caches present: $(ls -d data/flow_cache/_shard_${SIZE}v2_* 2>/dev/null | wc -l)/$(ls "$CFG_DIR"/*.yaml | wc -l)"
 
 # ---------------------------------------------------------------- 3. gate: every shard must exist
 missing=0
