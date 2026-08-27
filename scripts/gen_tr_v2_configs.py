@@ -169,11 +169,27 @@ def main() -> int:
     ap.add_argument("--preset", choices=sorted(PRESETS), default="instruct")
     ap.add_argument("--init", choices=sorted(INIT), default="continue")
     ap.add_argument("--epochs", type=float, default=3.0)
+    ap.add_argument("--no-reuse", action="store_true",
+                    help="collect EVERY row instead of only the tail. Required on a machine that "
+                         "does not have the v1 flow cache -- the tail-only plan assumes v1's rows "
+                         "are already represented by that cache, and it is 124 GB of DERIVED data "
+                         "that is not published anywhere.")
     opts = ap.parse_args()
     plan = PRESETS[opts.preset]
+    if opts.no_reuse:
+        for _c in SIZES.values():
+            _c["reuse"] = False
     print(f"preset={opts.preset}  target rows/source={plan}\n")
     for size, cfg in SIZES.items():
         out = f"collect_configs/stage1_{size}_v2"
+        # CLEAR FIRST. Shard filenames encode their row range, so changing preset or reuse mode
+        # produces a DIFFERENT set of names and the old ones survive alongside the new. That is not
+        # cosmetic: `multiturn_0_2145` next to a leftover `multiturn_1200_2145` collects rows
+        # [1200,2145) twice and silently duplicates them into the training cache. Nothing downstream
+        # would notice -- the shards are valid, the concat succeeds, the row count merely looks high.
+        if os.path.isdir(out):
+            for stale in os.listdir(out):
+                os.remove(os.path.join(out, stale))
         os.makedirs(out, exist_ok=True)
         n = 0
         for stem, src, v1_end, v2_max in SRC:
@@ -205,6 +221,22 @@ def main() -> int:
                         f"output_dir: teacher_states/stage1-{size}-v2-{name}\n")
                 n += b - a
                 a = b
+        # Overlap is the failure that duplicating rows would cause, so assert on the RANGES rather
+        # than trusting that clearing the directory was enough.
+        import collections as _c
+        _by = _c.defaultdict(list)
+        for _f in os.listdir(out):
+            _d = open(os.path.join(out, _f)).read()
+            _src = [l.split(": ")[1] for l in _d.splitlines() if l.startswith("source: ")][0]
+            _s0 = int([l.split(": ")[1] for l in _d.splitlines() if l.startswith("dataset_start:")][0])
+            _e0 = int([l.split(": ")[1] for l in _d.splitlines() if l.startswith("dataset_end:")][0])
+            _by[_src].append((_s0, _e0))
+        for _src, _rs in _by.items():
+            _rs.sort()
+            for (_a1, _b1), (_a2, _b2) in zip(_rs, _rs[1:]):
+                if _a2 < _b1:
+                    raise SystemExit(f"{out}: overlapping ranges for {_src}: "
+                                     f"[{_a1},{_b1}) and [{_a2},{_b2}) would collect rows twice")
         tc = write_train_config(size, opts.preset, opts.init, opts.epochs)
         print(f"{out:38s} shards={len(os.listdir(out)):3d}  rows={n:6d}"
               f"  ({'tail only' if cfg['reuse'] else 'FULL recollect'})  -> {tc}")

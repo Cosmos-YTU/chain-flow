@@ -32,9 +32,9 @@ export CF_COMPILE="${CF_COMPILE:-1}"
 export CF_COMPILE_MODE="${CF_COMPILE_MODE:-max-autotune}"
 export CF_FUSED_HEAD="${CF_FUSED_HEAD:-1}"
 case "$SIZE" in
-  4btr)  V1_CACHE=data/flow_cache/stage1_4btr_mix_k4  ; NEED_GB=180 ;;
-  9btr)  V1_CACHE=""                                  ; NEED_GB=320 ;;  # full recollect, no reuse
-  tr27b) V1_CACHE=data/flow_cache/stage1_tr27b_mix_k4 ; NEED_GB=380 ;;
+  4btr)  V1_CACHE=data/flow_cache/stage1_4btr_mix_k4  ;;
+  9btr)  V1_CACHE=""                                  ;;  # v1 used a different prompt set: no reuse
+  tr27b) V1_CACHE=data/flow_cache/stage1_tr27b_mix_k4 ;;
   *) echo "unknown size $SIZE (want 4btr|9btr|tr27b)"; exit 2 ;;
 esac
 CFG_DIR=collect_configs/stage1_${SIZE}_v2
@@ -55,9 +55,39 @@ if [ ! -f bench_data_tr_v2/tr-instructurca.train.jsonl ]; then
   say "fetching prompts from selimaktas/turkish-flow-drafter-prompts"
   $PY scripts/fetch_tr_prompts.py || { say "ABORT: prompt fetch failed"; exit 1; }
 fi
-[ -n "$V1_CACHE" ] && [ ! -f "$V1_CACHE/metadata.json" ] && { say "ABORT: v1 cache $V1_CACHE missing; it is an INPUT, not optional"; exit 1; }
+# v1 cache: an OPTIMISATION, not a requirement. When it exists, v2 is a strict prefix extension of
+# it and only the tail needs collecting. It is 124 GB of DERIVED data and is published nowhere, so
+# on a fresh machine it is simply absent -- in which case collect everything instead of aborting.
+# Regenerating the configs is what actually changes the plan; without that the shards would still
+# start at v1's offsets and the run would train on a cache missing its first 29,100 rows.
+REUSE_ARG=""
+if [ -n "$V1_CACHE" ] && [ ! -f "$V1_CACHE/metadata.json" ]; then
+  say "v1 cache $V1_CACHE is ABSENT -- collecting every row instead of just the tail."
+  say "  This is the normal path on a fresh clone. It costs more GPU time and more disk;"
+  say "  nothing is lost, because the tail-only plan only ever SKIPPED rows that cache held."
+  V1_CACHE=""
+  REUSE_ARG="--no-reuse"
+fi
+say "regenerating configs (preset=$PRESET, init=continue${REUSE_ARG:+, full collection})"
+$PY scripts/gen_tr_v2_configs.py --preset "$PRESET" $REUSE_ARG >/dev/null || {
+  say "ABORT: config generation failed"; exit 1; }
 
+# Rows this plan will actually collect, read from the configs rather than assumed -- the number
+# differs by preset AND by whether the v1 cache was reusable, so a hard-coded gate is wrong in at
+# least one of those cases.
+PLANNED=$(CF_SIZE="$SIZE" $PY - <<'PYEOF'
+import glob, os, yaml
+d = f"collect_configs/stage1_{os.environ['CF_SIZE']}_v2"
+print(sum(yaml.safe_load(open(f))["dataset_end"] - yaml.safe_load(open(f))["dataset_start"]
+          for f in glob.glob(f"{d}/*.yaml")))
+PYEOF
+)
+[ -n "$PLANNED" ] && [ "$PLANNED" -gt 0 ] 2>/dev/null || { say "ABORT: could not count planned rows from $CFG_DIR"; exit 1; }
+# ~5.3 MB of teacher states per row at 27B, and the flow cache is about the same again. Teacher
+# states are deleted per shard once preprocessed, so the peak is roughly one shard plus the cache.
+NEED_GB=$(( PLANNED * 6 / 1000 + 60 ))
 say "START size=$SIZE preset=$PRESET gpus=[$GPUS] free=$(freegb)G need>=${NEED_GB}G"
+say "  collecting $PLANNED rows${V1_CACHE:+ (tail only; v1 cache supplies the rest)}"
 say "  compile=$CF_COMPILE mode=$CF_COMPILE_MODE fused_head=$CF_FUSED_HEAD"
 say "  train config: $TRAIN_CFG"
 say "  cache:        $CACHE"
@@ -99,7 +129,17 @@ for cfg in "$CFG_DIR"/*.yaml; do
       $PY scripts/preprocess_flow_dataset.py --dataset-path "teacher_states/stage1-${SIZE}-v2-${name}" \
           --output-dir "data/flow_cache/_shard_${SIZE}v2_${name}" --draft-length 4 --overwrite \
           >>"$LOG/preprocess_g$g.log" 2>&1
-      say "[g$g] PREPROCESS $name rc=$? free=$(freegb)G"
+      prc=$?
+      say "[g$g] PREPROCESS $name rc=$prc free=$(freegb)G"
+      # Teacher states are ~5.3 MB/row and the shard cache now represents them, so holding both
+      # doubles peak disk for no benefit. Deleted ONLY on a clean preprocess with a real cache on
+      # disk -- on failure they are kept so the shard can be reprocessed without recollecting.
+      if [ $prc -eq 0 ] && [ -f "data/flow_cache/_shard_${SIZE}v2_${name}/metadata.json" ]; then
+        rm -rf "teacher_states/stage1-${SIZE}-v2-${name}"
+        say "[g$g] freed teacher states for $name  free=$(freegb)G"
+      else
+        say "[g$g] KEEPING teacher states for $name (preprocess rc=$prc) -- reprocess, do not recollect"
+      fi
     fi ) &
   pids="$pids $!"; i=$((i+1))
   # keep at most one job per GPU in flight
@@ -126,9 +166,13 @@ if [ ! -f "$CACHE/metadata.json" ]; then
 fi
 ROWS=$($PY -c "import json;print(json.load(open('$CACHE/metadata.json'))['num_rows'])") || exit 1
 say "cache rows=$ROWS free=$(freegb)G"
-# v1 27B kept 25k of 29.1k collected rows after the context+draft length filter (~86%).
-MIN=$([ "$SIZE" = "9btr" ] && echo 45000 || echo 48000)
-[ "$ROWS" -lt "$MIN" ] && { say "ABORT: cache has only $ROWS rows, expected >=$MIN"; exit 1; }
+# v1 kept ~86% of collected rows after the context+draft length filter; 75% is a floor that catches
+# a lost shard without tripping on normal filtering. Derived from what this run actually planned,
+# plus whatever the v1 cache contributes, so it stays correct across presets and reuse modes.
+V1ROWS=0
+[ -n "$V1_CACHE" ] && V1ROWS=$($PY -c "import json;print(json.load(open('$V1_CACHE/metadata.json'))['num_rows'])")
+MIN=$(( (PLANNED + V1ROWS) * 75 / 100 ))
+[ "$ROWS" -lt "$MIN" ] && { say "ABORT: cache has $ROWS rows, expected >=$MIN (planned $PLANNED + v1 $V1ROWS)"; exit 1; }
 
 # ---------------------------------------------------------------- 5. train
 NG=$(set -- $GPUS; echo $#)
