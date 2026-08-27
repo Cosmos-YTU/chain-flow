@@ -56,13 +56,31 @@ PRESETS = {
 # at 27B bf16 the weights are ~54 GB and the KV for batch 256 at ~860 tokens is ~26 GB, so ~80 GB
 # against a B300's ~288.
 #
+# !! gen and hid DO NOT SCALE TOGETHER. Raising them in step OOMs phase 2. !!
+#
+# Phase 1 (generate) holds weights + KV: ~0.5 GB/sequence at 27B, so gen=256 runs comfortably and
+# was measured at 2.48 it/s.
+#
+# Phase 2 (`output_hidden_states=True`) materialises EVERY layer's hidden states at once, plus the
+# activations to produce them -- `torch_chunk_gated_delta_rule` does a full
+# `transpose(1,2).contiguous()` copy. MEASURED at 27B: hid=128 put 266 GB in use on a 267 GB card
+# and OOMed, i.e. ~1.66 GB per sequence, about 3x what the hidden-state tensor alone accounts for.
+# Do not derive this from layers x tokens x hidden; that underestimates it by 3x.
+#
+#   hid=32  -> ~54 GB weights + ~53 GB  = ~107 GB   (default; still 2.7x the v1 value of 12)
+#   hid=64  -> ~54 GB weights + ~106 GB = ~160 GB   (workable, less margin for long prompts)
+#   hid=128 -> OOM, observed
+#
+# Prompt length varies a lot by source (tool-calling averages 825 tokens against function-calling's
+# 563), so the margin at hid=64 is thinner on some shards than others.
+#
 # Override per run without regenerating: CF_GEN_BS / CF_HID_BS.
 _GEN = int(os.environ.get("CF_GEN_BS", "0"))
 _HID = int(os.environ.get("CF_HID_BS", "0"))
 SIZES = {
-    "4btr":  dict(model="Qwen/Qwen3.5-4B",  gen=_GEN or 512, hid=_HID or 256, reuse=True),
-    "9btr":  dict(model="Qwen/Qwen3.5-9B",  gen=_GEN or 256, hid=_HID or 128, reuse=False),
-    "tr27b": dict(model="Qwen/Qwen3.5-27B", gen=_GEN or 128, hid=_HID or 64,  reuse=True),
+    "4btr":  dict(model="Qwen/Qwen3.5-4B",  gen=_GEN or 512, hid=_HID or 128, reuse=True),
+    "9btr":  dict(model="Qwen/Qwen3.5-9B",  gen=_GEN or 256, hid=_HID or 64,  reuse=False),
+    "tr27b": dict(model="Qwen/Qwen3.5-27B", gen=_GEN or 256, hid=_HID or 32,  reuse=True),
 }
 SHARD_ROWS = 4000            # keep a shard under ~2h so a crash costs little
 

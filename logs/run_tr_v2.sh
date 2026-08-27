@@ -98,7 +98,10 @@ if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
 fi
 [ -f "$LOCK" ] && say "clearing a stale lock (pid $(cat "$LOCK") is gone)"
 echo $$ > "$LOCK"
-trap 'rm -f "$LOCK"' EXIT
+# ONE exit trap for everything. A second `trap ... EXIT` REPLACES the first rather than adding to
+# it, so the lock cleanup and the heartbeat kill cannot be registered separately.
+cleanup() { [ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null; rm -f "$LOCK"; }
+trap cleanup EXIT
 
 # Orphaned collectors from a previous Ctrl-C would fight this one for the GPUs and the output dirs.
 _orphans=$(pgrep -f "collect_teacher_states.py .*stage1_${SIZE}_v2" | grep -v "^$$\$" | tr '\n' ' ')
@@ -161,12 +164,18 @@ HEARTBEAT_SEC="${CF_HEARTBEAT_SEC:-300}"
     [ -f "$LOG/.collect_done" ] && exit 0
     for g in $GPUS; do
       [ -f "$LOG/collect_g$g.log" ] || continue
+      # Only report if the log is still being written. A dead collector leaves its last progress
+      # line behind, and repeating it every 5 minutes reads exactly like a running job.
+      now=$(date +%s); mtime=$(stat -c %Y "$LOG/collect_g$g.log" 2>/dev/null || echo 0)
+      if [ $((now - mtime)) -gt $((HEARTBEAT_SEC * 2)) ]; then
+        say "  [g$g] no output for $((now - mtime))s -- process is not writing"
+        continue
+      fi
       line=$(tr '\r' '\n' < "$LOG/collect_g$g.log" | grep -aE "[0-9]+%\|" | tail -1 | cut -c1-100)
       [ -n "$line" ] && say "  [g$g] $line"
     done
   done
 ) & HEARTBEAT_PID=$!
-trap 'kill $HEARTBEAT_PID 2>/dev/null' EXIT
 
 # ---------------------------------------------------------------- 2. collect, round-robin by GPU
 i=0; pids=""
@@ -230,11 +239,16 @@ for cfg in "$CFG_DIR"/*.yaml; do
   if [ -f "$LOG/.collect_failed" ]; then
     say "ABORT after the first failure -- $((i-1))/$(ls "$CFG_DIR"/*.yaml | wc -l) shards dispatched."
     say "  The tail above is the real error. Fix it and re-run; finished shards are skipped."
-    wait; exit 1
+    # Kill the heartbeat FIRST. A bare `wait` includes it, and it loops until .collect_done is
+    # written -- which an aborting run never does -- so the script would hang here forever,
+    # printing stale progress from logs whose processes had already died.
+    touch "$LOG/.collect_done"; kill "$HEARTBEAT_PID" 2>/dev/null
+    for _p in $pids; do wait "$_p" 2>/dev/null; done
+    exit 1
   fi
 done
-wait $pids
-touch "$LOG/.collect_done"; kill $HEARTBEAT_PID 2>/dev/null
+touch "$LOG/.collect_done"; kill "$HEARTBEAT_PID" 2>/dev/null
+for _p in $pids; do wait "$_p" 2>/dev/null; done; kill $HEARTBEAT_PID 2>/dev/null
 say "collection+preprocess complete free=$(freegb)G"
 say "  shard caches present: $(ls -d data/flow_cache/_shard_${SIZE}v2_* 2>/dev/null | wc -l)/$(ls "$CFG_DIR"/*.yaml | wc -l)"
 

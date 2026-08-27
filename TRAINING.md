@@ -97,10 +97,15 @@ runner hook — so it would be a two-stage pipeline: generate with vLLM, harvest
 It also needs its own venv because of the torch pin. Worth doing; not a thing to bolt on before a
 20-hour run.
 
-The version of that win available today is batch size. The v1 values (27B: `gen 24 / hid 12`) were
-sized for 97 GB cards; at 27B bf16 the weights are ~54 GB and the KV for batch 256 at ~860 tokens
-is ~26 GB, so ~80 GB against a B300's ~288. Defaults are now `gen 128 / hid 64` at 27B, `256/128`
-at 9B, `512/256` at 4B. Override without regenerating:
+The version of that win available today is batch size — but **the two batch sizes do not scale
+together**. Phase 1 holds weights + KV (~0.5 GB/sequence at 27B), so `gen=256` runs comfortably at
+2.48 it/s. Phase 2 materialises every layer's hidden states *plus* the activations that produce
+them; measured at 27B, `hid=128` put 266 GB in use on a 267 GB card and OOMed — about 1.66 GB per
+sequence, roughly 3× what the hidden-state tensor alone accounts for. Raising both in step is the
+mistake to avoid.
+
+Defaults are `gen 256 / hid 32` at 27B, `256/64` at 9B, `512/128` at 4B. Override without
+regenerating:
 
 ```bash
 CF_GEN_BS=64 CF_HID_BS=32 python scripts/gen_tr_v2_configs.py
