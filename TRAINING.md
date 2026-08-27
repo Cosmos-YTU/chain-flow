@@ -112,6 +112,17 @@ Stopping and restarting is cheap: a shard is considered done when its flow cache
 restart skips everything already collected. That is what makes it safe to kill a run partway and
 come back with a bigger batch.
 
+### Watching it
+
+tqdm writes to stderr, which is redirected into the per-GPU log, so the terminal only shows the
+pipeline's own lines. Every 5 minutes (`CF_HEARTBEAT_SEC`) the runner pulls the latest progress out
+of each collect log. To follow one directly — note the `tr`, since tqdm separates updates with `\r`
+and the file is otherwise one enormous line:
+
+```bash
+tr '\r' '\n' < logs/tr_v2_tr27b_instruct/collect_g0.log | tail -20
+```
+
 ## 6. Performance knobs
 
 | variable | default | what it does |

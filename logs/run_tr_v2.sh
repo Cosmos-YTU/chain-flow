@@ -42,7 +42,7 @@ TRAIN_CFG=train_configs/recovered/joint_${SIZE}_v2_${PRESET}.yaml
 CACHE=$($PY -c "import yaml;print(yaml.safe_load(open('$TRAIN_CFG'))['dataset_path'])" 2>/dev/null)
 LOG=logs/tr_v2_${SIZE}_${PRESET}
 mkdir -p "$LOG"
-rm -f "$LOG/.collect_failed"
+rm -f "$LOG/.collect_failed" "$LOG/.collect_done"
 say(){ echo "[$(date -u +%F' '%H:%M:%S)] $*" | tee -a "$LOG/pipeline.log"; }
 freegb(){ df --output=avail -BG / | tail -1 | tr -dc '0-9'; }
 
@@ -127,6 +127,25 @@ case "$_probe" in
   *) say "collector accepts a positional YAML (probe failed on the file, as intended)" ;;
 esac
 
+# ---------------------------------------------------------------- 1c. progress heartbeat
+# tqdm writes to stderr, which is redirected into the per-GPU collect log, so the terminal shows
+# nothing between START and DONE -- on a 20-hour collection that is indistinguishable from a hang.
+# This pulls the most recent progress line out of each log every few minutes. tqdm separates
+# updates with \r rather than \n, so the log is one enormous line until it is split.
+HEARTBEAT_SEC="${CF_HEARTBEAT_SEC:-300}"
+(
+  while true; do
+    sleep "$HEARTBEAT_SEC"
+    [ -f "$LOG/.collect_done" ] && exit 0
+    for g in $GPUS; do
+      [ -f "$LOG/collect_g$g.log" ] || continue
+      line=$(tr '\r' '\n' < "$LOG/collect_g$g.log" | grep -aE "[0-9]+%\|" | tail -1 | cut -c1-100)
+      [ -n "$line" ] && say "  [g$g] $line"
+    done
+  done
+) & HEARTBEAT_PID=$!
+trap 'kill $HEARTBEAT_PID 2>/dev/null' EXIT
+
 # ---------------------------------------------------------------- 2. collect, round-robin by GPU
 i=0; pids=""
 for cfg in "$CFG_DIR"/*.yaml; do
@@ -184,6 +203,7 @@ for cfg in "$CFG_DIR"/*.yaml; do
   fi
 done
 wait $pids
+touch "$LOG/.collect_done"; kill $HEARTBEAT_PID 2>/dev/null
 say "collection+preprocess complete free=$(freegb)G"
 say "  shard caches present: $(ls -d data/flow_cache/_shard_${SIZE}v2_* 2>/dev/null | wc -l)/$(ls "$CFG_DIR"/*.yaml | wc -l)"
 
