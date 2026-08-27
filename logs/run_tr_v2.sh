@@ -87,6 +87,27 @@ PYEOF
 # ~5.3 MB of teacher states per row at 27B, and the flow cache is about the same again. Teacher
 # states are deleted per shard once preprocessed, so the peak is roughly one shard plus the cache.
 NEED_GB=$(( PLANNED * 6 / 1000 + 60 ))
+# SINGLE RUN PER SIZE. Ctrl-C stops the script, but collectors already running may take a while to
+# die -- and starting a second run immediately puts two processes in the same
+# teacher_states/stage1-<size>-v2-<shard> directory, which corrupts both with no error from either.
+LOCK="$LOG/.run.lock"
+if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+  say "ABORT: run already active (pid $(cat "$LOCK")). Two collectors would write the same"
+  say "  teacher_states directory and corrupt each other. Wait for it, or: kill $(cat "$LOCK")"
+  exit 1
+fi
+[ -f "$LOCK" ] && say "clearing a stale lock (pid $(cat "$LOCK") is gone)"
+echo $$ > "$LOCK"
+trap 'rm -f "$LOCK"' EXIT
+
+# Orphaned collectors from a previous Ctrl-C would fight this one for the GPUs and the output dirs.
+_orphans=$(pgrep -f "collect_teacher_states.py .*stage1_${SIZE}_v2" | grep -v "^$$\$" | tr '\n' ' ')
+if [ -n "$_orphans" ]; then
+  say "ABORT: collectors from a previous run are still alive: $_orphans"
+  say "  They hold the GPUs and would write the same shard dirs. Stop them first:  kill $_orphans"
+  exit 1
+fi
+
 say "START size=$SIZE preset=$PRESET gpus=[$GPUS] free=$(freegb)G need>=${NEED_GB}G"
 say "  collecting $PLANNED rows${V1_CACHE:+ (tail only; v1 cache supplies the rest)}"
 say "  compile=$CF_COMPILE mode=$CF_COMPILE_MODE fused_head=$CF_FUSED_HEAD"
@@ -166,10 +187,17 @@ for cfg in "$CFG_DIR"/*.yaml; do
     # three seconds each.
     CUDA_VISIBLE_DEVICES=$g $PY scripts/collect_teacher_states.py "$cfg" \
         >>"$LOG/collect_g$g.log" 2>&1
-    rc=$?; say "[g$g] COLLECT $name DONE rc=$rc free=$(freegb)G"
-    if [ $rc -ne 0 ]; then
+    rc=$?
+    if [ $rc -eq 0 ]; then
+      say "[g$g] COLLECT $name DONE free=$(freegb)G"
+    elif [ $rc -eq 130 ] || [ $rc -eq 2 ]; then
+      # SIGINT. Not a failure of the shard -- somebody stopped the run. Saying "DONE rc=1" here
+      # made an interrupted shard read exactly like one that ran and failed.
       touch "$LOG/.collect_failed"
-      say "[g$g] !! $name FAILED rc=$rc -- last lines of $LOG/collect_g$g.log:"
+      say "[g$g] COLLECT $name INTERRUPTED (rc=$rc) -- stopped by signal, not by an error"
+    else
+      touch "$LOG/.collect_failed"
+      say "[g$g] COLLECT $name FAILED rc=$rc -- last lines of $LOG/collect_g$g.log:"
       tail -n 15 "$LOG/collect_g$g.log" | sed 's/^/      /' | tee -a "$LOG/pipeline.log"
     fi
     # preprocess immediately: ~2.5 rows/s single-process, so hiding it behind the GPU work
