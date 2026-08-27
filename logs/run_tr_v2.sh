@@ -179,8 +179,23 @@ HEARTBEAT_SEC="${CF_HEARTBEAT_SEC:-300}"
 
 # ---------------------------------------------------------------- 2. collect, round-robin by GPU
 i=0; pids=""
+# GPU slots are LOCK FILES, not a job count. Two things were wrong with counting jobs:
+#   1. the GPU came from the shard INDEX (i % nGPU), so the next shard could be handed to a card
+#      that was still busy while the other sat idle;
+#   2. the count included the whole subshell -- collection AND the ~10 minutes of CPU-only
+#      preprocessing that follows it -- so a preprocessing job held a GPU slot while using no GPU.
+# A slot is now released the moment collection ends, and preprocessing continues outside it.
+rm -f "$LOG"/.gpu_*.busy
+claim_gpu() {                       # echoes the first free GPU, waiting until one is
+  while :; do
+    for _g in $GPUS; do
+      if ( set -o noclobber; echo $$ > "$LOG/.gpu_${_g}.busy" ) 2>/dev/null; then echo "$_g"; return; fi
+    done
+    sleep 5
+  done
+}
+
 for cfg in "$CFG_DIR"/*.yaml; do
-  set -- $GPUS; shift $(( i % $# )); g=$1
   name=$(basename "$cfg" .yaml)
   # RESUME. A shard is done when its flow cache exists -- that is the artifact the concat consumes,
   # and it is only written after a clean preprocess. Skipping here is what makes it safe to stop a
@@ -196,6 +211,7 @@ for cfg in "$CFG_DIR"/*.yaml; do
   # a 4000-row shard) and phase 2 is the one that OOMs, so without this every phase-2 retry redoes
   # all of it. `state.json` is the completeness marker: save_to_disk writes it last, so its presence
   # means generation ran to the end.
+  g=$(claim_gpu)
   tmpd="teacher_states/_tmp_stage1-${SIZE}-v2-${name}"
   shard_cfg="$cfg"
   if [ -f "$tmpd/state.json" ]; then
@@ -236,6 +252,9 @@ import yaml; d=yaml.safe_load(open('$cfg')); print(d['dataset_end']-d['dataset_s
       say "[g$g] COLLECT $name FAILED rc=$rc -- last lines of $LOG/collect_g$g.log:"
       tail -n 15 "$LOG/collect_g$g.log" | sed 's/^/      /' | tee -a "$LOG/pipeline.log"
     fi
+    # Release the GPU HERE. Everything below is CPU-only; holding the card through it left the
+    # other GPU idle for roughly a third of the run.
+    rm -f "$LOG/.gpu_${g}.busy"
     # preprocess immediately: ~2.5 rows/s single-process, so hiding it behind the GPU work
     # is most of the saving.  A shard that failed to collect must NOT be preprocessed.
     if [ $rc -eq 0 ]; then
@@ -255,10 +274,8 @@ import yaml; d=yaml.safe_load(open('$cfg')); print(d['dataset_end']-d['dataset_s
       fi
     fi ) &
   pids="$pids $!"; i=$((i+1))
-  # Keep at most one COLLECTOR per GPU in flight. The heartbeat is also a background job of this
-  # shell, so a bare `jobs -rp | wc -l` counts it too: with 2 GPUs the cap tripped after dispatching
-  # a single collector and the second GPU never started. Count only the collectors.
-  while [ "$(jobs -rp | grep -vcx "${HEARTBEAT_PID:-none}")" -ge "$NGPU" ]; do wait -n; done
+  # No job-count cap: claim_gpu already blocks until a card frees, and it is the GPU that is
+  # scarce -- CPU preprocessing may pile up a little behind it, which is fine and is the point.
   # Checked AFTER waiting on a slot so it sees the most recent completion. The first failure is
   # almost always systematic -- a bad invocation, a missing model, no disk -- so the remaining
   # shards fail identically and bury the one message worth reading.
