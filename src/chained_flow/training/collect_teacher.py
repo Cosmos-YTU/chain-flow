@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence as TypingSequence
 
-from datasets import Dataset, Features, Sequence, Value, load_dataset, load_from_disk
+from datasets import Dataset, Features, LargeList, Sequence, Value, load_dataset, load_from_disk
 import torch
 from tqdm.auto import tqdm
 
@@ -62,7 +62,12 @@ def teacher_dataset_features(storage_dtype: str = "float32") -> Features:
             "prompt_text": Value("string"),
             "generated_text": Value("string"),
             "input_ids": Sequence(Value("int32")),
-            "final_hidden": Sequence(Sequence(Value(hidden_dtype))),
+            # INNER list must be 64-bit. Arrow's `list` uses int32 offsets into its child array,
+            # and the child here is rows x tokens x hidden halffloats: a 2000-row 27B shard is
+            # ~8.8e9 elements against a 2^31 = 2.15e9 limit, so `combine_chunks` during save fails
+            # with "offset overflow while concatenating arrays". Only the inner level needs it --
+            # the outer offsets index inner LISTS (rows x tokens, ~1.7M) and stay well inside int32.
+            "final_hidden": Sequence(LargeList(Value(hidden_dtype))),
             "example_id": Value("string"),
             "source": Value("string"),
             "split": Value("string"),

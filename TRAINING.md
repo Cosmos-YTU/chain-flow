@@ -113,6 +113,14 @@ CF_GEN_BS=64 CF_HID_BS=32 python scripts/gen_tr_v2_configs.py
 
 These are **unverified on B300** like the training batch shapes. If collection OOMs, halve them.
 
+### Arrow offsets
+
+`final_hidden` is stored as `Sequence(LargeList(...))`. Arrow's plain `list` uses **int32 offsets**
+into its child array, and the child here is rows × tokens × hidden halffloats — a 2000-row 27B shard
+is ~8.8e9 elements against a 2^31 = 2.15e9 limit, so saving fails with *"offset overflow while
+concatenating arrays"*. Only the inner level needs 64-bit offsets; the outer indexes inner lists
+(~1.7M) and stays well inside int32. This is why `datasets>=4.x` is pinned — `LargeList` is required.
+
 ### Host memory
 
 Phase 2 accumulates every row and writes once at the end of a shard, so peak **system** RAM scales
