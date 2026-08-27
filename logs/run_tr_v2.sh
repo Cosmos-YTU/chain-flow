@@ -42,6 +42,7 @@ TRAIN_CFG=train_configs/recovered/joint_${SIZE}_v2_${PRESET}.yaml
 CACHE=$($PY -c "import yaml;print(yaml.safe_load(open('$TRAIN_CFG'))['dataset_path'])" 2>/dev/null)
 LOG=logs/tr_v2_${SIZE}_${PRESET}
 mkdir -p "$LOG"
+rm -f "$LOG/.collect_failed"
 say(){ echo "[$(date -u +%F' '%H:%M:%S)] $*" | tee -a "$LOG/pipeline.log"; }
 freegb(){ df --output=avail -BG / | tail -1 | tr -dc '0-9'; }
 
@@ -113,16 +114,37 @@ for g in $GPUS; do
 done
 say "GPUs [$GPUS] are clear"
 
+# ---------------------------------------------------------------- 1b. invocation smoke test
+# Every script this pipeline drives has its own CLI contract, and getting one wrong costs a full
+# dispatch round to discover -- `--config` instead of a positional YAML killed 13 shards in three
+# seconds each. This proves the collector ACCEPTS the exact form used below, without loading a
+# model: a nonexistent config must fail on the missing FILE, not on argument parsing.
+_probe=$($PY scripts/collect_teacher_states.py "$CFG_DIR/__does_not_exist__.yaml" 2>&1 | tail -5)
+case "$_probe" in
+  *"unrecognized arguments"*|*"invalid choice"*|*"the following arguments are required"*)
+    say "ABORT: the collector rejects this invocation form, not the missing file:"
+    printf '%s\n' "$_probe" | sed 's/^/      /' | tee -a "$LOG/pipeline.log"; exit 1 ;;
+  *) say "collector accepts a positional YAML (probe failed on the file, as intended)" ;;
+esac
+
 # ---------------------------------------------------------------- 2. collect, round-robin by GPU
 i=0; pids=""
 for cfg in "$CFG_DIR"/*.yaml; do
   set -- $GPUS; shift $(( i % $# )); g=$1
   name=$(basename "$cfg" .yaml)
   ( say "[g$g] COLLECT $name START"
-    CUDA_VISIBLE_DEVICES=$g $PY scripts/collect_teacher_states.py --config "$cfg" \
+    # POSITIONAL, and it must be the ONLY argument: collect_teacher_states.py dispatches on
+    # `len(sys.argv) == 2 and sys.argv[1].endswith(".yaml")`. A `--config` flag falls through to
+    # the full argparse, which rejects it instantly -- which is what killed all 13 shards in
+    # three seconds each.
+    CUDA_VISIBLE_DEVICES=$g $PY scripts/collect_teacher_states.py "$cfg" \
         >>"$LOG/collect_g$g.log" 2>&1
     rc=$?; say "[g$g] COLLECT $name DONE rc=$rc free=$(freegb)G"
-    [ $rc -ne 0 ] && say "[g$g] !! $name FAILED -- pipeline will abort at the gate"
+    if [ $rc -ne 0 ]; then
+      touch "$LOG/.collect_failed"
+      say "[g$g] !! $name FAILED rc=$rc -- last lines of $LOG/collect_g$g.log:"
+      tail -n 15 "$LOG/collect_g$g.log" | sed 's/^/      /' | tee -a "$LOG/pipeline.log"
+    fi
     # preprocess immediately: ~2.5 rows/s single-process, so hiding it behind the GPU work
     # is most of the saving.  A shard that failed to collect must NOT be preprocessed.
     if [ $rc -eq 0 ]; then
@@ -144,6 +166,14 @@ for cfg in "$CFG_DIR"/*.yaml; do
   pids="$pids $!"; i=$((i+1))
   # keep at most one job per GPU in flight
   [ "$(jobs -rp | wc -l)" -ge "$(set -- $GPUS; echo $#)" ] && wait -n
+  # Checked AFTER waiting on a slot so it sees the most recent completion. The first failure is
+  # almost always systematic -- a bad invocation, a missing model, no disk -- so the remaining
+  # shards fail identically and bury the one message worth reading.
+  if [ -f "$LOG/.collect_failed" ]; then
+    say "ABORT after the first failure -- $((i-1))/$(ls "$CFG_DIR"/*.yaml | wc -l) shards dispatched."
+    say "  The tail above is the real error. Fix it and re-run; finished shards are skipped."
+    wait; exit 1
+  fi
 done
 wait $pids
 say "collection+preprocess complete free=$(freegb)G"
