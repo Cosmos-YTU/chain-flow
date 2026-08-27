@@ -199,10 +199,22 @@ for cfg in "$CFG_DIR"/*.yaml; do
   tmpd="teacher_states/_tmp_stage1-${SIZE}-v2-${name}"
   shard_cfg="$cfg"
   if [ -f "$tmpd/state.json" ]; then
-    shard_cfg="$LOG/resume_${name}.yaml"
-    grep -v '^answer_dataset_path:' "$cfg" > "$shard_cfg"
-    echo "answer_dataset_path: $tmpd" >> "$shard_cfg"
-    say "[g$g] REUSING phase-1 answers for $name ($tmpd) -- skipping generation"
+    # The tmp dataset holds ONLY this shard's rows, indexed from 0. The shard config's
+    # dataset_start/end address the SOURCE prompt file, and the resume path re-applies them to the
+    # answer dataset -- so leaving them in slices [2000:3000] out of a 1000-row set, yields nothing,
+    # and phase 2 then builds a dataset from an empty list. Reset the range to the whole file.
+    ntmp=$($PY -c "
+from datasets import load_from_disk; print(len(load_from_disk('$tmpd')))" 2>/dev/null || echo 0)
+    want=$($PY -c "
+import yaml; d=yaml.safe_load(open('$cfg')); print(d['dataset_end']-d['dataset_start'])")
+    if [ "$ntmp" != "$want" ]; then
+      say "[g$g] tmp answers for $name have $ntmp rows, shard wants $want -- regenerating instead"
+    else
+      shard_cfg="$LOG/resume_${name}.yaml"
+      grep -vE '^(answer_dataset_path|dataset_start|dataset_end):' "$cfg" > "$shard_cfg"
+      printf 'answer_dataset_path: %s\ndataset_start: 0\ndataset_end: %s\n' "$tmpd" "$ntmp" >> "$shard_cfg"
+      say "[g$g] REUSING phase-1 answers for $name ($ntmp rows) -- skipping generation"
+    fi
   fi
   ( say "[g$g] COLLECT $name START"
     # POSITIONAL, and it must be the ONLY argument: collect_teacher_states.py dispatches on

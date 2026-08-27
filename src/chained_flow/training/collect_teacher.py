@@ -604,6 +604,19 @@ def collect_teacher_dataset(config: TeacherCollectionConfig) -> tuple[Dataset, T
                 print(f"pushing temporary answer dataset: {config.tmp_push_to_hub}", flush=True)
                 answer_dataset.push_to_hub(config.tmp_push_to_hub, private=config.private)
 
+        if not answer_rows:
+            # Dataset.from_list([]) fails later with an opaque "Keys mismatch ... (target) {}",
+            # which says nothing about the cause. Almost always a range applied to the wrong
+            # dataset: with answer_dataset_path set, dataset_start/end index the ANSWER dataset,
+            # not the original prompt file.
+            raise RuntimeError(
+                "no rows to extract hidden states from. "
+                + (f"answer_dataset_path={config.answer_dataset_path} was loaded, then "
+                   f"dataset_start={config.dataset_start}/dataset_end={config.dataset_end} "
+                   f"selected nothing from it -- those index the ANSWER dataset here, so they "
+                   f"must be 0/len, not the source file's row range."
+                   if config.answer_dataset_path else
+                   "generation produced no rows; check the prompt file and the dataset range."))
         rows: list[dict[str, Any]] = []
         hidden_bar = tqdm(total=len(answer_rows), desc="phase 2/2 extracting hidden states")
         with timed_section(timings, "teacher_hidden_extraction", wrapper.device):
