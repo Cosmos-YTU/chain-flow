@@ -153,6 +153,7 @@ esac
 # nothing between START and DONE -- on a 20-hour collection that is indistinguishable from a hang.
 # This pulls the most recent progress line out of each log every few minutes. tqdm separates
 # updates with \r rather than \n, so the log is one enormous line until it is split.
+NGPU=$(set -- $GPUS; echo $#)
 HEARTBEAT_SEC="${CF_HEARTBEAT_SEC:-300}"
 (
   while true; do
@@ -219,8 +220,10 @@ for cfg in "$CFG_DIR"/*.yaml; do
       fi
     fi ) &
   pids="$pids $!"; i=$((i+1))
-  # keep at most one job per GPU in flight
-  [ "$(jobs -rp | wc -l)" -ge "$(set -- $GPUS; echo $#)" ] && wait -n
+  # Keep at most one COLLECTOR per GPU in flight. The heartbeat is also a background job of this
+  # shell, so a bare `jobs -rp | wc -l` counts it too: with 2 GPUs the cap tripped after dispatching
+  # a single collector and the second GPU never started. Count only the collectors.
+  while [ "$(jobs -rp | grep -vcx "${HEARTBEAT_PID:-none}")" -ge "$NGPU" ]; do wait -n; done
   # Checked AFTER waiting on a slot so it sees the most recent completion. The first failure is
   # almost always systematic -- a bad invocation, a missing model, no disk -- so the remaining
   # shards fail identically and bury the one message worth reading.
@@ -262,9 +265,8 @@ MIN=$(( (PLANNED + V1ROWS) * 75 / 100 ))
 [ "$ROWS" -lt "$MIN" ] && { say "ABORT: cache has $ROWS rows, expected >=$MIN (planned $PLANNED + v1 $V1ROWS)"; exit 1; }
 
 # ---------------------------------------------------------------- 5. train
-NG=$(set -- $GPUS; echo $#)
-say "TRAIN start ($NG GPUs)"
-CUDA_VISIBLE_DEVICES=$(echo $GPUS | tr ' ' ',') $PY -m torch.distributed.run --nproc_per_node=$NG \
+say "TRAIN start ($NGPU GPUs)"
+CUDA_VISIBLE_DEVICES=$(echo $GPUS | tr ' ' ',') $PY -m torch.distributed.run --nproc_per_node=$NGPU \
     --master_port=29531 scripts/train_tree_flow.py "$TRAIN_CFG" \
     2>&1 | grep -viE "it/s\]$|examples/s\]$" >>"$LOG/train.log"
 say "TRAIN rc=$? free=$(freegb)G"
