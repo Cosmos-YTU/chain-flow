@@ -84,7 +84,31 @@ flow cache is just another shard. 16,209 new rows on the `instruct` preset inste
 is the exception** — its v1 came from a different prompt set with no prefix relationship, so it
 collects everything.
 
-## 5. Performance knobs
+## 5. Collection speed
+
+Collection runs HF `model.generate()`, **not vLLM**. The generation phase is 256 sequential decode
+steps per batch against a single forward for the hidden-state pass, so it dominates the wall clock
+— and HF generate pads every sequence to the longest in its batch and runs without CUDA graphs or
+continuous batching.
+
+**vLLM would be materially faster for that phase and is not implemented.** It cannot do the second
+phase at all — hidden states need `output_hidden_states`, which vLLM does not expose without the
+runner hook — so it would be a two-stage pipeline: generate with vLLM, harvest with transformers.
+It also needs its own venv because of the torch pin. Worth doing; not a thing to bolt on before a
+20-hour run.
+
+The version of that win available today is batch size. The v1 values (27B: `gen 24 / hid 12`) were
+sized for 97 GB cards; at 27B bf16 the weights are ~54 GB and the KV for batch 256 at ~860 tokens
+is ~26 GB, so ~80 GB against a B300's ~288. Defaults are now `gen 128 / hid 64` at 27B, `256/128`
+at 9B, `512/256` at 4B. Override without regenerating:
+
+```bash
+CF_GEN_BS=64 CF_HID_BS=32 python scripts/gen_tr_v2_configs.py
+```
+
+These are **unverified on B300** like the training batch shapes. If collection OOMs, halve them.
+
+## 6. Performance knobs
 
 | variable | default | what it does |
 |---|---|---|
@@ -108,7 +132,7 @@ experiment. **The microbatch sizes are unverified on B300** — no card was free
 halve `per_device_train_batch_size` and double `gradient_accumulation_steps`; the assert will flag
 it immediately if the pair stops matching.
 
-## 6. After training — do not skip
+## 7. After training — do not skip
 
 Sweep the checkpoints and pick with the **both-corpora TRO ladder**
 (`scripts/tr27b_results_json.py`), not by eye and not by taking the last checkpoint. Two rules the

@@ -44,10 +44,25 @@ PRESETS = {
     "varied":   {"tr_instruct": 39264, "tr_funccall": 8000, "tr_toolcall": 7290, "tr_multiturn": 2145},
 }
 # per-size batch sizes copied from the v1 configs that are known to fit
+# Collection batch sizes. The v1 values (27B: gen 24 / hid 12) were sized for 97 GB cards and are
+# the single biggest lever on collection time that costs no new code.
+#
+# Collection is HF `model.generate()` -- NOT vLLM. The generation phase is 256 sequential decode
+# steps per batch against ONE forward for the hidden-state pass, so it dominates, and HF generate
+# pads every sequence to the longest in its batch and runs without CUDA graphs or continuous
+# batching. vLLM would be materially faster for that phase (it cannot do the hidden-state pass --
+# that needs `output_hidden_states`), but it is a separate venv because of the torch pin and a code
+# path that does not exist yet. Raising the batch is the version of that win available today:
+# at 27B bf16 the weights are ~54 GB and the KV for batch 256 at ~860 tokens is ~26 GB, so ~80 GB
+# against a B300's ~288.
+#
+# Override per run without regenerating: CF_GEN_BS / CF_HID_BS.
+_GEN = int(os.environ.get("CF_GEN_BS", "0"))
+_HID = int(os.environ.get("CF_HID_BS", "0"))
 SIZES = {
-    "4btr":  dict(model="Qwen/Qwen3.5-4B",  gen=64, hid=24, reuse=True),
-    "9btr":  dict(model="Qwen/Qwen3.5-9B",  gen=48, hid=16, reuse=False),  # full recollect
-    "tr27b": dict(model="Qwen/Qwen3.5-27B", gen=24, hid=12, reuse=True),
+    "4btr":  dict(model="Qwen/Qwen3.5-4B",  gen=_GEN or 512, hid=_HID or 256, reuse=True),
+    "9btr":  dict(model="Qwen/Qwen3.5-9B",  gen=_GEN or 256, hid=_HID or 128, reuse=False),
+    "tr27b": dict(model="Qwen/Qwen3.5-27B", gen=_GEN or 128, hid=_HID or 64,  reuse=True),
 }
 SHARD_ROWS = 4000            # keep a shard under ~2h so a crash costs little
 
