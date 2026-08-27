@@ -576,7 +576,8 @@ def collect_teacher_dataset(config: TeacherCollectionConfig) -> tuple[Dataset, T
                                 "text": text,
                                 "prompt_text": prompt_text,
                                 "generated_text": generated_text,
-                                "input_ids": input_row.detach().cpu().to(torch.int32).tolist(),
+                                # same reasoning as final_hidden, smaller factor
+                                "input_ids": input_row.detach().cpu().to(torch.int32).numpy(),
                                 "example_id": str(batch_examples[row_idx].get("id", batch_indices[row_idx])),
                                 "source": config.source,
                                 "split": config.split,
@@ -636,7 +637,13 @@ def collect_teacher_dataset(config: TeacherCollectionConfig) -> tuple[Dataset, T
                     rows.append(
                         {
                             **row,
-                            "final_hidden": hidden.detach().cpu().to(storage_dtype).tolist(),
+                            # .numpy(), NOT .tolist(). A [860, 5120] fp16 row is 8.8 MB as an
+                            # array and ~140 MB as nested Python floats -- 24 bytes of object plus
+                            # 8 of pointer per element. `rows` holds every row until
+                            # Dataset.from_list at the end, so a 4000-row shard reached ~560 GB of
+                            # host memory and took the machine down. pyarrow consumes the array
+                            # directly: values and resulting Arrow bytes are identical (verified).
+                            "final_hidden": hidden.detach().cpu().to(storage_dtype).numpy(),
                         }
                     )
                 hidden_bar.update(len(batch_rows))

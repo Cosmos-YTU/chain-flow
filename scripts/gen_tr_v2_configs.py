@@ -82,7 +82,12 @@ SIZES = {
     "9btr":  dict(model="Qwen/Qwen3.5-9B",  gen=_GEN or 256, hid=_HID or 64,  reuse=False),
     "tr27b": dict(model="Qwen/Qwen3.5-27B", gen=_GEN or 256, hid=_HID or 32,  reuse=True),
 }
-SHARD_ROWS = 4000            # keep a shard under ~2h so a crash costs little
+# Shard size bounds HOST memory as well as wall-clock: phase 2 accumulates every row and only
+# writes at the end of a shard, so peak RAM is proportional to this. With final_hidden stored as
+# a numpy array a 27B row is ~8.8 MB (860 tokens x 5120 x fp16), so 2000 rows is ~18 GB plus the
+# Arrow conversion. It was 4000 with rows held as nested PYTHON floats -- ~140 MB each, ~560 GB
+# per shard -- which is what took a machine down. Override with CF_SHARD_ROWS.
+SHARD_ROWS = int(os.environ.get("CF_SHARD_ROWS", "2000"))
 
 # Warm start. `continue` resumes the SHIPPED Turkish checkpoint -- "carry on from where it left
 # off" -- which is what you want when the goal is a better Turkish drafter. `parent` restarts from

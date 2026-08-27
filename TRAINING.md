@@ -113,6 +113,13 @@ CF_GEN_BS=64 CF_HID_BS=32 python scripts/gen_tr_v2_configs.py
 
 These are **unverified on B300** like the training batch shapes. If collection OOMs, halve them.
 
+### Host memory
+
+Phase 2 accumulates every row and writes once at the end of a shard, so peak **system** RAM scales
+with `CF_SHARD_ROWS` (default 2000). At 27B a row is ~8.8 MB (860 tokens × 5120 × fp16), so a shard
+is ~18 GB plus the Arrow conversion. Lower `CF_SHARD_ROWS` on a machine with less RAM — it costs
+nothing but a few more shard boundaries.
+
 Stopping and restarting is cheap at two levels. A shard is done when its flow cache exists, so a
 restart skips it entirely. And within a shard, the generated answers are kept
 (`teacher_states/_tmp_<name>`) and reused, so a phase-2 failure does **not** cost the generation —
