@@ -104,8 +104,13 @@ them; measured at 27B, `hid=128` put 266 GB in use on a 267 GB card and OOMed �
 sequence, roughly 3× what the hidden-state tensor alone accounts for. Raising both in step is the
 mistake to avoid.
 
-Defaults are `gen 256 / hid 32` at 27B, `256/64` at 9B, `512/128` at 4B. Override without
-regenerating:
+`gen` is a single value per size; **`hid` is derived per source** from that source's actual prompt
+lengths, because phase-2 memory is per *token* and the sources differ by 2.5× — instructurca
+averages 441 tokens against tool-calling's 1081. One global value either wastes half the card on
+instructurca (87% of the rows) or OOMs on tool-calling. At 27B that yields `instruct 56`,
+`funccall 40`, `multiturn 32`, `toolcall 24`, all landing near 190 GB of a 275 GB card. It is sized
+on the mean/p95 midpoint, not the mean, since extraction pads to the longest row in each batch.
+`gen` is 256 at 27B. Override either without regenerating:
 
 ```bash
 CF_GEN_BS=64 CF_HID_BS=32 python scripts/gen_tr_v2_configs.py

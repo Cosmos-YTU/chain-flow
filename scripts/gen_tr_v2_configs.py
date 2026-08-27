@@ -201,6 +201,28 @@ ddp_find_unused_parameters: true
     return path
 
 
+def hid_for(stem: str, fallback: int) -> int:
+    """Per-source hidden_batch_size, scaled by that source's actual prompt lengths.
+
+    Phase-2 memory is per TOKEN, not per row, and the sources differ by 2.5x: instructurca
+    averages 441 tokens (prompt + <=256 generated) against tool-calling's 1081. A single global
+    value therefore either wastes half the card on instruct -- which is 87% of the rows -- or OOMs
+    on tool-calling. MEASURED anchor: hid=32 on instruct peaked at ~105 GB total, i.e. ~54 GB of
+    weights plus ~1.6 GB per row at 441 tokens.
+
+    Sized on the mean/p95 midpoint rather than the mean, because extraction pads every sequence to
+    the longest in its batch, so a few long rows set the peak. Target is ~200 GB of a 275 GB card.
+    """
+    f = f"bench_data_tr_v2/{stem}.train.jsonl"
+    if not os.path.exists(f):
+        return fallback
+    import json as _j
+    toks = sorted(_j.loads(l)["prompt_tokens"] + 256 for l in open(f))
+    typical = (sum(toks) / len(toks) + toks[int(0.95 * len(toks))]) / 2
+    hid = int(40392 / typical)                      # 40392 = (200-54) GB / (1.6 GB per 441 tok)
+    return max(16, min(96, hid // 8 * 8))           # multiples of 8, clamped to sane bounds
+
+
 def main() -> int:
     import argparse
     ap = argparse.ArgumentParser()
@@ -254,7 +276,7 @@ def main() -> int:
                         f"source: {src}\nformat_name: pretemplated\n"
                         f"generation_max_new_tokens: 256\n"
                         f"generation_batch_size: {cfg['gen']}\n"
-                        f"hidden_batch_size: {cfg['hid']}\n"
+                        f"hidden_batch_size: {hid_for(stem, cfg['hid'])}\n"
                         f"storage_dtype: float16\ndtype: float16\ndevice: cuda:0\n"
                         f"output_dir: teacher_states/stage1-{size}-v2-{name}\n")
                 n += b - a
