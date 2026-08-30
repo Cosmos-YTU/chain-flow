@@ -75,11 +75,18 @@ def _chunk_logits(x, W, bias, emb, w2):
     back most of the activation this module exists to remove.  As a sum of two matmuls into the
     same chunk buffer it costs no extra memory at all.
     """
-    logits = torch.matmul(x, W.t())
+    # Cast EXPLICITLY to the head's dtype. In the forward this function runs inside autocast,
+    # which silently harmonises operands; the backward recomputes it OUTSIDE autocast, where
+    # `emb` (bf16, cast to W.dtype by head_reductions) meets `w2` (fp32 master weights) and
+    # matmul raises. Doing here what autocast did there keeps forward and backward identical
+    # regardless of autocast state -- and makes the function correct on its own terms rather
+    # than dependent on where it is called from.
+    dt = W.dtype
+    logits = torch.matmul(x.to(dt), W.t())
     if bias is not None:
-        logits = logits + bias
+        logits = logits + bias.to(logits.dtype)
     if emb is not None:
-        logits = logits + torch.matmul(emb, w2.t())
+        logits = logits + torch.matmul(emb.to(dt), w2.to(dt).t())
     return logits
 
 
@@ -144,7 +151,7 @@ class _FusedHeadReduce(torch.autograd.Function):
             glw = gl.to(W.dtype)
             gx[a:b] = torch.matmul(glw, W)
             if emb is not None:
-                gemb[a:b] = torch.matmul(glw, w2)
+                gemb[a:b] = torch.matmul(glw, w2.to(glw.dtype))
                 gw2 += torch.matmul(gl.t(), e.to(gl.dtype))
         # lm_head W/bias are frozen buffers -- never optimised, so no gradient is produced.
         return gx, None, None, gemb, (None if gw2 is None else gw2.to(w2.dtype)), None, None, None

@@ -86,6 +86,42 @@ def run(device, dtype, B, K, H, V, rank, cov_b, chunk, tol):
     return ok
 
 
+def autocast_mixed_dtype(device="cuda"):
+    """The case a same-dtype test cannot reach: bf16 head, fp32 trainable markov weights, forward
+    under autocast and backward outside it.
+
+    This is exactly how training runs, and it is what broke a live run at step 0: autocast
+    harmonises operands in the forward, the custom Function recomputes the same matmul in the
+    backward where autocast is gone, and bf16 @ fp32 raises. Every earlier check here used one
+    dtype throughout, so none of them could see it.
+    """
+    if not torch.cuda.is_available():
+        print("\n=== autocast/mixed-dtype check SKIPPED (no CUDA) ===")
+        return True
+    print("\n=== autocast forward + eager backward, bf16 head vs fp32 markov weights ===")
+    B, K, H, V, rank, cov_b = 2, 4, 64, 512, 16, 4
+    hid = torch.randn(B, K, H, device=device, dtype=torch.bfloat16, requires_grad=True)
+    W = (torch.randn(V, H, device=device) / H**0.5).to(torch.bfloat16)
+    bias = torch.randn(V, device=device, dtype=torch.bfloat16)
+    emb = torch.randn(B, K, rank, device=device, requires_grad=True)     # fp32, like markov.w1 out
+    w2 = (torch.randn(V, rank, device=device) / rank**0.5).requires_grad_(True)   # fp32 parameter
+    tok = torch.randint(0, V, (B, K), device=device)
+    try:
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            lse, true, kth = head_reductions(hid, W, bias, tok, markov_emb=emb, markov_w2=w2,
+                                             cov_b=cov_b, chunk=3)
+            loss = (ce_from(lse, true) + accept_from(lse, true, 0.8, 1e-9)
+                    + coverage_from(kth, true, 1.0))
+        loss.backward()                       # OUTSIDE autocast, as the Trainer does it
+    except RuntimeError as e:
+        print(f"    FAILED: {e}")
+        return False
+    ok = all(g is not None and torch.isfinite(g).all() for g in (hid.grad, emb.grad, w2.grad))
+    print(f"    forward+backward OK; grads finite for hidden/markov_emb/markov_w2: {ok}")
+    print(f"    grad dtypes: hidden {hid.grad.dtype}, emb {emb.grad.dtype}, w2 {w2.grad.dtype}")
+    return ok
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bf16-cuda", action="store_true", help="also run in the shipping dtype on GPU")
@@ -104,6 +140,7 @@ def main() -> int:
         ok &= run("cuda", torch.bfloat16, B=8, K=8, H=512, V=4096, rank=256, cov_b=8,
                   chunk=a.chunk, tol=5e-2)
 
+    ok &= autocast_mixed_dtype()
     print("\n" + ("ALL CHECKS PASSED" if ok else "!! MISMATCH -- do not enable the fast path"))
     return 0 if ok else 1
 
