@@ -24,7 +24,10 @@ def parse_args() -> argparse.Namespace:
         "--hidden-dtype",
         choices=["float32", "float16", "bfloat16"],
         default="float32",
-        help="Hidden tensor dtype to store in the cache.",
+        # NB float32 is the historical default but every Turkish/English flow cache in this repo
+        # was built as float16, and concat_flow_caches refuses to merge mismatched dtypes. Callers
+        # extending an existing cache must pass --hidden-dtype float16 explicitly.
+        help="Hidden tensor dtype to store in the cache. Pass float16 to match the existing caches.",
     )
     parser.add_argument("--overwrite", action="store_true", help="Allow writing into a non-empty output directory.")
     return parser.parse_args()
