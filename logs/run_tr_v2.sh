@@ -31,7 +31,13 @@ NGPU=$(set -- $GPUS; echo $#)          # defined HERE: config generation needs i
 # default here and only `default` in the library. CF_FUSED_HEAD/CF_FUSED_CHUNK default on in the
 # training module -- set CF_FUSED_HEAD=0 to fall back to the reference path.
 export CF_COMPILE="${CF_COMPILE:-1}"
-export CF_COMPILE_MODE="${CF_COMPILE_MODE:-max-autotune}"
+# max-autotune-no-cudagraphs, NOT max-autotune. `max-autotune` turns on CUDA graphs, which recycle
+# output buffers between runs -- and the fused head is a custom autograd Function that saves tensors
+# produced by the compiled forward and reads them again in the backward, by which point the graph
+# has re-run and overwritten them ("accessing tensor output of CUDAGraphs that has been overwritten
+# by a subsequent run"). The kernel autotuning, which is the actual win here, is unaffected; CUDA
+# graphs mainly remove launch overhead, and at a 512-window microbatch that is already amortised.
+export CF_COMPILE_MODE="${CF_COMPILE_MODE:-max-autotune-no-cudagraphs}"
 export CF_FUSED_HEAD="${CF_FUSED_HEAD:-1}"
 case "$SIZE" in
   4btr)  V1_CACHE=data/flow_cache/stage1_4btr_mix_k4  ;;
@@ -345,6 +351,10 @@ if [ "$CACHE_READY" = 0 ]; then
 fi
 
 # ---------------------------------------------------------------- 5. train
+# Rotate: train.log is appended, so a previous run's traceback stays at the tail and reads as if
+# it belonged to this one -- which cost a round of confusion diagnosing a run that was 15 seconds
+# old against an error from ten minutes earlier.
+[ -f "$LOG/train.log" ] && mv "$LOG/train.log" "$LOG/train.$(date -u +%Y%m%d-%H%M%S).log"
 say "TRAIN start ($NGPU GPUs)"
 CUDA_VISIBLE_DEVICES=$(echo $GPUS | tr ' ' ',') $PY -m torch.distributed.run --nproc_per_node=$NGPU \
     --master_port=29531 scripts/train_tree_flow.py "$TRAIN_CFG" \

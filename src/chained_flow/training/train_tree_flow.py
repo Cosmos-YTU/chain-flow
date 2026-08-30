@@ -139,7 +139,14 @@ class TreeFlowTrainingModule(nn.Module):
         # module (and therefore state_dict, named_parameters and DDP) untouched.
         self._compiled_teacher = None
         if _truthy(os.environ.get("CF_COMPILE", "1")):
+            # Not "max-autotune": that enables CUDA graphs, whose recycled output buffers are
+            # incompatible with the fused head saving compiled-forward tensors for its backward.
             mode = os.environ.get("CF_COMPILE_MODE", "default")
+            if mode == "max-autotune" and _truthy(os.environ.get("CF_FUSED_HEAD", "1")):
+                mode = "max-autotune-no-cudagraphs"
+                print("[chained-flow] CF_COMPILE_MODE=max-autotune is unsafe with the fused head "
+                      "(CUDA graphs recycle buffers it saves for backward); using "
+                      "max-autotune-no-cudagraphs", flush=True)
             try:
                 self._compiled_teacher = torch.compile(self.drafter.forward_teacher,
                                                        mode=mode, dynamic=False)
