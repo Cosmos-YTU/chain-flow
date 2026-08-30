@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass
 from pathlib import Path
 import random
@@ -432,7 +434,16 @@ class FlowWindowCacheDataset(TorchDataset):
         print(f"loading flow window cache: {cache_dir}", flush=True)
         with (cache_dir / FLOW_CACHE_METADATA).open("r", encoding="utf-8") as f:
             metadata = json.load(f)
-        hidden = torch.load(cache_dir / FLOW_CACHE_FILES["hidden"], map_location="cpu")
+        # mmap the big one. `hidden.pt` is the whole cache -- 186 GB for the 27B Turkish v2 mix --
+        # and a plain torch.load gives EVERY DDP rank its own private copy: 4 ranks x 192 GB = 768 GB
+        # of host RAM, which is what takes a machine down before the first step. Memory-mapping
+        # leaves a single copy in the page cache that all ranks share, and pages fault in on
+        # access, so a random-window reader touches only what it reads.
+        #
+        # CF_CACHE_MMAP=0 restores the eager load. Only worth doing if the cache is on storage too
+        # slow to fault against -- on local NVMe it is strictly better.
+        _mmap = os.environ.get("CF_CACHE_MMAP", "1") not in ("0", "false", "False", "no")
+        hidden = torch.load(cache_dir / FLOW_CACHE_FILES["hidden"], map_location="cpu", mmap=_mmap)
         input_ids = torch.load(cache_dir / FLOW_CACHE_FILES["input_ids"], map_location="cpu")
         row_offsets = torch.load(cache_dir / FLOW_CACHE_FILES["row_offsets"], map_location="cpu")
         row_lengths = torch.load(cache_dir / FLOW_CACHE_FILES["row_lengths"], map_location="cpu")
