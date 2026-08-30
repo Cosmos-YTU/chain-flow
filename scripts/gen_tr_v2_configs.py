@@ -75,13 +75,51 @@ PRESETS = {
 # 563), so the margin at hid=64 is thinner on some shards than others.
 #
 # Override per run without regenerating: CF_GEN_BS / CF_HID_BS.
+# CARD SIZE IS DETECTED, NOT ASSUMED. These numbers were tuned on 275 GB B300s; the same values
+# on a 102 GB card OOM immediately, and this pipeline has already lost several hours to batch
+# sizes that were right for one machine and wrong for the next.
+#
+# Everything is derived from two MEASURED anchors at 27B on a B300:
+#   generation  gen=256 sat at ~198 GB total -> (198 - 54 weights) / 256 = 0.56 GB per sequence
+#   extraction  hid=32 on instruct peaked at ~105 GB -> ~1.6 GB per row at 441 tokens
+# Usable headroom is (card total - target weights - 12 GB slack for fragmentation and cudagraphs).
+WEIGHTS_GB = {"4btr": 8.0, "9btr": 18.0, "tr27b": 54.0}
+GEN_GB_PER_SEQ = 0.56
+SLACK_GB = float(os.environ.get("CF_SLACK_GB", "20"))   # fragmentation + cudagraphs + long-tail rows
+
+
+def _card_gb() -> float:
+    if os.environ.get("CF_CARD_GB"):
+        return float(os.environ["CF_CARD_GB"])
+    try:
+        import torch
+        return torch.cuda.get_device_properties(0).total_memory / 1e9
+    except Exception:                                        # noqa: BLE001
+        return 102.0                                         # conservative if torch/GPU absent
+
+
+def _headroom(size: str) -> float:
+    return max(8.0, _card_gb() - WEIGHTS_GB[size] - SLACK_GB)
+
+
 _GEN = int(os.environ.get("CF_GEN_BS", "0"))
 _HID = int(os.environ.get("CF_HID_BS", "0"))
+
+
+def gen_for(size: str) -> int:
+    if _GEN:
+        return _GEN
+    return max(8, min(256, int(_headroom(size) / GEN_GB_PER_SEQ) // 8 * 8))
+
+
 SIZES = {
-    "4btr":  dict(model="Qwen/Qwen3.5-4B",  gen=_GEN or 512, hid=_HID or 128, reuse=True),
-    "9btr":  dict(model="Qwen/Qwen3.5-9B",  gen=_GEN or 256, hid=_HID or 64,  reuse=False),
-    "tr27b": dict(model="Qwen/Qwen3.5-27B", gen=_GEN or 256, hid=_HID or 32,  reuse=True),
+    "4btr":  dict(model="Qwen/Qwen3.5-4B",  reuse=True),
+    "9btr":  dict(model="Qwen/Qwen3.5-9B",  reuse=False),
+    "tr27b": dict(model="Qwen/Qwen3.5-27B", reuse=True),
 }
+for _k, _v in SIZES.items():
+    _v["gen"] = gen_for(_k)
+    _v["hid"] = _HID or 32
 # Shard size bounds HOST memory as well as wall-clock: phase 2 accumulates every row and only
 # writes at the end of a shard, so peak RAM is proportional to this. With final_hidden stored as
 # a numpy array a 27B row is ~8.8 MB (860 tokens x 5120 x fp16), so 2000 rows is ~18 GB plus the
@@ -113,22 +151,43 @@ INIT = {
 # that forced the 27B microbatch down to 64, and a B300 has ~288 GB.
 # UNVERIFIED ON B300 (no card was free to test): if a run OOMs, halve `mb` and double `accum` --
 # the assert will tell you immediately if the pair stops matching.
+# `mb275` is the microbatch tuned for a 275 GB B300; `mb102` is the value PROVEN on a 102 GB card
+# by the v1 runs. Anything in between is interpolated. `eff` is that size's own v1 effective batch
+# and is preserved exactly, so only the microbatch/accumulation split changes and the optimisation
+# trajectory is untouched -- doubling effective batch at a constant LR is a different experiment.
 GEO = {
-    "4btr":  dict(model="Qwen/Qwen3.5-4B",  ed=640,  ls=640,  vi=1920, mb=2048, accum=3,  lr=1.5e-4,
-                  eff=12288, vae="out/vae/ckpts/transformer-hidden-4bx-2560-latent640-fp16"),
-    "9btr":  dict(model="Qwen/Qwen3.5-9B",  ed=1024, ls=1024, vi=3072, mb=2048, accum=6,  lr=1.5e-4,
-                  eff=24576, vae="out/vae/ckpts/transformer-hidden-9bx-4096-latent1024-fp16"),
-    "tr27b": dict(model="Qwen/Qwen3.5-27B", ed=1024, ls=1024, vi=4096, mb=512,  accum=6,  lr=1.0e-4,
-                  eff=6144, vae="out/vae/ckpts/transformer-hidden-q3527bx-5120-latent1024-fp16"),
+    "4btr":  dict(model="Qwen/Qwen3.5-4B",  ed=640,  ls=640,  vi=1920, mb275=2048, mb102=512,
+                  eff=12288, lr=1.5e-4, vae="out/vae/ckpts/transformer-hidden-4bx-2560-latent640-fp16"),
+    "9btr":  dict(model="Qwen/Qwen3.5-9B",  ed=1024, ls=1024, vi=3072, mb275=2048, mb102=512,
+                  eff=24576, lr=1.5e-4, vae="out/vae/ckpts/transformer-hidden-9bx-4096-latent1024-fp16"),
+    "tr27b": dict(model="Qwen/Qwen3.5-27B", ed=1024, ls=1024, vi=4096, mb275=512,  mb102=64,
+                  eff=6144,  lr=1.0e-4, vae="out/vae/ckpts/transformer-hidden-q3527bx-5120-latent1024-fp16"),
 }
-for _s, _g in GEO.items():
-    assert _g["mb"] * _g["accum"] * 2 == _g["eff"], (
-        f"{_s}: {_g['mb']} x {_g['accum']} x 2 = {_g['mb']*_g['accum']*2}, "
-        f"but v1's effective batch was {_g['eff']}")
 
 
-def write_train_config(size, preset, init_mode, epochs):
+def batch_split(size: str, ngpu: int) -> tuple[int, int]:
+    """(microbatch, accumulation) for this card and this many GPUs, holding `eff` exactly."""
     g = GEO[size]
+    if os.environ.get("CF_TRAIN_MB"):
+        mb = int(os.environ["CF_TRAIN_MB"])
+    else:
+        card = _card_gb()
+        frac = max(0.0, min(1.0, (card - 102.0) / (275.0 - 102.0)))
+        mb = int(g["mb102"] + frac * (g["mb275"] - g["mb102"]))
+        mb = max(8, 1 << (mb.bit_length() - 1))              # round down to a power of two
+    per_step = g["eff"] // ngpu
+    if mb > per_step:
+        mb = per_step
+    accum = per_step // mb
+    if mb * accum * ngpu != g["eff"]:
+        raise SystemExit(f"{size}: {mb} x {accum} x {ngpu} = {mb*accum*ngpu}, not v1's {g['eff']}. "
+                         f"Pick a CF_TRAIN_MB that divides {per_step}.")
+    return mb, accum
+
+
+def write_train_config(size, preset, init_mode, epochs, ngpu):
+    g = GEO[size]
+    mb, accum = batch_split(size, ngpu)
     path = f"train_configs/recovered/joint_{size}_v2_{preset}.yaml"
     with open(path, "w") as f:
         f.write(f"""# Turkish v2 ({preset} preset, warm start: {init_mode}). Generated by
@@ -187,8 +246,8 @@ gamma: 0.8
 output_dir: out/flow/ckpts/tree-vae-joint-{size}v2{preset}-{g['ls']}-k8-l8
 learning_rate: {g['lr']}
 num_train_epochs: {epochs}
-per_device_train_batch_size: {g['mb']}
-gradient_accumulation_steps: {g['accum']}
+per_device_train_batch_size: {mb}
+gradient_accumulation_steps: {accum}
 lr_scheduler_type: constant
 save_steps: 400
 logging_steps: 25
@@ -201,7 +260,7 @@ ddp_find_unused_parameters: true
     return path
 
 
-def hid_for(stem: str, fallback: int) -> int:
+def hid_for(stem: str, size: str) -> int:
     """Per-source hidden_batch_size, scaled by that source's actual prompt lengths.
 
     Phase-2 memory is per TOKEN, not per row, and the sources differ by 2.5x: instructurca
@@ -215,12 +274,14 @@ def hid_for(stem: str, fallback: int) -> int:
     """
     f = f"bench_data_tr_v2/{stem}.train.jsonl"
     if not os.path.exists(f):
-        return fallback
+        return SIZES[size]["hid"]
     import json as _j
     toks = sorted(_j.loads(l)["prompt_tokens"] + 256 for l in open(f))
     typical = (sum(toks) / len(toks) + toks[int(0.95 * len(toks))]) / 2
-    hid = int(40392 / typical)                      # 40392 = (200-54) GB / (1.6 GB per 441 tok)
-    return max(16, min(96, hid // 8 * 8))           # multiples of 8, clamped to sane bounds
+    # 1.6 GB per row at 441 tokens, scaled to this source's typical length and this card's headroom
+    per_row = 1.6 * typical / 441.0
+    hid = int(_headroom(size) / per_row)
+    return max(4, min(96, hid // 4 * 4))
 
 
 def main() -> int:
@@ -229,6 +290,9 @@ def main() -> int:
     ap.add_argument("--preset", choices=sorted(PRESETS), default="instruct")
     ap.add_argument("--init", choices=sorted(INIT), default="continue")
     ap.add_argument("--epochs", type=float, default=3.0)
+    ap.add_argument("--gpus", type=int, default=int(os.environ.get("CF_NGPU", "2")),
+                    help="GPUs the training run will use; sets gradient_accumulation_steps so the "
+                         "effective batch stays at v1's value")
     ap.add_argument("--no-reuse", action="store_true",
                     help="collect EVERY row instead of only the tail. Required on a machine that "
                          "does not have the v1 flow cache -- the tail-only plan assumes v1's rows "
@@ -276,7 +340,7 @@ def main() -> int:
                         f"source: {src}\nformat_name: pretemplated\n"
                         f"generation_max_new_tokens: 256\n"
                         f"generation_batch_size: {cfg['gen']}\n"
-                        f"hidden_batch_size: {hid_for(stem, cfg['hid'])}\n"
+                        f"hidden_batch_size: {hid_for(stem, size)}\n"
                         f"storage_dtype: float16\ndtype: float16\ndevice: cuda:0\n"
                         f"output_dir: teacher_states/stage1-{size}-v2-{name}\n")
                 n += b - a
@@ -297,7 +361,7 @@ def main() -> int:
                 if _a2 < _b1:
                     raise SystemExit(f"{out}: overlapping ranges for {_src}: "
                                      f"[{_a1},{_b1}) and [{_a2},{_b2}) would collect rows twice")
-        tc = write_train_config(size, opts.preset, opts.init, opts.epochs)
+        tc = write_train_config(size, opts.preset, opts.init, opts.epochs, opts.gpus)
         print(f"{out:38s} shards={len(os.listdir(out)):3d}  rows={n:6d}"
               f"  ({'tail only' if cfg['reuse'] else 'FULL recollect'})  -> {tc}")
     return 0

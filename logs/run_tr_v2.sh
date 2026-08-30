@@ -70,7 +70,10 @@ if [ -n "$V1_CACHE" ] && [ ! -f "$V1_CACHE/metadata.json" ]; then
   REUSE_ARG="--no-reuse"
 fi
 say "regenerating configs (preset=$PRESET, init=continue${REUSE_ARG:+, full collection})"
-$PY scripts/gen_tr_v2_configs.py --preset "$PRESET" $REUSE_ARG >/dev/null || {
+# --gpus sets gradient_accumulation_steps so the effective batch stays at v1's value regardless of
+# how many cards this run uses. Without it a 4-GPU run would silently double the effective batch,
+# which at a constant LR is a different experiment, not a speed-up.
+$PY scripts/gen_tr_v2_configs.py --preset "$PRESET" --gpus "$NGPU" $REUSE_ARG >/dev/null || {
   say "ABORT: config generation failed"; exit 1; }
 
 # Rows this plan will actually collect, read from the configs rather than assumed -- the number

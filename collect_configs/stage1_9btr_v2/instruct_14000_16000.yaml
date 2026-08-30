@@ -12,8 +12,8 @@ dataset_end: 16000
 source: tr_instruct
 format_name: pretemplated
 generation_max_new_tokens: 256
-generation_batch_size: 256
-hidden_batch_size: 56
+generation_batch_size: 112
+hidden_batch_size: 24
 storage_dtype: float16
 dtype: float16
 device: cuda:0
