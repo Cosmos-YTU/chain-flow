@@ -23,6 +23,8 @@ PY=.venv/bin/python
 SIZE="${1:?usage: run_tr_v2.sh <4btr|9btr|tr27b> \"<gpus>\" [preset]}"
 GPUS="${2:?usage: run_tr_v2.sh <size> \"<gpus>\" [preset]}"
 PRESET="${3:-instruct}"
+NGPU=$(set -- $GPUS; echo $#)          # defined HERE: config generation needs it long before the
+                                       # heartbeat section where it used to live
 
 # torch.compile mode. max-autotune costs several minutes of warm-up per graph and then benchmarks
 # real kernel variants; over a multi-hour run that is the right trade, which is why it is the
@@ -159,7 +161,6 @@ esac
 # nothing between START and DONE -- on a 20-hour collection that is indistinguishable from a hang.
 # This pulls the most recent progress line out of each log every few minutes. tqdm separates
 # updates with \r rather than \n, so the log is one enormous line until it is split.
-NGPU=$(set -- $GPUS; echo $#)
 HEARTBEAT_SEC="${CF_HEARTBEAT_SEC:-300}"
 (
   while true; do
