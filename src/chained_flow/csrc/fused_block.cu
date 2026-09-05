@@ -188,6 +188,69 @@ __device__ __forceinline__ void warp_dot(const __half* __restrict__ W, const __h
   warp_dot_n<S, NCH, 1>(W, 0, sA, ldA, &acc);
 }
 
+// THE BATCH FALLOFF IS MATH THROUGHPUT, NOT MEMORY.  Four independent memory-side fixes were
+// built and measured, and all four are dead ends.  Read this before attempting a fifth.
+//
+// The kernel's projection rate is FLAT in batch while cuBLAS's grows, and that flat line IS the
+// falloff.  Same FLOPs, same shapes, same batch (D=640, S=8, projections only via STAGES=26):
+//     rows   this kernel   cuBLAS (tensor cores)   headroom
+//       64      12.0 TF/s          22.9 TF/s          1.9x
+//      256      14.9 TF/s          74.9 TF/s          5.0x
+//      512      15.9 TF/s         127.6 TF/s          8.0x
+// Scalar fp32 FFMA cannot follow tensor cores, so every batch the ratio gets worse.  It lines up
+// with the measured crossover on the real 4B drafter (integrate(), compiled+cudagraphed, ms):
+//     B          1      4      8     32     64
+//     PyTorch  2.02   2.19   2.50   3.77   4.41     <- grows 2.2x over a 64x batch
+//     fused    1.26   1.63   2.57   7.85  18.28     <- grows 14.5x
+// PyTorch is launch-bound at B=1 (which is why fusion wins 2.5x there) and absorbs batch almost
+// for free after that.  ``batch_limit`` already hands off at B=8, which is exactly the crossover.
+//
+// REFUTED 1 -- packing the batch into the ROW dimension so one weight walk serves BS slices.
+// Rows are NOT nearly free: at G=128 the FULL kernel costs 147.5 / 197.3 / 342.3 us at S=4/8/16,
+// so the marginal cost of a row RISES (12.5 -> 18.1 us/row).  Fitting T = W + r*S + q*S^2 gives
+// W=112.8 us, r=6.77, q=0.473 -- the q term is self-attention, and it is what makes packing get
+// worse the more you pack.  smem is a second wall: 88.8 KB at (D=640,S=16) fits the ~99 KB optin
+// cap, 176.5 KB at S=32 does not.
+//
+// REFUTED 2 -- packing the PROJECTIONS only, keeping attention per-slice.  This one survives the
+// row-scaling test (STAGES=26, G=128: 114.7 / 139.7 / 217.9 us at S=4/8/16, so T(2S) < 2*T(S))
+// and it halves the weight traffic, so it looked right.  It was then priced WITHOUT building it,
+// by holding total rows fixed and varying the split -- (S=16,B=N/2) has exactly a packed BS=2
+// weight-per-row ratio, and its timing is faithful even though its cross-attention is not:
+//     total rows    64      128      256      512
+//     S=8,  B=N/8  522.4    859.3   1522.9   2878.3 us
+//     S=16, B=N/16 597.2    939.1   1494.6   2725.3 us   <- HALF the L2 weight traffic
+//     speedup      0.87x    0.92x    1.02x    1.06x
+// Halving the weight traffic buys ~nothing, which is the cleanest possible proof that this kernel
+// is not bandwidth-bound.  Do not build the packed kernel on the strength of the row-scaling test
+// alone; that test holds bandwidth constant and so cannot see this.
+//
+// REFUTED 3 -- a LOCKSTEP grid barrier (one counter for all G*B blocks instead of one per slice)
+// so the batch marches the weight stream together and slices 2..B hit L2 instead of DRAM.  It was
+// built, shown faithful, and measured at 0.99-1.02x everywhere.  ncu says why -- the hardware
+// already does this reuse with no help, L2 MISSES ARE FLAT IN BATCH while hits scale:
+//     B=1   miss 2,775,279 sectors (~89 MB)   hit   3.9M
+//     B=8   miss 2,816,114        (~90 MB)    hit  28.4M
+//     B=32  miss 2,955,600        (~95 MB)    hit 109.2M
+// The weights come off DRAM ONCE at every batch.  Wall-clock alone suggests the opposite (16 x
+// 88.5 MB / 833 us "=" 1670 GB/s, ~93% of peak) -- that traffic is L2, not DRAM.  Do not infer
+// DRAM bandwidth from wall-clock here; measure dram__bytes / lts__t_sectors.
+//
+// REFUTED 4 -- see the two blocks below (k-splitting the narrow stages; a wider NCOL).
+//
+// THE DESIGN THAT WOULD ACTUALLY WORK, and the only one left: mma.sync on the projections.  The
+// two refuted row-packing schemes are not wasted -- MMA needs M >= 16 and one draft has only
+// S=8 rows, so a packed BS=2 supplies the M that makes m16n8k16 efficient.  Packing alone buys
+// nothing (refuted 2) and tensor cores alone have no M to work with; they only pay off together.
+// Note the prize is NOT tensor cores per se -- the PyTorch fallback already has them, and already
+// scales.  It is fusion AND tensor cores at once, i.e. moving the B=8 crossover up rather than
+// making high batch possible at all.
+//
+// NUMERICS NOTE for anyone A/B-ing a change here: stages 2 and 4 reduce into `res` with a float
+// atomicAdd, so the kernel does NOT reproduce itself bit-for-bit -- measured run-to-run delta is
+// 9.77e-04, one fp16 ulp.  Bit-equality is the wrong oracle; the right one is that a change stays
+// inside that noise floor.
+//
 // K-SPLITTING THE NARROW STAGES WAS TRIED AND REFUTED -- do not reopen without new evidence.
 //
 // The four D-column stages run at 15-28% of their weight roofline while the FFN runs at 69-92%,
