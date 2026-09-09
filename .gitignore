@@ -88,3 +88,8 @@ vllm/_cf_backup/
 bench_data_tr/
 bench_data_tr_v2/
 bench_data_tr_ood/
+
+# Prompt corpora are DATA, not source (same rule as bench_data_tr*): they are rebuilt by
+# scripts/build_multilingual_prompts.py and would otherwise add ~25 MB of jsonl to the repo.
+bench_data_de/
+bench_data_fr/
