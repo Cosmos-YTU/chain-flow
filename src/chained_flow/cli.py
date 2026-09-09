@@ -138,7 +138,7 @@ def _drafter_line() -> str:
     d = os.environ.get("CF_DRAFTER_DIR")
     if not d:
         return ("drafter    : CF_DRAFTER_DIR unset -- set it to a checkpoint dir or an HF repo "
-                "id (e.g. selimaktas/Flow-Drafter-4B-v2)")
+                "id (e.g. ytu-ce-cosmos/Flow-Drafter-Qwen3.5-4B)")
     return f"drafter    : {d}" + ("" if os.path.isdir(d) else "  (not a local dir: treated as an HF repo id)")
 
 

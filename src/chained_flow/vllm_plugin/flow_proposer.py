@@ -376,7 +376,7 @@ class FlowDrafterProposer:
         if not self.ckd:
             raise ValueError("set CF_DRAFTER_DIR to the drafter checkpoint dir or a HF repo id")
         if not os.path.isdir(self.ckd):
-            # a HF repo id (e.g. selimaktas/Flow-Drafter-Qwen3.5-27B-v2): run the PUBLISHED weights
+            # a HF repo id (e.g. ytu-ce-cosmos/Flow-Drafter-Qwen3.5-27B): run the PUBLISHED weights
             from huggingface_hub import snapshot_download
             # `shortlist.pt` is in the allow-list so that a drafter repo which ships one is
             # actually picked up.  Documenting "drop shortlist.pt next to the checkpoint" while

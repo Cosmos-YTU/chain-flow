@@ -63,14 +63,14 @@ Exactly two things. Everything else has a default that is gated and printed.
 
 | target model | drafter |
 |---|---|
-| `Qwen/Qwen3.5-4B`  | `selimaktas/Flow-Drafter-4B-v2` |
-| `Qwen/Qwen3.5-9B`  | `selimaktas/Flow-Drafter-9B-v2` |
-| `Qwen/Qwen3.5-27B` | `selimaktas/Flow-Drafter-Qwen3.5-27B-v2` |
+| `Qwen/Qwen3.5-4B`  | `ytu-ce-cosmos/Flow-Drafter-Qwen3.5-4B` |
+| `Qwen/Qwen3.5-9B`  | `ytu-ce-cosmos/Flow-Drafter-Qwen3.5-9B` |
+| `Qwen/Qwen3.5-27B` | `ytu-ce-cosmos/Flow-Drafter-Qwen3.5-27B` |
 
 ## Quickstart
 
 ```python
-# quickstart.py  —  CF_DRAFTER_DIR=selimaktas/Flow-Drafter-4B-v2 python quickstart.py
+# quickstart.py  —  CF_DRAFTER_DIR=ytu-ce-cosmos/Flow-Drafter-Qwen3.5-4B python quickstart.py
 from vllm import LLM, SamplingParams
 
 
@@ -99,7 +99,7 @@ if __name__ == "__main__":
 ```
 
 ```bash
-CF_DRAFTER_DIR=selimaktas/Flow-Drafter-4B-v2 python quickstart.py
+CF_DRAFTER_DIR=ytu-ce-cosmos/Flow-Drafter-Qwen3.5-4B python quickstart.py
 ```
 
 Everything else is defaulted and **capability-gated**: eleven optimisation flags

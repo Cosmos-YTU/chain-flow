@@ -93,3 +93,5 @@ bench_data_tr_ood/
 # scripts/build_multilingual_prompts.py and would otherwise add ~25 MB of jsonl to the repo.
 bench_data_de/
 bench_data_fr/
+
+bench_data_en/
