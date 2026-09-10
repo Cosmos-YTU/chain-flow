@@ -1,8 +1,8 @@
 import torch
 
-from chained_flow.drafters.markov_flow import MarkovFlowDrafter, MarkovFlowConfig
-from chained_flow.training.train_chunked_flow import FlowLossArguments
-from chained_flow.training.train_markov_flow import MarkovModelArguments, MarkovTrainingModule, markov_config_from_args
+from chain_flow.drafters.markov_flow import MarkovFlowDrafter, MarkovFlowConfig
+from chain_flow.training.train_chunked_flow import FlowLossArguments
+from chain_flow.training.train_markov_flow import MarkovModelArguments, MarkovTrainingModule, markov_config_from_args
 
 
 def _cfg(K=4, C=4):

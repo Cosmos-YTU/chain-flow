@@ -1,13 +1,13 @@
 import os
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-import sys; sys.path.insert(0, "/home/shadeform/chained-flow/src")
+import sys; sys.path.insert(0, "/home/shadeform/chain-flow/src")
 import time, json, dataclasses, torch
 import numpy as _np
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
 MODEL = "Qwen/Qwen3.5-4B"
-CKD = "/home/shadeform/chained-flow/out/flow/ckpts/tree-vae-joint-4bx-640-k8-l8"
+CKD = "/home/shadeform/chain-flow/out/flow/ckpts/tree-vae-joint-4bx-640-k8-l8"
 tok = AutoTokenizer.from_pretrained(MODEL)
 # structured (high-accept) + prose prompts
 import json as _json
@@ -41,7 +41,7 @@ def run(worker):
     from vllm.distributed.parallel_state import graph_capture
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update as cu
     from vllm.model_executor.layers.fla.ops import fused_recurrent_gated_delta_rule_packed_decode as pd
-    from chained_flow.vllm_tree.tree_ssm import tree_gdn_op, tree_conv_op
+    from chain_flow.vllm_tree.tree_ssm import tree_gdn_op, tree_conv_op
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
     dev = "cuda"; model = worker.get_model(); runner = worker.model_runner
@@ -169,7 +169,7 @@ def run(worker):
             return lg
 
     # ---- 4B joint-VAE drafter (stub w/ real untied lm_head) ----
-    from chained_flow.drafters.tree_vae_flow import TreeVAEFlowDrafter, TreeVAEFlowConfig
+    from chain_flow.drafters.tree_vae_flow import TreeVAEFlowDrafter, TreeVAEFlowConfig
     from safetensors.torch import load_file
     from types import SimpleNamespace
     class Emb:

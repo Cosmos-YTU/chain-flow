@@ -2,7 +2,7 @@ from pathlib import Path
 
 from transformers import HfArgumentParser, TrainingArguments
 
-from chained_flow.training.train_hidden_mlp import (
+from chain_flow.training.train_hidden_mlp import (
     HiddenMLPModelArguments,
     LossArguments,
     TeacherDataArguments,

@@ -43,6 +43,6 @@ fig.text(0.5, 0.005, "4 prompts/domain (long summarization/rag truncated to fit)
          "v2's diverse data lifts the free-form domains (writing/qa/summ/rag); math/code ~flat.",
          ha="center", fontsize=8.5, color=muted)
 fig.tight_layout(rect=[0, 0.02, 1, 0.98])
-out = "/home/shadeform/chained-flow/docs/alldomain_speedup_v1_vs_v2.png"
+out = "/home/shadeform/chain-flow/docs/alldomain_speedup_v1_vs_v2.png"
 fig.savefig(out, bbox_inches="tight", facecolor="white")
 print("wrote", out)

@@ -15,7 +15,7 @@ PLENS=${3:-$(seq -s, 1 32)}
 export CUDA_VISIBLE_DEVICES=${CF_GPU:-5}
 PY=${CF_PY:-/home/shadeform/vllm-pristine/.venv/bin/python}
 HERE=$(cd "$(dirname "$0")" && pwd)
-OUT=${CF_OUT:-/home/shadeform/chained-flow/logs/prefill_guard}
+OUT=${CF_OUT:-/home/shadeform/chain-flow/logs/prefill_guard}
 mkdir -p "$OUT"
 
 case "$SIZE" in

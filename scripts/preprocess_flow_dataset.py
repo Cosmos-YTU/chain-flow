@@ -11,7 +11,7 @@ load_dotenv()
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from chained_flow.training.window_dataset import build_flow_window_cache
+from chain_flow.training.window_dataset import build_flow_window_cache
 
 
 def parse_args() -> argparse.Namespace:

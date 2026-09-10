@@ -11,7 +11,7 @@ import sys
 
 import torch
 
-sys.path.insert(0, "/home/shadeform/chained-flow/src")
+sys.path.insert(0, "/home/shadeform/chain-flow/src")
 
 PROMPT = "Q: What is 15*23? A: Let's think step by step."
 N = int(os.environ.get("CMP_MAXTOK", "32"))
@@ -20,7 +20,7 @@ MODEL = os.environ.get("CMP_MODEL", "Qwen/Qwen3.5-4B")
 
 def vllm_hiddens():
     from vllm import LLM, SamplingParams
-    from chained_flow.vllm_plugin.flow_proposer import _install_hidden_state_hook, _STASH
+    from chain_flow.vllm_plugin.flow_proposer import _install_hidden_state_hook, _STASH
     llm = LLM(model=MODEL, gpu_memory_utilization=0.55, max_model_len=2048, dtype="float16",
               max_num_seqs=8)
     _install_hidden_state_hook()
@@ -73,7 +73,7 @@ def main():
             llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner  # noqa
         except Exception:
             pass
-        import chained_flow.vllm_plugin.flow_proposer as fp
+        import chain_flow.vllm_plugin.flow_proposer as fp
         fp._install_hidden_state_hook()
         d = torch.load(f"{outp}_hf.pt")
         ids = d["ids"].tolist()

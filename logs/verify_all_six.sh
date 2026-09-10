@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 V=logs/verify_usage_any.sh
 ( bash $V Qwen/Qwen3.5-4B  selimaktas/Flow-Drafter-4B-v2  3 8801 0.55 4bv2  62642
   bash $V Qwen/Qwen3.5-9B  selimaktas/Flow-Drafter-9B-v2  3 8802 0.70 9bv2  62642

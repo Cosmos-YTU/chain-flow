@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import re, os
 
-ROOT = "/home/shadeform/chained-flow"
+ROOT = "/home/shadeform/chain-flow"
 LOGS = {"4B v1": f"{ROOT}/vllm/test_compiled_4b_cgdraft.log", "4B v2": f"{ROOT}/logs/speedup_4bx.log",
         "27B v1": f"{ROOT}/logs/speedup_q3527b.log", "27B v2": f"{ROOT}/logs/speedup_q3527bx.log"}
 PROMPTS = ["math", "code", "short\nfactual", "prose", "MEAN"]

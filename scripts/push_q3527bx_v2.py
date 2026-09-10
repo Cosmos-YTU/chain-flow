@@ -3,7 +3,7 @@ its accept table and the v1->v2 comparison. Only invoked by the bench arm when t
 import json, re, shutil, time
 from pathlib import Path
 
-ROOT = Path("/home/shadeform/chained-flow")
+ROOT = Path("/home/shadeform/chain-flow")
 CKD = ROOT / "out/flow/ckpts/tree-vae-joint-q3527bx-1024-k8-l8"
 VAE = ROOT / "out/vae/ckpts/transformer-hidden-q3527bx-5120-latent1024-fp16"
 REPO = "selimaktas/Flow-Drafter-Qwen3.5-27B-v2"
@@ -49,7 +49,7 @@ tags:
 - speculative-decoding
 - draft-model
 - flow-matching
-- chained-flow
+- chain-flow
 ---
 
 # Flow-Drafter-Qwen3.5-27B-v2
@@ -82,7 +82,7 @@ def main():
     shutil.copy(CKD / "chained_flow_tree_config.json", STAGE)
     (STAGE / "vae").mkdir()
     shutil.copy(VAE / "model.safetensors", STAGE / "vae")
-    shutil.copy(VAE / "chained_flow_vae_config.json", STAGE / "vae")
+    shutil.copy(VAE / "chain_flow_vae_config.json", STAGE / "vae")
     (STAGE / "README.md").write_text(card())
     log(f"staged: {[p.name for p in STAGE.iterdir()]}")
     api.create_repo(REPO, repo_type="model", private=False, exist_ok=True)

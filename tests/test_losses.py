@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from chained_flow.training.losses import DrafterLossConfig, compute_drafter_loss
+from chain_flow.training.losses import DrafterLossConfig, compute_drafter_loss
 
 
 def test_hidden_only_loss_does_not_require_lm_head():

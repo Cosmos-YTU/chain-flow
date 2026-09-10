@@ -11,7 +11,7 @@ Nothing here changes a default: it is a separate driver, all hooks are local.
 """
 import os, sys, time, json, glob, itertools
 
-sys.path.insert(0, "/home/shadeform/chained-flow/src")
+sys.path.insert(0, "/home/shadeform/chain-flow/src")
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 import torch
 from vllm import LLM, SamplingParams
@@ -94,7 +94,7 @@ _rs.tree_rejection_sample = _tree
 # but rebind the imported alias too in case a future edit imports it by value.
 
 # ---------------------------------------------------------------- prompts
-_pd = os.environ.get("CF_PROMPTS", "/home/shadeform/chained-flow/bench_data")
+_pd = os.environ.get("CF_PROMPTS", "/home/shadeform/chain-flow/bench_data")
 _OFFS = [int(x) for x in os.environ.get("CF_POFF", "4").split(",")]
 _N = int(os.environ.get("CF_BATCH", "1"))
 _per = []
@@ -109,7 +109,7 @@ kw = dict(model=MODEL, gpu_memory_utilization=GMU, max_model_len=2048, dtype="fl
           enforce_eager=os.environ.get("CF_EAGER", "0") == "1", max_num_seqs=64)
 if MODE == "spec":
     kw["speculative_config"] = {"method": "custom_class",
-                                "model": "chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer",
+                                "model": "chain_flow.vllm_plugin.flow_proposer.FlowDrafterProposer",
                                 "num_speculative_tokens": K}
 llm = LLM(**kw)
 

@@ -1,8 +1,8 @@
 from datasets import Dataset
 import torch
 
-from chained_flow.training import window_dataset
-from chained_flow.training.window_dataset import TeacherWindowDataset, build_flow_window_cache, is_flow_window_cache
+from chain_flow.training import window_dataset
+from chain_flow.training.window_dataset import TeacherWindowDataset, build_flow_window_cache, is_flow_window_cache
 
 
 def test_teacher_window_dataset_derives_dynamic_training_fields():
@@ -189,7 +189,7 @@ def test_flow_window_cache_round_trips_teacher_windows(tmp_path):
     sample = windows[0]
 
     assert is_flow_window_cache(cache_dir)
-    assert metadata["cache_type"] == "chained_flow.flow_window_cache"
+    assert metadata["cache_type"] == "chain_flow.flow_window_cache"
     assert windows.available_windows == 2
     assert sample["context_hidden"].shape == (3, 2)
     assert sample["target_hidden"].shape == (2, 2)

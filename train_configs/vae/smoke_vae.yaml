@@ -1,7 +1,7 @@
 dataset_path: sghosts/cf_gsm8k_1k_train
 # dataset_path: sghosts/cf_gsm8k_64_train_v1
 dataset_split: train
-output_dir: /content/drive/MyDrive/chained-flow/vae/ckpts/hidden-vae-smoke
+output_dir: /content/drive/MyDrive/chain-flow/vae/ckpts/hidden-vae-smoke
 
 vae_type: residual_mlp
 hidden_size: 1024

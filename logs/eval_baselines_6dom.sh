@@ -3,7 +3,7 @@
 # adds held-out gsm8k). The first baseline pass used bench-* only (5 domains); before/after
 # comparisons must be over an identical domain set, so this replaces those two arms.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 V2=out/flow/ckpts/tree-vae-joint-q3527bx-1024-k8-l8

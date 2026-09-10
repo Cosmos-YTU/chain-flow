@@ -91,14 +91,14 @@ Turkish {tr_delta:+.2f}, English {en_delta:+.2f}.
 ## The shortlist matters more than the weights here
 
 The drafter's candidate head scores a **shortlist** of the 248,320-token vocabulary instead of the
-full `lm_head`. The list shipped with `chained-flow` was built from English-weighted corpora and
+full `lm_head`. The list shipped with `chain-flow` was built from English-weighted corpora and
 covers only **{r['cov_tr_before']:.1f}%** of held-out Turkish tokens against **{r['cov_en']:.1f}%** of English --
 about **1 in 3 Turkish target tokens is unproposable at any quality of training**.
 
 This repo therefore ships its own **`shortlist.pt`** ({sl['n']:,} ids, {100 * sl['n'] / 248320:.1f}% of the
 head, {sl['reduction']:.2f}x less head traffic than the full `lm_head`), rebuilt as the union over the
 English corpora *and* the Turkish corpus. It covers **{r['cov_tr_after']:.1f}%** of held-out Turkish tokens
-and still {r['cov_en']:.1f}% of English. `chained-flow` picks up a `shortlist.pt` sitting next to the
+and still {r['cov_en']:.1f}% of English. `chain-flow` picks up a `shortlist.pt` sitting next to the
 checkpoint automatically -- no env var -- so this is handled as long as `CF_DRAFTER_DIR` points here.
 
 The list is **vocabulary-level**, so it is the same file the 9B and 27B Turkish drafters ship.
@@ -176,7 +176,7 @@ def main() -> None:
     shutil.copy(SHORTLIST, STAGE / "shortlist.pt")
     (STAGE / "vae").mkdir()
     shutil.copy(VAE / "model.safetensors", STAGE / "vae")
-    vcfg = VAE / "chained_flow_vae_config.json"
+    vcfg = VAE / "chain_flow_vae_config.json"
     if vcfg.exists():
         shutil.copy(vcfg, STAGE / "vae")
     (STAGE / "README.md").write_text(card(r))

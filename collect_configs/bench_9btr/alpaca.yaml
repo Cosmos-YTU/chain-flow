@@ -6,7 +6,7 @@ storage_dtype: float16
 dtype: float16
 device: cuda:0
 dataset_name: json
-data_files: /home/shadeform/chained-flow/data/turkish_prompts/bench_turkish_alpaca_100.jsonl
+data_files: /home/shadeform/chain-flow/data/turkish_prompts/bench_turkish_alpaca_100.jsonl
 split: train
 source: alpaca
 format_name: raw_prompt

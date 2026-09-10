@@ -35,7 +35,7 @@ import os
 import sys
 import time
 
-sys.path.insert(0, "/home/shadeform/chained-flow/src")
+sys.path.insert(0, "/home/shadeform/chain-flow/src")
 
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
@@ -58,7 +58,7 @@ def _snapshot(repo: str) -> str:
 
 
 def build(size: str, dev="cuda", dt=torch.float16):
-    from chained_flow.drafters.tree_vae_flow import TreeVAEFlowDrafter, TreeVAEFlowConfig
+    from chain_flow.drafters.tree_vae_flow import TreeVAEFlowDrafter, TreeVAEFlowConfig
     from safetensors.torch import load_file
 
     repo, hidden = CKPTS[size]
@@ -125,7 +125,7 @@ def main() -> int:
     args = ap.parse_args()
     Bs = [int(x) for x in args.batches.split(",")]
 
-    from chained_flow import cuda_block
+    from chain_flow import cuda_block
 
     d, hidden, cfg = build(args.size)
     ctx_size = getattr(cfg, "context_size", 8)

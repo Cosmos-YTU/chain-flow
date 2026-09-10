@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from chained_flow import defaults, shortlist
+from chain_flow import defaults, shortlist
 
 
 # ------------------------------------------------------------------ the shipped file
@@ -29,7 +29,7 @@ def test_packaged_shortlist_is_present_and_is_the_qwen35_vocab():
     p = shortlist.packaged_path()
     assert p.is_file(), (
         f"{p} is missing -- a wheel without it silently runs the full head. It is declared in "
-        f"pyproject.toml under [tool.setuptools.package-data] 'chained_flow.data'."
+        f"pyproject.toml under [tool.setuptools.package-data] 'chain_flow.data'."
     )
     ids, meta = shortlist.load(str(p))
     assert meta["vocab_size"] == shortlist.PACKAGED_VOCAB
@@ -123,6 +123,6 @@ def test_default_is_the_best_candidate_and_exists():
 
 def test_packaged_path_agrees_between_the_two_modules():
     """`defaults.py` re-derives the path so it stays importable as a bare file with no torch and
-    no `chained_flow` package (it is run that way by `bench_cf.sh --sh`). Duplication is the
+    no `chain_flow` package (it is run that way by `bench_cf.sh --sh`). Duplication is the
     price; drift is what the test is for."""
     assert Path(defaults.packaged_shortlist()) == shortlist.packaged_path()

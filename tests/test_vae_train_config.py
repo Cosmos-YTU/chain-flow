@@ -39,7 +39,7 @@ def test_smoke_vae_yaml_parses():
     assert data_args.tokens_per_epoch is None
     assert data_args.validation_fraction == 0.1
     assert loss_args.beta == 0.0001
-    assert training_args.output_dir == "/content/drive/MyDrive/chained-flow/vae/ckpts/hidden-vae-smoke"
+    assert training_args.output_dir == "/content/drive/MyDrive/chain-flow/vae/ckpts/hidden-vae-smoke"
     assert training_args.per_device_eval_batch_size == training_args.per_device_train_batch_size
     assert training_args.per_device_eval_batch_size > 0
     assert training_args.eval_strategy == "epoch"
@@ -48,7 +48,7 @@ def test_smoke_vae_yaml_parses():
 
 def test_configure_epoch_eval_forces_eval_when_args_default_to_no_eval():
     module = load_script_module()
-    training_args = TrainingArguments(output_dir="/tmp/chained-flow-test")
+    training_args = TrainingArguments(output_dir="/tmp/chain-flow-test")
 
     module.configure_epoch_eval(training_args)
 
@@ -94,7 +94,7 @@ def test_transformer_hidden_seq8_sweep_configs_parse():
 
 
 def test_vae_component_logging_trainer_prediction_step_logs_eval_components(tmp_path):
-    from chained_flow.training.train_vae import (
+    from chain_flow.training.train_vae import (
         HiddenVAETrainingModule,
         VAEComponentLoggingTrainer,
         VAELossArguments,

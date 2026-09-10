@@ -21,7 +21,7 @@
 #      before.  Measuring with it disabled measures a configuration nobody deploys.
 #   2. It greps the [cf-defaults] line OUT OF THE ENGINE PROCESS (the `(EngineCore pid=...)`
 #      copy), not the API server's, and fails loudly if the engine never printed one.  The API
-#      server imports chained_flow too and prints its own line from a process that has no
+#      server imports chain_flow too and prints its own line from a process that has no
 #      drafter in it -- reading that one tells you nothing about the run.
 #   3. It records the completion TEXT for every request so two arms can be diffed before their
 #      throughputs are compared.  `bench_serve_diff.py a.json b.json`.
@@ -32,7 +32,7 @@ GPU=${3:?gpu}
 PORT=${4:?port}
 TAG=${5:-}
 
-ROOT=/home/shadeform/chained-flow
+ROOT=/home/shadeform/chain-flow
 OUT=$ROOT/logs/bench_serve/${SIZE}_${ARM}${TAG}
 mkdir -p "$OUT"
 SERVER_LOG=$OUT/server.log
@@ -47,7 +47,7 @@ export PYTHONPATH=$ROOT/src
 # Same capability-gated default table bench_cf.sh evaluates, for the same reason: CF_ASYNC_SPEC
 # is read by the forked config/vllm.py before anything imports us, so it cannot be defaulted
 # in-process on the fork.  Run as a FILE (no torch import, ~40 ms).
-_CF_DEF=$(PYTHONPATH=$ROOT/src "$CF_PY" $ROOT/src/chained_flow/defaults.py --sh)
+_CF_DEF=$(PYTHONPATH=$ROOT/src "$CF_PY" $ROOT/src/chain_flow/defaults.py --sh)
 echo "$_CF_DEF" | sed 's/^/[bench_serve] /' >&2
 eval "$_CF_DEF"
 
@@ -70,12 +70,12 @@ SPEC_ARGS=()
 case "$ARM" in
   base) ;;
   chain) export CF_CUDAGRAPH=1 CF_K=${CF_K:-5}
-         SPEC_ARGS=(--speculative-config "{\"method\":\"custom_class\",\"model\":\"chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer\",\"num_speculative_tokens\":${CF_K}}") ;;
+         SPEC_ARGS=(--speculative-config "{\"method\":\"custom_class\",\"model\":\"chain_flow.vllm_plugin.flow_proposer.FlowDrafterProposer\",\"num_speculative_tokens\":${CF_K}}") ;;
   tree)  export CF_CUDAGRAPH=1 VLLM_SPEC_TREE=1
          : ${CF_TREE_KEEP:=8}; : ${CF_TREE_DEPTH:=5}
          : ${CF_K:=$(( CF_TREE_KEEP * CF_TREE_DEPTH + 1 ))}
          export CF_TREE_KEEP CF_TREE_DEPTH CF_K
-         SPEC_ARGS=(--speculative-config "{\"method\":\"custom_class\",\"model\":\"chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer\",\"num_speculative_tokens\":${CF_K}}") ;;
+         SPEC_ARGS=(--speculative-config "{\"method\":\"custom_class\",\"model\":\"chain_flow.vllm_plugin.flow_proposer.FlowDrafterProposer\",\"num_speculative_tokens\":${CF_K}}") ;;
   *) echo "bad arm"; exit 1 ;;
 esac
 # Async scheduling ON for EVERY arm including base -- otherwise the base arm gives up a
@@ -131,7 +131,7 @@ if [ -z "$ENGINE_LINE" ] && [ "$ARM" != "base" ]; then
   grep -n "cf-defaults" "$SERVER_LOG" | head; exit 1
 fi
 echo "$ENGINE_LINE" | tee "$OUT/cf_defaults.engine.txt"
-grep -E "\(EngineCore pid=.*\[chained-flow\] (drafter=|shortlist head)" "$SERVER_LOG" \
+grep -E "\(EngineCore pid=.*\[chain-flow\] (drafter=|shortlist head)" "$SERVER_LOG" \
   | tee "$OUT/cf_build.engine.txt"
 
 RES=$OUT/serve_bench.json

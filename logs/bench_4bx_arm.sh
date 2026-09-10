@@ -2,7 +2,7 @@
 # Waits for the 4bx drafter, then benches its accept on the 6 domains by REUSING the existing
 # base-model caches (data/flow_cache/deploy_*) — no re-collection. Compares 4bx vs original 4B.
 set -o pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export CUDA_VISIBLE_DEVICES=5 PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 CKD=out/flow/ckpts/tree-vae-joint-4bx-640-k8-l8
@@ -19,8 +19,8 @@ $PY - <<'PYEOF'
 import json
 from dataclasses import asdict
 from transformers import HfArgumentParser, TrainingArguments
-from chained_flow.training.train_tree_flow import TreeModelArguments
-from chained_flow.training.train_chunked_flow import TeacherDataArguments, FlowLossArguments
+from chain_flow.training.train_tree_flow import TreeModelArguments
+from chain_flow.training.train_chunked_flow import TeacherDataArguments, FlowLossArguments
 p=HfArgumentParser((TreeModelArguments, TeacherDataArguments, FlowLossArguments, TrainingArguments))
 m,d,l,t=p.parse_yaml_file(yaml_file="train_configs/recovered/joint_4bx.yaml")
 json.dump({"model_args":asdict(m),"data_args":asdict(d),"loss_args":asdict(l)},
@@ -29,7 +29,7 @@ print("4bx config synthesized")
 PYEOF
 mkdir -p $ED
 cp $CKD/chained_flow_tree_config.json $ED/
-ln -sf /home/shadeform/chained-flow/$CKD/model.safetensors $ED/model.safetensors
+ln -sf /home/shadeform/chain-flow/$CKD/model.safetensors $ED/model.safetensors
 
 # eval each domain on the EXISTING base-model cache (domain -> cache dir)
 > logs/deploy_eval_4bx.log

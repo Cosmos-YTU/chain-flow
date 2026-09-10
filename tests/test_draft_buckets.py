@@ -11,7 +11,7 @@ and the property that matters is that it REACHES the largest batch the engine ca
 import pytest
 
 torch = pytest.importorskip("torch")
-from chained_flow.vllm_plugin.flow_proposer import FlowDrafterProposer  # noqa: E402
+from chain_flow.vllm_plugin.flow_proposer import FlowDrafterProposer  # noqa: E402
 
 
 def ladder(max_reqs, env=None, monkeypatch=None):

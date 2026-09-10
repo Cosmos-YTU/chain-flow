@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from chained_flow import defaults
+from chain_flow import defaults
 
 
 REPO = defaults.repo_root()

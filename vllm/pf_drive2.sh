@@ -1,7 +1,7 @@
 #!/bin/bash
 # Phase 2 of the `pf` (pad-fix) verification: the CHAIN arm is unaffected, the stale-tree
 # fallback is unreachable, and the 4B concurrency ladder still reads what it read.
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 
 # 0. EXTEND THE 27B NULL.  The 27B tree flips domain 4 at token 161 between its own repeats --
 #    the tie this project has recorded the 27B BASE arm flipping against itself -- but three

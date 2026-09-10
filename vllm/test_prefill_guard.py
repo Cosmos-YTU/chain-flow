@@ -9,7 +9,7 @@ linear attention + full attention) the captured decode graph holds the recurrent
 STEP, not the chunked prefill scan, so the replay computes the wrong linear-attention output and
 leaves a wrong recurrent state: the request is corrupt from its very first emitted token.
 
-`chained_flow.vllm_plugin.flow_proposer._install_uniform_decode_guard` fixes it by making
+`chain_flow.vllm_plugin.flow_proposer._install_uniform_decode_guard` fixes it by making
 `uniform_decode` a statement about PHASE (does any row still have prompt tokens left to compute?)
 rather than about shape. This file is the test that it stays fixed -- and, because the collision
 is at ``plen == K+1`` for EVERY K, that means sweeping both axes:
@@ -32,8 +32,8 @@ import json
 import os
 import sys
 
-if importlib.util.find_spec("chained_flow") is None:
-    sys.path.insert(0, "/home/shadeform/chained-flow/src")
+if importlib.util.find_spec("chain_flow") is None:
+    sys.path.insert(0, "/home/shadeform/chain-flow/src")
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 from vllm import LLM, SamplingParams  # noqa: E402
@@ -51,7 +51,7 @@ kw = dict(model=MODEL, gpu_memory_utilization=GMU, max_model_len=2048, dtype="fl
           max_num_seqs=64)
 if MODE == "spec":
     kw["speculative_config"] = {"method": "custom_class",
-                                "model": "chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer",
+                                "model": "chain_flow.vllm_plugin.flow_proposer.FlowDrafterProposer",
                                 "num_speculative_tokens": K}
 _as = os.environ.get("CF_ASYNC_SCHED")
 if _as is not None:

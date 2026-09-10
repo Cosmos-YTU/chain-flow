@@ -27,8 +27,8 @@ import json
 import pathlib
 import textwrap
 
-ROOT = pathlib.Path("/home/shadeform/chained-flow")
-# SET A IS CANONICAL -- the chained-flow Turkish holdouts. Set B is a different prompt
+ROOT = pathlib.Path("/home/shadeform/chain-flow")
+# SET A IS CANONICAL -- the chain-flow Turkish holdouts. Set B is a different prompt
 # collection (turkishdspark) and is reported second, never pooled with A.
 SET_A = ["tr_funccall", "tr_instruct", "tr_multiturn", "tr_toolcall"]
 SET_B = ["tds_alpaca", "tds_holdout", "tds_wikirag"]
@@ -241,7 +241,7 @@ Under natural EOS the arms no longer emit the same number of tokens, so **only t
 comparable** -- `tokens` totals are not. At concurrency 1 that is a safe comparison: the
 decode-only ratios (prefill excluded) sit within {dec_gap:.3f} of the headline ratios below.
 
-### Set A -- chained-flow Turkish holdouts (`bench_data_tr`) -- canonical, **natural EOS**
+### Set A -- chain-flow Turkish holdouts (`bench_data_tr`) -- canonical, **natural EOS**
 
 {table(nat, SET_A, ("chain_v2", "chain_tr"))}
 

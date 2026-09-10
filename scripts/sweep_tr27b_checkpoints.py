@@ -33,7 +33,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-ROOT = Path("/home/shadeform/chained-flow")
+ROOT = Path("/home/shadeform/chain-flow")
 CKPT_DIR = ROOT / "out/flow/ckpts/tree-vae-joint-tr27b-1024-k8-l8"
 V2 = ROOT / "out/flow/ckpts/tree-vae-joint-q3527bx-1024-k8-l8"
 SHORTLIST = ROOT / "out/flow/shortlist_q3527b_tr_bare.pt"

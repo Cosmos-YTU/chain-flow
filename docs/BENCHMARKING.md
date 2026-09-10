@@ -101,7 +101,7 @@ getting it wrong produced a wrong answer here first:
 
 ### The `[cf-defaults]` line is a build-time statement. It cannot report a batch gate.
 
-Every gate in `chained_flow/defaults.py` is evaluated once, against the drafter and the
+Every gate in `chain_flow/defaults.py` is evaluated once, against the drafter and the
 engine config, *before any request exists*. So the line says `cuda_block(D=640 …)` for the
 whole life of a server on which the fused kernel runs on a minority of steps. Set
 **`CF_BATCH_AUDIT=1`** (default off) for the per-step answer: it prints a histogram of the
@@ -847,7 +847,7 @@ cache. `vllm/cnd_stale_repro.py` now drives that, the block-aligned cache hit, a
 
 #### The fix: schedule the full drafted width, or schedule none
 
-`chained_flow.vllm_plugin.batch_cutoff.install_slot_guard()`, installed unconditionally from the
+`chain_flow.vllm_plugin.batch_cutoff.install_slot_guard()`, installed unconditionally from the
 plugin entry point — it is *not* gated on the cutoff, because hole 2 fires without it:
 
 1. Give the scheduler instance an **identity `dynamic_sd_lookup`** (`self.num_spec_tokens` at every
@@ -1001,7 +1001,7 @@ somewhere else — but nothing on this page's ladder is attributable to the spec
   **503**, and every subsequent *greedy* request 500 forever. The engine log carries our
   intended message —
 
-  > `RuntimeError: chained-flow tree mode requires greedy sampling (temperature=0, no
+  > `RuntimeError: chain-flow tree mode requires greedy sampling (temperature=0, no
   > logprobs, no penalties)… Run with VLLM_SPEC_TREE=0…`
 
   — but "fail fast with an actionable message" was designed for the offline `LLM()` path,
@@ -1018,7 +1018,7 @@ somewhere else — but nothing on this page's ladder is attributable to the spec
 
 #### `CF_TREE_GREEDY_GUARD=1` — the mitigation (default OFF)
 
-`chained_flow/vllm_plugin/greedy_guard.py`, installed from the existing `vllm.general_plugins`
+`chain_flow/vllm_plugin/greedy_guard.py`, installed from the existing `vllm.general_plugins`
 entry point. In **tree mode only**, it wraps `AsyncLLM.add_request` — the single funnel every
 serving front end goes through — and raises `ValueError` for a request whose `SamplingParams`
 would fail the tree's preconditions. That happens **in the API-server process**, so the engine
@@ -1246,7 +1246,7 @@ change before it could be.
 1. **Something has to relax the guard on stock vLLM.** The fork patches only the
    explicit-request branch of `config/vllm.py`; the auto-decide branch at `:1007`
    still forces async off for `custom_class`. On stock vLLM that job belongs to
-   `chained_flow/vllm_plugin/async_guard.py`, a **`vllm.general_plugins` entry
+   `chain_flow/vllm_plugin/async_guard.py`, a **`vllm.general_plugins` entry
    point** that rebinds `NgramGPUTypes` inside `vllm.config.vllm` — the name is
    referenced at exactly those two guard sites and nowhere else — and then wraps
    `VllmConfig.__post_init__` to **raise** if the resolved `async_scheduling` is
@@ -1260,7 +1260,7 @@ change before it could be.
    construction — the reason the fork-free arm had never been run with async at all.
 
 Measured 2026-08-05, pristine vLLM 0.25.1 (`RECORD` sha256: 0 modified, 0 added),
-chained-flow installed as a wheel, GPU 6, batch 1, 7 domains, `maxtok` 256, pooled:
+chain-flow installed as a wheel, GPU 6, batch 1, 7 domains, `maxtok` 256, pooled:
 
 | 4B | tok/s | vs base async-on | vs base async-off |
 |---|---|---|---|
@@ -1473,7 +1473,7 @@ hardest kind of difference to notice.
    **145.7 vs 157.8 tok/s (1.04x vs 1.13x)** at 4B in the clean room. The list is
    keyed by token id, so it is a property of the Qwen3.5 *vocabulary*, not of a
    model or a checkpoint: 250 KB as int32, one file for 4B/9B/27B. It now ships
-   inside the wheel (`chained_flow/data/shortlist_qwen3_5.pt`) and is the default.
+   inside the wheel (`chain_flow/data/shortlist_qwen3_5.pt`) and is the default.
 2. **`CF_COMPILE` was hard-coded to 1 in `bench_cf.sh`'s spec arms** and defaulted
    to 0 in the proposer, and it was not in the defaults table, so it never appeared
    on the `[cf-defaults]` line. A pip user was on an uncompiled flow net (9.79 vs
@@ -1482,7 +1482,7 @@ hardest kind of difference to notice.
    sets it** — if the script sets it, the table cannot report on it.
 
 Measured 2026-08-05 on **GPU 6** (GPU 5, the usual one, was occupied by a foreign
-job), pristine vLLM 0.25.1, chained-flow installed as a wheel, batch 1, 7 domains,
+job), pristine vLLM 0.25.1, chain-flow installed as a wheel, batch 1, 7 domains,
 `maxtok` 256, pooled. The chain arm ran with **no CF_* environment variables set
 at all** beyond `CF_DRAFTER_DIR` — i.e. exactly what `pip install` gives you:
 
@@ -1577,7 +1577,7 @@ vocabulary and every id names a different token: the list is not suboptimal, it
 is nonsense, and the only symptom is a quietly lower accept. The old loader
 clamped ids into range (`sl[sl < V]`) and carried on, which is that failure mode
 exactly. The payload now records the `vocab_size` it was built against,
-`chained_flow.shortlist.check` **refuses** a mismatch, and the fallback is the
+`chain_flow.shortlist.check` **refuses** a mismatch, and the fallback is the
 full head with the reason printed — slower, never wrong. Resolution order is
 `CF_SHORTLIST` (explicit, and `CF_SHORTLIST=` means "full head, deliberately"),
 then `<drafter checkpoint>/shortlist.pt` (now actually reachable: it is in the

@@ -3,7 +3,7 @@
 GPU=$1; CFGDIR=$2; LOG=$3
 export CUDA_VISIBLE_DEVICES=$GPU
 export HF_HUB_ENABLE_HF_TRANSFER=0
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 {
 echo "==== COLLECT START $CFGDIR on GPU$GPU $(date -u) ===="
 for s in gsm8k_fp16 nemotron_math nemotron_stem alpaca_code dolly_chat; do

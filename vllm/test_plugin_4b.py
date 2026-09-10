@@ -1,12 +1,12 @@
 import os
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-import sys; sys.path.insert(0, "/home/shadeform/chained-flow/src")
+import sys; sys.path.insert(0, "/home/shadeform/chain-flow/src")
 import time, json, dataclasses, torch
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
 MODEL = "Qwen/Qwen3.5-4B"
-CKD = "/home/shadeform/chained-flow/out/flow/ckpts/tree-vae-joint-4b-640-k8-l8"
+CKD = "/home/shadeform/chain-flow/out/flow/ckpts/tree-vae-joint-4b-640-k8-l8"
 tok = AutoTokenizer.from_pretrained(MODEL)
 PROMPTS = [
     "The capital of France is",
@@ -27,8 +27,8 @@ print(f"[native vLLM] {ntok} tok / {t_native:.2f}s = {ntok/t_native:.0f} tok/s",
 
 
 def run(model):
-    from chained_flow.vllm_tree.native import NativeTreeSpecDecoder
-    from chained_flow.drafters.tree_vae_flow import TreeVAEFlowDrafter, TreeVAEFlowConfig
+    from chain_flow.vllm_tree.native import NativeTreeSpecDecoder
+    from chain_flow.drafters.tree_vae_flow import TreeVAEFlowDrafter, TreeVAEFlowConfig
     from safetensors.torch import load_file
 
     lang = model.language_model

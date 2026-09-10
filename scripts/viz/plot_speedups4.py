@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import re, os
 
-ROOT = "/home/shadeform/chained-flow"
+ROOT = "/home/shadeform/chain-flow"
 # label -> (speedup log, bar color)   colors: size ramp light->dark, two 27Bs as distinct hues
 SERIES = [
     ("4B",            f"{ROOT}/vllm/test_compiled_4b_cgdraft.log", "#93c5fd"),

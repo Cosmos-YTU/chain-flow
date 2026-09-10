@@ -2,7 +2,7 @@
 # RESUME 4bx: re-collect no_robots (fixed batch) then combine->caches->VAE->drafter
 set -o pipefail
 TAG=4bx
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 st(){ echo "======== [$(date -u '+%m-%d %H:%M:%S')] $1 ========"; }

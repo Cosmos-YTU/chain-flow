@@ -6,7 +6,7 @@
 # tr27b_results_json.py (English/v2 must reproduce the published 2.44) has to be READ by
 # someone before a card is built on top of it.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src
 PY=.venv/bin/python
 CKPT=out/flow/ckpts/tree-vae-joint-tr27b-1024-k8-l8

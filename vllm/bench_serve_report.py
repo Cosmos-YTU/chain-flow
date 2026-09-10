@@ -19,7 +19,7 @@ ORDER = {"base": 0, "chain": 1, "tree": 2}
 
 
 def main() -> int:
-    root = sys.argv[1] if len(sys.argv) > 1 else "/home/shadeform/chained-flow/logs/bench_serve"
+    root = sys.argv[1] if len(sys.argv) > 1 else "/home/shadeform/chain-flow/logs/bench_serve"
     # ONLY the canonical `<size>_<arm>` directories. A tagged run (`4b_chain_noblock`,
     # `4b_tree_guard`, ...) is a probe with a deliberately different configuration; folding it
     # in under the same key silently replaced the real arm with the probe, which is precisely

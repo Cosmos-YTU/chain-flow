@@ -46,7 +46,7 @@ def build_turkish(sources: list[str], tmp_dir: str, draft_length: int) -> None:
     materialises a combined teacher_states copy on disk.
     """
     from datasets import concatenate_datasets, load_from_disk
-    import chained_flow.training.window_dataset as W
+    import chain_flow.training.window_dataset as W
 
     parts, tok = [], 0
     for path in sources:
@@ -63,7 +63,7 @@ def build_turkish(sources: list[str], tmp_dir: str, draft_length: int) -> None:
 
 
 def load_cache(d: Path) -> dict:
-    from chained_flow.training.window_dataset import FLOW_CACHE_FILES
+    from chain_flow.training.window_dataset import FLOW_CACHE_FILES
     out = {k: torch.load(d / v, map_location="cpu", mmap=True) for k, v in FLOW_CACHE_FILES.items()}
     out["metadata"] = json.loads((d / "metadata.json").read_text())
     return out
@@ -86,7 +86,7 @@ def main() -> None:
     ap.add_argument("--keep-tmp", action="store_true")
     args = ap.parse_args()
 
-    from chained_flow.training.window_dataset import FLOW_CACHE_FILES
+    from chain_flow.training.window_dataset import FLOW_CACHE_FILES
 
     print("step 1/2: Turkish cache")
     build_turkish(args.turkish, args.tmp_dir, args.draft_length)

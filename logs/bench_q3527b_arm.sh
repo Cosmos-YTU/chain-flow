@@ -2,7 +2,7 @@
 # Waits for the Qwen3.5-27B drafter to finish (logs/train_q3527b_DONE.flag), then on GPU 5 (freed):
 # RedHatAI+held-out accept -> best-effort vLLM speedup -> push selimaktas/Flow-Drafter-Qwen3.5-27B.
 set -o pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export CUDA_VISIBLE_DEVICES=5 PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 VPY=vllm/.venv/bin/python
@@ -20,8 +20,8 @@ $PY - <<'PYEOF'
 import json
 from dataclasses import asdict
 from transformers import HfArgumentParser, TrainingArguments
-from chained_flow.training.train_tree_flow import TreeModelArguments
-from chained_flow.training.train_chunked_flow import TeacherDataArguments, FlowLossArguments
+from chain_flow.training.train_tree_flow import TreeModelArguments
+from chain_flow.training.train_chunked_flow import TeacherDataArguments, FlowLossArguments
 p=HfArgumentParser((TreeModelArguments, TeacherDataArguments, FlowLossArguments, TrainingArguments))
 m,d,l,t=p.parse_yaml_file(yaml_file="train_configs/recovered/joint_q3527b.yaml")
 json.dump({"model_args":asdict(m),"data_args":asdict(d),"loss_args":asdict(l)},
@@ -30,7 +30,7 @@ print("q3527b config synthesized")
 PYEOF
 mkdir -p $ED
 cp $CKD/chained_flow_tree_config.json $ED/
-ln -sf /home/shadeform/chained-flow/$CKD/model.safetensors $ED/model.safetensors
+ln -sf /home/shadeform/chain-flow/$CKD/model.safetensors $ED/model.safetensors
 
 # accept bench: collect -> cache -> measure per domain
 > logs/deploy_eval_q3527b.log

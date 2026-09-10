@@ -16,7 +16,7 @@
 # DISK.  Concat writes a new store while its inputs still exist, so peak = inputs + output.  Each
 # stage refuses to start below a floor rather than dying half-written and leaving a corrupt cache.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 

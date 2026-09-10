@@ -1,7 +1,7 @@
 #!/bin/bash
 # Batch 2 (disk constraint lifted) + the Turkish eval bench. Queued behind batch 1 on GPU 2.
 set -o pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 until [ -f logs/collect_9btr_DONE.flag ]; do sleep 30; done
 export CUDA_VISIBLE_DEVICES=2 HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python

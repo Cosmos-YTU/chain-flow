@@ -1,7 +1,7 @@
 #!/bin/bash
 # Turkish teacher states for Qwen/Qwen3.5-9B, GPU 2 only. Sequential over the 4 dspark corpora.
 set -o pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export CUDA_VISIBLE_DEVICES=2 HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 for s in instructurca multiturn func_calling tool_calling; do

@@ -22,7 +22,7 @@ GPU=${3:?gpu}
 PORT=${4:?port}
 TAG=${5:-}
 
-ROOT=/home/shadeform/chained-flow
+ROOT=/home/shadeform/chain-flow
 DATA=${CF_TR_DATA:-$ROOT/logs/bench_tr/data}
 # CF_TR_IGNORE_EOS=0 measures the NATURAL-EOS condition (what a deployment serves) instead of the
 # forced-256 equal-work condition. The two are NOT poolable -- forcing 256 tokens runs the model past
@@ -73,14 +73,14 @@ case "$ARM" in
 esac
 export CF_DRAFTER_DIR=$DRAFTER
 
-_CF_DEF=$(PYTHONPATH=$ROOT/src "$CF_PY" $ROOT/src/chained_flow/defaults.py --sh)
+_CF_DEF=$(PYTHONPATH=$ROOT/src "$CF_PY" $ROOT/src/chain_flow/defaults.py --sh)
 echo "$_CF_DEF" | sed 's/^/[bench_tr] /' >&2
 eval "$_CF_DEF"
 
 SPEC_ARGS=()
 if [ "$ARM" != "base" ]; then
   export CF_CUDAGRAPH=1 CF_K=${CF_K:-5}
-  SPEC_ARGS=(--speculative-config "{\"method\":\"custom_class\",\"model\":\"chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer\",\"num_speculative_tokens\":${CF_K}}")
+  SPEC_ARGS=(--speculative-config "{\"method\":\"custom_class\",\"model\":\"chain_flow.vllm_plugin.flow_proposer.FlowDrafterProposer\",\"num_speculative_tokens\":${CF_K}}")
 fi
 # ON FOR EVERY ARM INCLUDING BASE.  Dropping it from base alone is worth +10.5%/+5.5% to the
 # ratio and every speedup here would be overstated by that much.
@@ -120,10 +120,10 @@ curl -sf -m 300 "http://localhost:${PORT}/v1/completions" -H 'Content-Type: appl
   >/dev/null || { echo "[bench_tr] first request FAILED"; tail -60 "$SERVER_LOG"; exit 1; }
 
 # PROVENANCE FROM THE ENGINE PROCESS, not from this shell's env and not from the API server's
-# copy (which imports chained_flow but holds no drafter).
+# copy (which imports chain_flow but holds no drafter).
 if [ "$ARM" != "base" ]; then
   grep -E "\(EngineCore pid=.*\[cf-defaults\] ON:" "$SERVER_LOG" | head -1 | tee "$OUT/cf_defaults.engine.txt"
-  grep -E "\(EngineCore pid=.*\[chained-flow\] (drafter=|shortlist head)" "$SERVER_LOG" \
+  grep -E "\(EngineCore pid=.*\[chain-flow\] (drafter=|shortlist head)" "$SERVER_LOG" \
     | tee "$OUT/cf_build.engine.txt"
   if ! grep -q "shortlist head" "$OUT/cf_build.engine.txt"; then
     echo "[bench_tr] FATAL: engine never reported a shortlist head -- full head or no build"; exit 1

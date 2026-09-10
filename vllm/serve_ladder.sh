@@ -18,7 +18,7 @@ GPU=${3:?gpu}
 PORT=${4:?port}
 TAG=${5:?tag}
 
-ROOT=/home/shadeform/chained-flow
+ROOT=/home/shadeform/chain-flow
 OUT=$ROOT/logs/bench_serve/${SIZE}_${ARM}_${TAG}
 mkdir -p "$OUT"
 SERVER_LOG=$OUT/server.log
@@ -27,7 +27,7 @@ export CUDA_VISIBLE_DEVICES=$GPU
 CF_PY=${CF_PY:-/home/shadeform/vllm/.venv/bin/python}
 export PYTHONPATH=$ROOT/src
 
-_CF_DEF=$(PYTHONPATH=$ROOT/src "$CF_PY" $ROOT/src/chained_flow/defaults.py --sh)
+_CF_DEF=$(PYTHONPATH=$ROOT/src "$CF_PY" $ROOT/src/chain_flow/defaults.py --sh)
 eval "$_CF_DEF"
 
 if [ "$SIZE" = "4b" ]; then
@@ -49,12 +49,12 @@ SPEC_ARGS=()
 case "$ARM" in
   base) ;;
   chain) export CF_CUDAGRAPH=1 CF_K=${CF_K:-5}
-         SPEC_ARGS=(--speculative-config "{\"method\":\"custom_class\",\"model\":\"chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer\",\"num_speculative_tokens\":${CF_K}}") ;;
+         SPEC_ARGS=(--speculative-config "{\"method\":\"custom_class\",\"model\":\"chain_flow.vllm_plugin.flow_proposer.FlowDrafterProposer\",\"num_speculative_tokens\":${CF_K}}") ;;
   tree)  export CF_CUDAGRAPH=1 VLLM_SPEC_TREE=1
          : ${CF_TREE_KEEP:=8}; : ${CF_TREE_DEPTH:=5}
          : ${CF_K:=$(( CF_TREE_KEEP * CF_TREE_DEPTH + 1 ))}
          export CF_TREE_KEEP CF_TREE_DEPTH CF_K
-         SPEC_ARGS=(--speculative-config "{\"method\":\"custom_class\",\"model\":\"chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer\",\"num_speculative_tokens\":${CF_K}}") ;;
+         SPEC_ARGS=(--speculative-config "{\"method\":\"custom_class\",\"model\":\"chain_flow.vllm_plugin.flow_proposer.FlowDrafterProposer\",\"num_speculative_tokens\":${CF_K}}") ;;
   *) echo "bad arm"; exit 1 ;;
 esac
 ASYNC_ARG=(--async-scheduling)

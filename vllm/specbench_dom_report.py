@@ -141,7 +141,7 @@ def agg_accept(reps):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default="/home/shadeform/chained-flow/logs/specbench_dom")
+    ap.add_argument("--root", default="/home/shadeform/chain-flow/logs/specbench_dom")
     ap.add_argument("--size", required=True)
     ap.add_argument("--json-out", default=None)
     args = ap.parse_args()
@@ -340,7 +340,7 @@ def main():
         "generated_at": _dt.datetime.now().isoformat(timespec="seconds"),
         "results_root": str(args.root),
         "git_head": subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
-                                   text=True, cwd="/home/shadeform/chained-flow"
+                                   text=True, cwd="/home/shadeform/chain-flow"
                                    ).stdout.strip(),
         "src_snapshot": snap.read_text().splitlines()[0] if snap.exists() else None,
         "benchmark": "RedHatAI/speculator_benchmarks",

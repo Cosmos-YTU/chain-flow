@@ -12,7 +12,7 @@
 # removed from the card because the library reads none of them meaningfully (K comes from
 # num_speculative_tokens; async from --async-scheduling; CUDAGRAPH already defaults to 1).
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 PORT=8791
 GPU=${VERIFY_GPU:-4}
 OUT=logs/verify_card_usage
@@ -24,11 +24,11 @@ echo "campaign done, verifying card usage block at $(date -u)"
 
 CF_PY=${CF_PY:-/home/shadeform/vllm/.venv/bin/python}
 env -u CF_SHORTLIST -u CF_K -u CF_ASYNC_SCHED -u CF_CUDAGRAPH -u CF_DRAFTER_DIR -u VLLM_SPEC_TREE \
-    CUDA_VISIBLE_DEVICES=$GPU PYTHONPATH=/home/shadeform/chained-flow/src \
+    CUDA_VISIBLE_DEVICES=$GPU PYTHONPATH=/home/shadeform/chain-flow/src \
     CF_DRAFTER_DIR=selimaktas/Flow-Drafter-4B-tr \
   "${CF_PY%python}vllm" serve Qwen/Qwen3.5-4B --async-scheduling --port $PORT \
     --gpu-memory-utilization 0.55 \
-    --speculative-config '{"method":"custom_class","model":"chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer","num_speculative_tokens":5}' \
+    --speculative-config '{"method":"custom_class","model":"chain_flow.vllm_plugin.flow_proposer.FlowDrafterProposer","num_speculative_tokens":5}' \
     > $OUT/server.log 2>&1 &
 PID=$!
 trap 'kill '"$PID"' 2>/dev/null; sleep 8; kill -9 '"$PID"' 2>/dev/null' EXIT
@@ -47,7 +47,7 @@ curl -sf -m 300 "http://localhost:$PORT/v1/chat/completions" -H 'Content-Type: a
 echo
 
 echo "=== engine provenance ==="
-grep -E "\[chained-flow\] (drafter from HF hub|shortlist head|drafter=)" $OUT/server.log | tee $OUT/provenance.txt
+grep -E "\[chain-flow\] (drafter from HF hub|shortlist head|drafter=)" $OUT/server.log | tee $OUT/provenance.txt
 
 echo "=== VERDICT ==="
 grep -q "shortlist head: 77939" $OUT/provenance.txt \

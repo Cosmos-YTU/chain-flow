@@ -8,7 +8,7 @@
 # read as signal for free-form English. It cannot be settled from the sweep: 600 scores 2.64 at 200
 # windows and 2.84 at 400, so 900's 2.67 is not comparable to 600's 2.84. Different instrument.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 CK=out/flow/ckpts/tree-vae-joint-tr27b-1024-k8-l8

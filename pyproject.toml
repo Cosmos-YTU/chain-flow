@@ -3,7 +3,7 @@ requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "chained-flow"
+name = "chain-flow"
 version = "0.1.0"
 description = "Flow-matching hidden-state drafter for lossless speculative decoding in vLLM"
 readme = "README.md"
@@ -21,26 +21,26 @@ classifiers = [
 
 # vLLM is PINNED, not lower-bounded. The package installs a `vllm.general_plugins` entry point
 # that rebinds a PRIVATE symbol in `vllm.config.vllm` to relax one async-scheduling guard (see
-# chained_flow/vllm_plugin/async_guard.py). That symbol is verified to exist, and to be
+# chain_flow/vllm_plugin/async_guard.py). That symbol is verified to exist, and to be
 # referenced by nothing but that guard, on 0.25.x. On an unverified version the relaxation
 # could silently become a no-op -- and a silent fall back to synchronous scheduling is a ~10%
 # regression that announces itself nowhere. So on an unverified vLLM the plugin declines to
-# rebind anything and any chained-flow speculative config then REFUSES to start; the pin is what
+# rebind anything and any chain-flow speculative config then REFUSES to start; the pin is what
 # keeps that refusal from being the normal experience.
 #
 # NOT LISTED, AND DELIBERATELY: `flashinfer-jit-cache`. vLLM pulls `flashinfer-python`, which is
 # the frontend only -- the compiled sampling kernels live in that separate distribution, which is
 # built per CUDA version and is published from flashinfer's own index, NOT PyPI. It therefore
 # cannot be a dependency here: a `flashinfer-jit-cache` requirement would make
-# `pip install chained-flow` fail outright against a default index. Without it, flashinfer
+# `pip install chain-flow` fail outright against a default index. Without it, flashinfer
 # JIT-compiles its sampling kernels on the first run (minutes, needs nvcc) -- before any
-# chained-flow code is reached, which makes it look like our stall. So it is reported instead:
-# `chained-flow info` prints whether it is present and the exact command to install it, and the
+# chain-flow code is reached, which makes it look like our stall. So it is reported instead:
+# `chain-flow info` prints whether it is present and the exact command to install it, and the
 # README documents the first-run cost. The one thing not on the table is saying nothing.
 #
 # torch and transformers are deliberately NOT pinned here. vLLM pins `torch==2.11.0` exactly,
 # and a lower bound of ours above that number is an unsatisfiable install rather than a safety
-# net -- the previous `torch>=2.12.0` would have made `pip install chained-flow` fail outright
+# net -- the previous `torch>=2.12.0` would have made `pip install chain-flow` fail outright
 # against the vLLM it requires. Let the pinned dependency own the pinned dependency.
 dependencies = [
     "vllm==0.25.*",
@@ -63,14 +63,14 @@ train = [
 dev = ["pytest>=8.0.0"]
 
 [project.urls]
-Homepage = "https://github.com/Zeuss5/chained-flow"
-Repository = "https://github.com/Zeuss5/chained-flow"
+Homepage = "https://github.com/Zeuss5/chain-flow"
+Repository = "https://github.com/Zeuss5/chain-flow"
 
 [project.scripts]
-# `chained-flow info` prints the resolved flag table, the vLLM build in use, whether the async
+# `chain-flow info` prints the resolved flag table, the vLLM build in use, whether the async
 # guard is relaxed, and whether the CUDA kernel compiles -- i.e. every question you would
 # otherwise answer by reading a 200-line engine log.
-chained-flow = "chained_flow.cli:main"
+chain-flow = "chain_flow.cli:main"
 
 [project.entry-points."vllm.general_plugins"]
 # THE FORK-FREE ENABLER. vLLM calls this from `EngineArgs.__post_init__`, before
@@ -79,7 +79,7 @@ chained-flow = "chained_flow.cli:main"
 # `method="custom_class"` when CF_ASYNC_SPEC is on, then asserts the resolved value.
 # Worth +10.5% / +5.5% / +1.6% at 4B / 9B / 27B; without it a fork-free chain build is ~1.02x
 # at 4B. See docs/BENCHMARKING.md.
-chained_flow_async_guard = "chained_flow.vllm_plugin.async_guard:register"
+chain_flow_async_guard = "chain_flow.vllm_plugin.async_guard:register"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
@@ -88,24 +88,24 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-# The fused-block CUDA source ships INSIDE the wheel: `chained_flow.cuda_block` compiles it
+# The fused-block CUDA source ships INSIDE the wheel: `chain_flow.cuda_block` compiles it
 # with torch's JIT extension loader on first use, so the .cu has to be importable-adjacent.
 # A wheel without it degrades to the (bit-identical, ~2x slower) PyTorch block stack.
 #
 # The tree patch ships too. Someone who `pip install`ed the wheel and now wants the tree path
-# has no checkout to find it in, and `chained-flow tree-patch` printing a path that does not
+# has no checkout to find it in, and `chain-flow tree-patch` printing a path that does not
 # exist is the sort of documentation that is worse than none.
 #
 # `docs/BENCHMARKING.md` is a symlink to the repo's copy, so there is one source of truth and
 # the wheel gets the content. The README tells you to read it before quoting a speedup; a
-# relative link in a PyPI long description goes nowhere, so `chained-flow docs` prints it.
-"chained_flow" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "patches/*.patch", "docs/*.md"]
+# relative link in a PyPI long description goes nowhere, so `chain-flow docs` prints it.
+"chain_flow" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "patches/*.patch", "docs/*.md"]
 # THE SHORTLIST (250 KB, int32). It is keyed by TOKEN ID, so it is a property of the Qwen3.5
 # VOCABULARY and one file serves 4B/9B/27B -- not model-specific data, which is why it can ship
 # at all. Without it in the wheel, `CF_SHORTLIST` defaulted to a path inside this repo's `out/`
 # and every pip user silently ran the full 248k-row head: measured 145.7 tok/s (1.04x) instead
-# of 157.8 (1.13x) at 4B. `chained_flow.shortlist.check` refuses it on a vocab mismatch.
-"chained_flow.data" = ["*.pt"]
+# of 157.8 (1.13x) at 4B. `chain_flow.shortlist.check` refuses it on a vocab mismatch.
+"chain_flow.data" = ["*.pt"]
 
 [dependency-groups]
 dev = ["pytest>=8.0.0"]

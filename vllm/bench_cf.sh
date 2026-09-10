@@ -10,14 +10,14 @@ export CF_TAG=${3:-_${SIZE}_${ARM}}
 export CUDA_VISIBLE_DEVICES=${CF_GPU:-5}
 export CF_BATCH=1
 export CF_POFF=${CF_POFF:-0,1,2,3,4,5,6}
-export CF_PROMPTS=/home/shadeform/chained-flow/bench_data
+export CF_PROMPTS=/home/shadeform/chain-flow/bench_data
 export CF_MAXTOK=${CF_MAXTOK:-64}
 export CF_ACCEPT=1
 
 # ---------------------------------------------------------------------------------------
-# CAPABILITY-GATED DEFAULTS.  Single source of truth: src/chained_flow/defaults.py.
+# CAPABILITY-GATED DEFAULTS.  Single source of truth: src/chain_flow/defaults.py.
 #
-# Almost every CF_* default is applied in-process at `import chained_flow` (which the fork does
+# Almost every CF_* default is applied in-process at `import chain_flow` (which the fork does
 # while constructing the custom_class proposer, EARLIER in GPUModelRunner.__init__ than it reads
 # its own flags).  Exactly one cannot be on the FORK: CF_ASYNC_SPEC is read by the forked
 # config/vllm.py inside VllmConfig.__post_init__, i.e. while LLM(...) is still being built,
@@ -34,9 +34,9 @@ export CF_ACCEPT=1
 # run with the SAME interpreter, or it would probe the wrong install for the fork markers.
 CF_PY=${CF_PY:-/home/shadeform/vllm/.venv/bin/python}
 
-_CF_DEF=$(PYTHONPATH=/home/shadeform/chained-flow/src \
+_CF_DEF=$(PYTHONPATH=/home/shadeform/chain-flow/src \
           "$CF_PY" \
-          /home/shadeform/chained-flow/src/chained_flow/defaults.py --sh)
+          /home/shadeform/chain-flow/src/chain_flow/defaults.py --sh)
 echo "$_CF_DEF" | sed 's/^/[bench_cf] /' >&2
 eval "$_CF_DEF"
 
@@ -105,4 +105,4 @@ case "$ARM" in
          _cf_async_engine ;;
   *) echo "bad arm"; exit 1 ;;
 esac
-exec "$CF_PY" /home/shadeform/chained-flow/vllm/test_plugin_native.py
+exec "$CF_PY" /home/shadeform/chain-flow/vllm/test_plugin_native.py

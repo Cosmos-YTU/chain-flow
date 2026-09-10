@@ -19,8 +19,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from transformers import HfArgumentParser, TrainingArguments  # noqa: E402
 
-from chained_flow.training.train_chunked_flow import FlowLossArguments, TeacherDataArguments  # noqa: E402
-from chained_flow.training.train_tree_flow import TreeModelArguments  # noqa: E402
+from chain_flow.training.train_chunked_flow import FlowLossArguments, TeacherDataArguments  # noqa: E402
+from chain_flow.training.train_tree_flow import TreeModelArguments  # noqa: E402
 
 
 def main() -> None:

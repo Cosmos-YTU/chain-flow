@@ -1,4 +1,4 @@
-"""``chained-flow tree-patch``: the invariants that keep a half-applied fork impossible.
+"""``chain-flow tree-patch``: the invariants that keep a half-applied fork impossible.
 
 The failure this guards against is not a crash.  A vLLM with five of the six patched files is a
 tree verifier with a stale ancestor mask, which produces MALFORMED DRAFTS at full speed -- wrong
@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from chained_flow import tree_patch as tp
+from chain_flow import tree_patch as tp
 
 
 # --------------------------------------------------------------------------- shipped patch

@@ -74,7 +74,7 @@ fig.text(0.5, 0.008,
          "about as much as the base decode it replaces.",
          ha="center", fontsize=8.5, color=muted, linespacing=1.5)
 fig.tight_layout(rect=[0, 0.035, 1, 0.965])
-out = "/home/shadeform/chained-flow/docs/vllm_domain_speedup.png"
+out = "/home/shadeform/chain-flow/docs/vllm_domain_speedup.png"
 fig.savefig(out, bbox_inches="tight", facecolor="white")
 print("wrote", out)
 

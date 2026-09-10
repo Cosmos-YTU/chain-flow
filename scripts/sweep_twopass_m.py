@@ -206,7 +206,7 @@ def main():
         return
 
     # ---- draft time, compiled + cudagraphed (the shipping baseline) ---------------------
-    from chained_flow.vllm_plugin import fused
+    from chain_flow.vllm_plugin import fused
     fused.fuse_path_head(d)
     fused.compile_flow(d, mode="max-autotune-no-cudagraphs")
     ctx1 = torch.randn(1, C, d.hidden_size, device=dev, dtype=dtype)

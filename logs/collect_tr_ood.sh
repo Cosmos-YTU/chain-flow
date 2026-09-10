@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Out-of-distribution Turkish eval sets, on GPU 4 while the sweep runs on GPU 3.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 for s in turkish_alpaca_100 wikirag_tr_100; do
   echo "==== OOD $s START $(date -u +%H:%M:%S) ===="

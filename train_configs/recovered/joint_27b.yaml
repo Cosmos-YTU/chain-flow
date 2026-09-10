@@ -19,7 +19,7 @@ tree_top_b: 8
 tree_max_nodes: 64
 architecture: tree_flow
 device: cuda
-vae_dir: /home/shadeform/chained-flow/out/vae/ckpts/transformer-hidden-27b-5120-latent1024-fp16
+vae_dir: /home/shadeform/chain-flow/out/vae/ckpts/transformer-hidden-27b-5120-latent1024-fp16
 latent_size: 1024
 vae_type: transformer_hidden
 vae_intermediate_size: 4096

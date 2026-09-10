@@ -1,4 +1,4 @@
-# chained-flow -- TRAINING environment (CUDA 13).
+# chain-flow -- TRAINING environment (CUDA 13).
 #
 #   uv venv --python 3.12
 #   uv pip install -r requirements.txt
@@ -8,9 +8,9 @@
 # transformers minor bump moves accept by more than the effects we routinely act on.
 #
 # vLLM is deliberately ABSENT: training imports it nowhere (the only vllm imports are under
-# src/chained_flow/vllm_tree/, the serving path). Installing it drags in a second torch pin and
+# src/chain_flow/vllm_tree/, the serving path). Installing it drags in a second torch pin and
 # is the biggest source of environment conflict here. Serve from a SEPARATE venv --
-# `uv pip install chained-flow` -- see README.
+# `uv pip install chain-flow` -- see README.
 
 --extra-index-url https://download.pytorch.org/whl/cu130
 

@@ -18,7 +18,7 @@ def run(worker, PID=PID, VOUT=VOUT):
     from vllm.distributed.parallel_state import graph_capture
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update as cu
     from vllm.model_executor.layers.fla.ops import fused_recurrent_gated_delta_rule_packed_decode as pd
-    from chained_flow.vllm_tree.tree_ssm import tree_gdn_op, tree_conv_op
+    from chain_flow.vllm_tree.tree_ssm import tree_gdn_op, tree_conv_op
     dev = "cuda"; model = worker.get_model(); runner = worker.model_runner
     inner = model.language_model.model; layers = inner.layers; embed = inner.embed_tokens.weight
     g0 = [l for l in layers if hasattr(l, "linear_attn")][0].linear_attn
@@ -129,7 +129,7 @@ def run(worker, PID=PID, VOUT=VOUT):
     # ---- drafter ----
     import json, dataclasses
     from types import SimpleNamespace
-    from chained_flow.drafters.tree_flow import TreeFlowDrafter, TreeFlowConfig
+    from chain_flow.drafters.tree_flow import TreeFlowDrafter, TreeFlowConfig
     from safetensors.torch import load_file
     class Emb:
         def __init__(s, w): s.weight = w
@@ -140,7 +140,7 @@ def run(worker, PID=PID, VOUT=VOUT):
     class Stub:
         def __init__(s, e, d): s.model = SM(e); s.device = d; s._e = e
         def lm_head(s, h): return h.to(s._e.dtype) @ s._e.T
-    CK = "/home/shadeform/chained-flow/out/flow/ckpts/tree-hiddenkv-k8-l8-ffn6-rank256-o8-cov8"
+    CK = "/home/shadeform/chain-flow/out/flow/ckpts/tree-hiddenkv-k8-l8-ffn6-rank256-o8-cov8"
     ma = json.load(open(CK + "/chained_flow_tree_config.json"))["model_args"]
     cfg = TreeFlowConfig(**{k: v for k, v in ma.items() if k in {f.name for f in dataclasses.fields(TreeFlowConfig)}})
     drafter = TreeFlowDrafter(Stub(embed, dev), cfg).to(dev)

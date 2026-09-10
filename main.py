@@ -1,5 +1,5 @@
 def main():
-    print("Hello from chained-flow!")
+    print("Hello from chain-flow!")
 
 
 if __name__ == "__main__":

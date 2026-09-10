@@ -1,9 +1,9 @@
 import torch
 
-from chained_flow.drafters.eagle_flow import EagleDrafter, EagleFlowConfig
-from chained_flow.frozen_lm import LMState
-from chained_flow.training.train_chunked_flow import FlowLossArguments
-from chained_flow.training.train_eagle_flow import EagleTrainingModule, eagle_config_from_args, EagleModelArguments
+from chain_flow.drafters.eagle_flow import EagleDrafter, EagleFlowConfig
+from chain_flow.frozen_lm import LMState
+from chain_flow.training.train_chunked_flow import FlowLossArguments
+from chain_flow.training.train_eagle_flow import EagleTrainingModule, eagle_config_from_args, EagleModelArguments
 
 
 def _config(K=4):

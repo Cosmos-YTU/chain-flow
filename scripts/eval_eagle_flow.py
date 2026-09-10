@@ -14,19 +14,19 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from chained_flow.context import ChainedFlowContext
-from chained_flow.frozen_lm import DEFAULT_MODEL_ID, FrozenLMWrapper
-from chained_flow.generation import generate_with_drafter
-from chained_flow.training.collators import collate_teacher_windows
-from chained_flow.training.eval_chunked_flow import (
+from chain_flow.context import ChainedFlowContext
+from chain_flow.frozen_lm import DEFAULT_MODEL_ID, FrozenLMWrapper
+from chain_flow.generation import generate_with_drafter
+from chain_flow.training.collators import collate_teacher_windows
+from chain_flow.training.eval_chunked_flow import (
     collect_speedup_prompts,
     generate_greedy_baseline,
     per_token_flow_metrics,
     summarize_metric,
     torch_dtype_from_string,
 )
-from chained_flow.training.train_eagle_flow import load_eagle_module
-from chained_flow.training.window_dataset import TeacherWindowDataset
+from chain_flow.training.train_eagle_flow import load_eagle_module
+from chain_flow.training.window_dataset import TeacherWindowDataset
 
 
 def parse_args() -> argparse.Namespace:

@@ -13,7 +13,7 @@
 # tokens are scored -- 200 windows would come from about one row and would measure that row, not
 # the domain. Both arms use the same value, so before/after stays comparable.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export CUDA_VISIBLE_DEVICES=7 HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 CKD=$1; TAG=$2; NW=${3:-600}; SL=${4:-}
 PY=.venv/bin/python

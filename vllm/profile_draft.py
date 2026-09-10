@@ -1,11 +1,11 @@
-import sys; sys.path.insert(0,"/home/shadeform/chained-flow/src")
+import sys; sys.path.insert(0,"/home/shadeform/chain-flow/src")
 import json, dataclasses, time, torch, torch.nn.functional as F
 from types import SimpleNamespace
-from chained_flow.drafters.tree_vae_flow import TreeVAEFlowDrafter, TreeVAEFlowConfig
+from chain_flow.drafters.tree_vae_flow import TreeVAEFlowDrafter, TreeVAEFlowConfig
 from safetensors.torch import load_file
 from torch.nn.attention import SDPBackend, sdpa_kernel
 dev="cuda"; dt=torch.float16
-CKD="/home/shadeform/chained-flow/out/flow/ckpts/tree-vae-joint-4b-640-k8-l8"
+CKD="/home/shadeform/chain-flow/out/flow/ckpts/tree-vae-joint-4b-640-k8-l8"
 HIDDEN=2560; VOCAB=248320
 # stub with random embed/lm_head (profiling timing only; weights don't affect timing)
 embed=torch.randn(VOCAB, HIDDEN, device=dev, dtype=dt)*0.02

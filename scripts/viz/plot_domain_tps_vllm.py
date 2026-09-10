@@ -73,7 +73,7 @@ fig.text(0.5, 0.008,
          "y-scales (27B ~26 tok/s, 4B ~140 tok/s).",
          ha="center", fontsize=8.5, color=muted, linespacing=1.5)
 fig.tight_layout(rect=[0, 0.035, 1, 0.965])
-out = "/home/shadeform/chained-flow/docs/vllm_domain_tps.png"
+out = "/home/shadeform/chain-flow/docs/vllm_domain_tps.png"
 fig.savefig(out, bbox_inches="tight", facecolor="white")
 print("wrote", out)
 

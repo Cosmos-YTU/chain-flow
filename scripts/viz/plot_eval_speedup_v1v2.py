@@ -41,6 +41,6 @@ fig.text(0.5, -0.03, "5 prompts/domain, all lossless (writing 27B: fp16 tie on ~
          "v2 (expanded diverse data) ≥ v1 on every domain, biggest on writing — the win the 4 generic prompts couldn't show.",
          ha="center", fontsize=8.5, color=muted)
 fig.tight_layout()
-out = "/home/shadeform/chained-flow/docs/eval_speedup_v1_vs_v2.png"
+out = "/home/shadeform/chain-flow/docs/eval_speedup_v1_vs_v2.png"
 fig.savefig(out, bbox_inches="tight", facecolor="white")
 print("wrote", out)

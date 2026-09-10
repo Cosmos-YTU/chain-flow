@@ -7,7 +7,7 @@ get a per-set acceptance number.  Same reason `specbench_domains.py` splits by d
 
 TWO PROMPT COLLECTIONS, REPORTED SEPARATELY -- THEY ARE NOT COMPARABLE
 ----------------------------------------------------------------------
-  setA_*  chained-flow's own Turkish holdouts (`bench_data_tr/*.holdout.jsonl`), built for the
+  setA_*  chain-flow's own Turkish holdouts (`bench_data_tr/*.holdout.jsonl`), built for the
           27B run.  4 structured/instruct domains.  The 4B drafter was evaluated on these.
   setB_*  the turkishdspark benchmark sets (`/root/turkishdspark/data/benchmark/`).  The 9B
           drafter was evaluated on these.
@@ -40,7 +40,7 @@ import pathlib
 
 THINK = "<think>\n\n</think>\n\n"
 
-SET_A = {  # chained-flow Turkish holdouts -- prompt already rendered
+SET_A = {  # chain-flow Turkish holdouts -- prompt already rendered
     "tr_funccall": "bench_data_tr/tr-function-calling-20k.holdout.jsonl",
     "tr_instruct": "bench_data_tr/tr-instructurca.holdout.jsonl",
     "tr_multiturn": "bench_data_tr/tr-multiturn.holdout.jsonl",
@@ -55,7 +55,7 @@ SET_B = {  # turkishdspark benchmark -- raw messages, rendered here
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default="/home/shadeform/chained-flow")
+    ap.add_argument("--root", default="/home/shadeform/chain-flow")
     ap.add_argument("--model", default="Qwen/Qwen3.5-4B",
                     help="tokenizer whose chat template renders set B. 4B/9B/27B share it.")
     ap.add_argument("--per-set", type=int, default=50)
@@ -92,7 +92,7 @@ def main() -> None:
         print(f"  {name:14s} {len(prompts):3d} prompts  ptok mean {sum(ntok)/len(ntok):6.1f} "
               f"max {max(ntok):5d}  <- {src}")
 
-    print("SET A -- chained-flow Turkish holdouts (prompt pre-rendered upstream)")
+    print("SET A -- chain-flow Turkish holdouts (prompt pre-rendered upstream)")
     for name, rel in SET_A.items():
         rows = [json.loads(l) for l in (root / rel).open() if l.strip()]
         emit(name, [r["prompt"] for r in rows[: args.per_set]], rel)

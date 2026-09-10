@@ -4,7 +4,7 @@ selimaktas/Flow-Drafter-4B on the HF Hub. Best-effort accept measurement for the
 import json, shutil, subprocess, sys, time, os
 from pathlib import Path
 
-ROOT = Path("/home/shadeform/chained-flow")
+ROOT = Path("/home/shadeform/chain-flow")
 CKD = ROOT / "out/flow/ckpts/tree-vae-joint-4b-640-k8-l8"
 VAE = ROOT / "out/vae/ckpts/transformer-hidden-4b-2560-latent640-fp16"
 CFG_YAML = ROOT / "train_configs/recovered/joint_4b.yaml"
@@ -33,8 +33,8 @@ def ensure_config():
     from dataclasses import asdict
     from pathlib import Path as P
     from transformers import HfArgumentParser, TrainingArguments
-    from chained_flow.training.train_tree_flow import TreeModelArguments
-    from chained_flow.training.train_chunked_flow import TeacherDataArguments, FlowLossArguments
+    from chain_flow.training.train_tree_flow import TreeModelArguments
+    from chain_flow.training.train_chunked_flow import TeacherDataArguments, FlowLossArguments
     p = HfArgumentParser((TreeModelArguments, TeacherDataArguments, FlowLossArguments, TrainingArguments))
     m, d, l, t = p.parse_yaml_file(yaml_file=str(CFG_YAML.resolve()))
     json.dump({"model_args": asdict(m), "data_args": asdict(d), "loss_args": asdict(l)}, open(cfgp, "w"), indent=2)
@@ -78,7 +78,7 @@ tags:
 - speculative-decoding
 - draft-model
 - flow-matching
-- chained-flow
+- chain-flow
 ---
 
 # Flow-Drafter-4B
@@ -104,7 +104,7 @@ single flow pass**, expands them into a **draft tree**, and the base model verif
 - `vae/` — the base VAE checkpoint (needed to construct the VAE at load time)
 
 ## Loading
-Load with the `chained-flow` project's `load_tree_module` (set `vae_dir` to the bundled `vae/` folder).
+Load with the `chain-flow` project's `load_tree_module` (set `vae_dir` to the bundled `vae/` folder).
 This drafter is meant to be driven as a tree proposer + lossless tree-verify over the Qwen3.5-4B backbone.
 
 Trained on a diverse mix (gsm8k, nemotron-math, nemotron-stem, alpaca-code, dolly-chat).
@@ -123,7 +123,7 @@ def main():
     shutil.copy(CKD / "chained_flow_tree_config.json", STAGE)
     (STAGE / "vae").mkdir()
     shutil.copy(VAE / "model.safetensors", STAGE / "vae")
-    shutil.copy(VAE / "chained_flow_vae_config.json", STAGE / "vae")
+    shutil.copy(VAE / "chain_flow_vae_config.json", STAGE / "vae")
     (STAGE / "README.md").write_text(readme(acc))
     log(f"staged: {[p.name for p in STAGE.iterdir()]}")
 

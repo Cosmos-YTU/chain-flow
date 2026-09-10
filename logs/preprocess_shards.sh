@@ -10,7 +10,7 @@
 #
 # scripts/concat_flow_caches.py then merges the per-shard caches, with row-level verification.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src
 PY=.venv/bin/python
 

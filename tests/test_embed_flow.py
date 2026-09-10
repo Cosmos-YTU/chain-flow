@@ -1,8 +1,8 @@
 import torch
 
-from chained_flow.drafters.embed_flow import EmbedFlowDrafter, EmbedFlowConfig
-from chained_flow.training.train_chunked_flow import FlowLossArguments
-from chained_flow.training.train_embed_flow import EmbedModelArguments, EmbedTrainingModule, embed_config_from_args
+from chain_flow.drafters.embed_flow import EmbedFlowDrafter, EmbedFlowConfig
+from chain_flow.training.train_chunked_flow import FlowLossArguments
+from chain_flow.training.train_embed_flow import EmbedModelArguments, EmbedTrainingModule, embed_config_from_args
 
 
 def _config(K=4, steps=4, cfdim=8, init="noise"):

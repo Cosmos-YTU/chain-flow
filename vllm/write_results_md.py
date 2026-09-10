@@ -1,6 +1,6 @@
 """Parse the 4B + 9B + 27B accept-bench and vLLM-speedup logs into docs/deployment_results.md."""
 import re, os, time
-ROOT = "/home/shadeform/chained-flow"
+ROOT = "/home/shadeform/chain-flow"
 
 MODELS = ["4B", "9B", "27B"]
 ACCEPT_LOGS = {"4B": f"{ROOT}/logs/deploy_eval.log", "9B": f"{ROOT}/logs/deploy_eval_9b.log",

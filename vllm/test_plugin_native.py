@@ -1,12 +1,12 @@
 """One mode per process (CF_MODE=base|spec) — avoids cudagraph-pool corruption from two LLMs."""
 import os, sys, time, json
-# Only fall back to the source tree when chained-flow is NOT installed. Prepending it
+# Only fall back to the source tree when chain-flow is NOT installed. Prepending it
 # unconditionally would shadow an installed package and quietly invalidate the one thing a
 # pristine-venv run is meant to prove -- that the WHEEL works, `vllm.general_plugins` entry
 # point and all.
 import importlib.util
-if importlib.util.find_spec("chained_flow") is None:
-    sys.path.insert(0, "/home/shadeform/chained-flow/src")
+if importlib.util.find_spec("chain_flow") is None:
+    sys.path.insert(0, "/home/shadeform/chain-flow/src")
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 from vllm import LLM, SamplingParams
 
@@ -29,7 +29,7 @@ if os.environ.get("CF_DBG_CG") == "1":      # tally which cudagraph mode each st
                                   dict(_tally.most_common(8)), flush=True))
 
 if os.environ.get("CF_VPROF") == "1":
-    from chained_flow.vllm_plugin import vprof
+    from chain_flow.vllm_plugin import vprof
     vprof.install()
     if os.environ.get("CF_SYNCDBG") == "1":
         vprof.install_sync_debug()
@@ -74,7 +74,7 @@ if _sd:
     kw["mamba_ssm_cache_dtype"] = _sd
 if MODE == "spec":
     kw["speculative_config"] = {"method": "custom_class",
-                                "model": "chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer",
+                                "model": "chain_flow.vllm_plugin.flow_proposer.FlowDrafterProposer",
                                 "num_speculative_tokens": K}
 # CF_ASYNC_SCHED: vLLM auto-decides async_scheduling (config/vllm.py:992-1040) and gives the
 # BASE arm a feature custom_class spec is FORCED to give up (:1003). Leaving it auto makes every
@@ -88,7 +88,7 @@ llm = LLM(**kw)
 def _acc_counters():
     """Cumulative (tokens emitted, request-steps) from the proposer, for per-set accept."""
     try:
-        from chained_flow.vllm_plugin.flow_proposer import _STASH
+        from chain_flow.vllm_plugin.flow_proposer import _STASH
         p = _STASH.get("proposer")
         if p is None:
             return (0, 0)

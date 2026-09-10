@@ -1,8 +1,8 @@
 from datasets import Dataset
 import torch
 
-from chained_flow.training import vae_dataset
-from chained_flow.training.vae_dataset import TeacherHiddenTokenDataset, collate_hidden_tokens
+from chain_flow.training import vae_dataset
+from chain_flow.training.vae_dataset import TeacherHiddenTokenDataset, collate_hidden_tokens
 
 
 def test_teacher_hidden_token_dataset_samples_response_tokens():

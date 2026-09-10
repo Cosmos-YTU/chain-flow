@@ -1,11 +1,11 @@
-chained-flow
+chain-flow
 Copyright 2026 Selim Aktas
 
 This product includes software developed as a derivative of vLLM
 (https://github.com/vllm-project/vllm), Copyright the vLLM Team, licensed under
 the Apache License, Version 2.0.
 
-Specifically, patches/vllm-0.25.1-chained-flow-tree.patch is a diff against vLLM
+Specifically, patches/vllm-0.25.1-chain-flow-tree.patch is a diff against vLLM
 0.25.1 source files and, when applied, modifies:
 
   vllm/config/vllm.py

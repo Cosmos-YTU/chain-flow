@@ -1,10 +1,10 @@
 import pytest
 import torch
 
-from chained_flow.context import ChainedFlowContext
-from chained_flow.drafters.ar import ARDrafter
-from chained_flow.drafters.base import DraftResult
-from chained_flow.generation import generate_with_drafter
+from chain_flow.context import ChainedFlowContext
+from chain_flow.drafters.ar import ARDrafter
+from chain_flow.drafters.base import DraftResult
+from chain_flow.generation import generate_with_drafter
 
 
 def test_generation_with_ar_drafter_matches_shift_pattern(fake_wrapper):

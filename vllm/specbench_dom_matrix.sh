@@ -4,7 +4,7 @@
 #
 #   specbench_dom_matrix.sh "<job> <job> ..."      job = "<size>:<arm>"
 set -uo pipefail
-ROOT=/home/shadeform/chained-flow
+ROOT=/home/shadeform/chain-flow
 JOBS=(${1:?jobs})
 QUEUE=$ROOT/logs/specbench_dom/queue.txt
 printf '%s\n' "${JOBS[@]}" > "$QUEUE"

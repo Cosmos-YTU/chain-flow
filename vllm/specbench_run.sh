@@ -11,7 +11,7 @@ ARM=${2:?arm}
 GPU=${3:?gpu}
 PORT=${4:?port}
 
-ROOT=/home/shadeform/chained-flow
+ROOT=/home/shadeform/chain-flow
 OUT=$ROOT/logs/specbench/${SIZE}_${ARM}
 DATA=$ROOT/logs/specbench/data
 GL=/home/shadeform/specbench-venv/bin/guidellm
@@ -96,7 +96,7 @@ for rep in $(seq 1 "$REPEATS"); do
   # project's numbers describe, so that is what is reported.
   # HARNESS-AS-SHIPPED: temp 0.6 / top_p 0.95 / top_k 20, generate to EOS.
   # NOT RUNNABLE ON THE TREE ARM. flow_proposer.py:1666 raises
-  #   "chained-flow tree mode requires greedy sampling (temperature=0, no logprobs,
+  #   "chain-flow tree mode requires greedy sampling (temperature=0, no logprobs,
   #    no penalties)"
   # and it raises inside propose(), i.e. inside the EngineCore step -- so the request does
   # not fail, the ENGINE dies (EngineDeadError) and every later benchmark against that

@@ -15,7 +15,7 @@
 #   cnd_reach.sh 7 4b fix                                                # defaults: must be 0
 set -uo pipefail
 GPU=${1:?gpu}; SIZE=${2:?size}; TAG=${3:?tag}; shift 3
-ROOT=/home/shadeform/chained-flow
+ROOT=/home/shadeform/chain-flow
 PORT=${CF_PORT:-8791}
 DIR=$ROOT/logs/cnd
 mkdir -p "$DIR"

@@ -11,7 +11,7 @@
 # mid-run, and the checkpoint ladder that picks what to ship reads model.safetensors alone. The two
 # newest are kept so an actual resume remains possible.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 CKPT_GLOB="out/flow/ckpts/tree-vae-joint-tr27bv2instruct-*/checkpoint-*"
 LOG=logs/tr_v2_tr27b_instruct/resources.log
 INTERVAL="${CF_WATCH_SEC:-300}"

@@ -24,7 +24,7 @@ import shutil
 import time
 from pathlib import Path
 
-ROOT = Path("/home/shadeform/chained-flow")
+ROOT = Path("/home/shadeform/chain-flow")
 CKD = ROOT / "out/flow/ckpts/tree-vae-joint-tr27b-1024-k8-l8"
 VAE = ROOT / "out/vae/ckpts/transformer-hidden-q3527bx-5120-latent1024-fp16"
 SHORTLIST = ROOT / "out/flow/shortlist_q3527b_tr.pt"
@@ -89,7 +89,7 @@ tags:
 - speculative-decoding
 - draft-model
 - flow-matching
-- chained-flow
+- chain-flow
 - turkish
 ---
 
@@ -183,7 +183,7 @@ def main() -> int:
     shutil.copy(SHORTLIST, STAGE / "shortlist.pt")
     (STAGE / "vae").mkdir()
     shutil.copy(VAE / "model.safetensors", STAGE / "vae")
-    shutil.copy(VAE / "chained_flow_vae_config.json", STAGE / "vae")
+    shutil.copy(VAE / "chain_flow_vae_config.json", STAGE / "vae")
     (STAGE / "README.md").write_text(card(r, digest))
     log(f"staged: {sorted(p.name for p in STAGE.iterdir())}")
 

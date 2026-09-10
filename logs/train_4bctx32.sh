@@ -2,7 +2,7 @@
 # P0: widen the flow's context 8 -> 32 hidden states. VAE first (its learned pos-emb caps the
 # context length), then the joint drafter. DDP on GPUs 3,4,5,6.
 set -o pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 echo "======== [$(date -u '+%m-%d %H:%M:%S')] 1/2 train VAE (ctx32, max_seq 64) ========"

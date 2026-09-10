@@ -1,10 +1,10 @@
 import torch
 
-from chained_flow.context import ChainedFlowContext
-from chained_flow.drafters.ar import ARDrafter
-from chained_flow.frozen_lm import FrozenLMWrapper
-from chained_flow.timing import TimingStats
-from chained_flow.verifier import SpeculativeVerifier
+from chain_flow.context import ChainedFlowContext
+from chain_flow.drafters.ar import ARDrafter
+from chain_flow.frozen_lm import FrozenLMWrapper
+from chain_flow.timing import TimingStats
+from chain_flow.verifier import SpeculativeVerifier
 
 
 def test_context_loads_backbone_once(monkeypatch, fake_wrapper):

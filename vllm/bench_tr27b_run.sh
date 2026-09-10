@@ -25,7 +25,7 @@ GPU=${2:?gpu}
 PORT=${3:?port}
 TAG=${4:-}
 
-ROOT=/home/shadeform/chained-flow
+ROOT=/home/shadeform/chain-flow
 DATA=${CF_TR_DATA:-$ROOT/logs/bench_tr/data_setA}
 OUT=$ROOT/logs/bench_tr/27b_${ARM}${TAG}
 mkdir -p "$OUT"
@@ -64,14 +64,14 @@ case "$ARM" in
 esac
 export CF_DRAFTER_DIR=$DRAFTER
 
-_CF_DEF=$(PYTHONPATH=$ROOT/src "$CF_PY" $ROOT/src/chained_flow/defaults.py --sh)
+_CF_DEF=$(PYTHONPATH=$ROOT/src "$CF_PY" $ROOT/src/chain_flow/defaults.py --sh)
 echo "$_CF_DEF" | sed 's/^/[bench27b] /' >&2
 eval "$_CF_DEF"
 
 SPEC_ARGS=()
 if [ "$ARM" != "base" ]; then
   export CF_CUDAGRAPH=1 CF_K=${CF_K:-5}
-  SPEC_ARGS=(--speculative-config "{\"method\":\"custom_class\",\"model\":\"chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer\",\"num_speculative_tokens\":${CF_K}}")
+  SPEC_ARGS=(--speculative-config "{\"method\":\"custom_class\",\"model\":\"chain_flow.vllm_plugin.flow_proposer.FlowDrafterProposer\",\"num_speculative_tokens\":${CF_K}}")
 fi
 # ON FOR EVERY ARM INCLUDING BASE. Dropping it from base alone inflates every ratio.
 export CF_ASYNC_SCHED=1
@@ -112,7 +112,7 @@ curl -sf -m 600 "http://localhost:${PORT}/v1/completions" -H 'Content-Type: appl
 # PROVENANCE FROM THE ENGINE PROCESS, not this shell's env.
 if [ "$ARM" != "base" ]; then
   grep -E "\(EngineCore pid=.*\[cf-defaults\] ON:" "$SERVER_LOG" | head -1 | tee "$OUT/cf_defaults.engine.txt"
-  grep -E "\(EngineCore pid=.*\[chained-flow\] (drafter=|shortlist head)" "$SERVER_LOG" \
+  grep -E "\(EngineCore pid=.*\[chain-flow\] (drafter=|shortlist head)" "$SERVER_LOG" \
     | tee "$OUT/cf_build.engine.txt"
   if ! grep -q "shortlist head" "$OUT/cf_build.engine.txt"; then
     echo "[bench27b] FATAL: engine never reported a shortlist head -- full head or no build"; exit 1

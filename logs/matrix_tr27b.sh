@@ -18,7 +18,7 @@
 # training data, so it is the honest read on whether Turkish ability transfers. Expect TRO to favour
 # the earlier checkpoint more strongly than TR does.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 

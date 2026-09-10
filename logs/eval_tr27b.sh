@@ -23,7 +23,7 @@
 # clipped by the shortlist. Measuring it on the parent (arms 4 vs 5, which differ by +0.02 here)
 # clears it FALSELY. Arm 7 vs 6 additionally shows whether the Turkish list itself clips anything.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 

@@ -2,7 +2,7 @@
 # Waits for the 27B drafter to finish, then on GPU 6 (which 27B frees): RedHatAI+held-out accept
 # rates -> best-effort vLLM speedup -> combined 4B+9B+27B docs/deployment_results.md -> push to HF.
 set -o pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export CUDA_VISIBLE_DEVICES=6 PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 VPY=vllm/.venv/bin/python
@@ -20,8 +20,8 @@ $PY - <<'PYEOF'
 import json
 from dataclasses import asdict
 from transformers import HfArgumentParser, TrainingArguments
-from chained_flow.training.train_tree_flow import TreeModelArguments
-from chained_flow.training.train_chunked_flow import TeacherDataArguments, FlowLossArguments
+from chain_flow.training.train_tree_flow import TreeModelArguments
+from chain_flow.training.train_chunked_flow import TeacherDataArguments, FlowLossArguments
 p=HfArgumentParser((TreeModelArguments, TeacherDataArguments, FlowLossArguments, TrainingArguments))
 m,d,l,t=p.parse_yaml_file(yaml_file="train_configs/recovered/joint_27b.yaml")
 json.dump({"model_args":asdict(m),"data_args":asdict(d),"loss_args":asdict(l)},
@@ -30,7 +30,7 @@ print("27B config synthesized")
 PYEOF
 mkdir -p $ED
 cp $CKD/chained_flow_tree_config.json $ED/
-ln -sf /home/shadeform/chained-flow/$CKD/model.safetensors $ED/model.safetensors
+ln -sf /home/shadeform/chain-flow/$CKD/model.safetensors $ED/model.safetensors
 
 # --- accept bench: collect -> cache -> measure per domain ---
 > logs/deploy_eval_27b.log

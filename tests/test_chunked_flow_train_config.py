@@ -2,7 +2,7 @@ from pathlib import Path
 
 from transformers import HfArgumentParser, TrainingArguments
 
-from chained_flow.training.train_chunked_flow import (
+from chain_flow.training.train_chunked_flow import (
     ChunkedFlowModelArguments,
     FlowLossArguments,
     TeacherDataArguments,

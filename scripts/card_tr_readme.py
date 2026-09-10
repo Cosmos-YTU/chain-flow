@@ -28,7 +28,7 @@ import subprocess
 import textwrap
 import sys
 
-ROOT = pathlib.Path("/home/shadeform/chained-flow")
+ROOT = pathlib.Path("/home/shadeform/chain-flow")
 # The domains each card's OFFLINE table is built from -- 4B leads with Set A, 9B with Set B.
 OFFLINE_STATES = {"4b": "teacher_states/bench-4btr-*", "9b": "teacher_states/bench-9btr-*"}
 

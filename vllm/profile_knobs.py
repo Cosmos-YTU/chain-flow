@@ -1,13 +1,13 @@
 """Microbenchmark: does lightening the draft (knob 1 shortlist head, 2 shorter depth, 3 smaller tree)
 reduce draft time? 27B-v2 drafter, random embed/head (timing only). Non-destructive — inference knobs."""
-import sys; sys.path.insert(0, "/home/shadeform/chained-flow/src")
+import sys; sys.path.insert(0, "/home/shadeform/chain-flow/src")
 import json, dataclasses, time, torch, torch.nn.functional as F
 from types import SimpleNamespace
-from chained_flow.drafters.tree_vae_flow import TreeVAEFlowDrafter, TreeVAEFlowConfig
+from chain_flow.drafters.tree_vae_flow import TreeVAEFlowDrafter, TreeVAEFlowConfig
 from safetensors.torch import load_file
 from torch.nn.attention import SDPBackend, sdpa_kernel
 dev, dt = "cuda", torch.float16
-CKD = "/home/shadeform/chained-flow/out/flow/ckpts/tree-vae-joint-q3527bx-1024-k8-l8"
+CKD = "/home/shadeform/chain-flow/out/flow/ckpts/tree-vae-joint-q3527bx-1024-k8-l8"
 HIDDEN, VOCAB = 5120, 248320
 embed = torch.randn(VOCAB, HIDDEN, device=dev, dtype=dt) * 0.02
 class Emb:

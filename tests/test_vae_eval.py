@@ -1,7 +1,7 @@
 import torch
 import pytest
 
-from chained_flow.training.eval_vae import (
+from chain_flow.training.eval_vae import (
     VAEEvalArguments,
     checkpoint_eval_output_path,
     dataset_eval_slug,
@@ -97,7 +97,7 @@ def test_find_vae_config_dir_uses_parent_for_trainer_checkpoint(tmp_path):
     run_dir = tmp_path / "run"
     checkpoint_dir = run_dir / "checkpoint-20"
     checkpoint_dir.mkdir(parents=True)
-    (run_dir / "chained_flow_vae_config.json").write_text("{}", encoding="utf-8")
+    (run_dir / "chain_flow_vae_config.json").write_text("{}", encoding="utf-8")
 
     assert find_vae_config_dir(checkpoint_dir) == run_dir
 
@@ -167,7 +167,7 @@ def test_select_checkpoint_stride_rejects_non_positive_vae_stride(tmp_path):
 
 
 def test_load_flow_cache_hidden_tokens_respects_response_only(tmp_path):
-    from chained_flow.training.window_dataset import FLOW_CACHE_FILES, FLOW_CACHE_METADATA
+    from chain_flow.training.window_dataset import FLOW_CACHE_FILES, FLOW_CACHE_METADATA
     import json
 
     cache_dir = tmp_path / "cache"

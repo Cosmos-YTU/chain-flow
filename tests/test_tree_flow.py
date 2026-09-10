@@ -1,8 +1,8 @@
 import torch
 
-from chained_flow.drafters.tree_flow import DraftTree, TreeFlowConfig, TreeFlowDrafter
-from chained_flow.training.train_chunked_flow import FlowLossArguments
-from chained_flow.training.train_tree_flow import TreeModelArguments, TreeFlowTrainingModule, tree_config_from_args
+from chain_flow.drafters.tree_flow import DraftTree, TreeFlowConfig, TreeFlowDrafter
+from chain_flow.training.train_chunked_flow import FlowLossArguments
+from chain_flow.training.train_tree_flow import TreeModelArguments, TreeFlowTrainingModule, tree_config_from_args
 
 
 def _cfg(K=4, order=4):

@@ -6,7 +6,7 @@
 # require the generated token ids to be bit-identical.
 set -euo pipefail
 V=/home/shadeform/vllm/.venv/lib/python3.12/site-packages/vllm
-PRE=/home/shadeform/chained-flow/vllm/_vllm_preopt
+PRE=/home/shadeform/chain-flow/vllm/_vllm_preopt
 CUR=/tmp/cf_cur_vllm
 FILES="v1/attention/backends/flash_attn.py v1/worker/gpu_model_runner.py \
        v1/sample/rejection_sampler.py v1/spec_decode/tree_state.py"
@@ -17,9 +17,9 @@ restore() { for f in $FILES; do cp "$CUR/$f" "$V/$f"; done; }
 trap restore EXIT
 
 for f in $FILES; do cp "$PRE/$f" "$V/$f"; done
-CF_TAG=_inv_pre bash /home/shadeform/chained-flow/vllm/bench_cf.sh "${1:-4b}" base _inv_pre >/tmp/inv_pre.log 2>&1
+CF_TAG=_inv_pre bash /home/shadeform/chain-flow/vllm/bench_cf.sh "${1:-4b}" base _inv_pre >/tmp/inv_pre.log 2>&1
 restore
-CF_TAG=_inv_post bash /home/shadeform/chained-flow/vllm/bench_cf.sh "${1:-4b}" base _inv_post >/tmp/inv_post.log 2>&1
+CF_TAG=_inv_post bash /home/shadeform/chain-flow/vllm/bench_cf.sh "${1:-4b}" base _inv_post >/tmp/inv_post.log 2>&1
 
 /home/shadeform/vllm/.venv/bin/python - <<'PY'
 import json

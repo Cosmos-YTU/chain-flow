@@ -7,7 +7,7 @@
 # running": there is an up-to-60s gap between wave 1 exiting and wave 2 claiming the
 # GPUs, and a process-absence check would fire inside that gap and contend for GPU 3.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 until grep -q "COLLECT EXT DONE" logs/collect_tr27b_ext_main.log 2>/dev/null; do sleep 60; done

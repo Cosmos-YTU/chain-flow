@@ -2,10 +2,10 @@ import json
 
 import torch
 
-from chained_flow.drafters.hidden_mlp import HiddenMLPConfig
-from chained_flow.training.losses import DrafterLossConfig
-from chained_flow.training.trainer_module import HiddenMLPTrainingModule
-from chained_flow.vae import HiddenVAEConfig, build_hidden_vae
+from chain_flow.drafters.hidden_mlp import HiddenMLPConfig
+from chain_flow.training.losses import DrafterLossConfig
+from chain_flow.training.trainer_module import HiddenMLPTrainingModule
+from chain_flow.vae import HiddenVAEConfig, build_hidden_vae
 
 
 def write_vae_checkpoint(path, *, hidden_size=8, latent_size=3, intermediate_size=5):
@@ -21,7 +21,7 @@ def write_vae_checkpoint(path, *, hidden_size=8, latent_size=3, intermediate_siz
         "loss_args": {},
         "data_args": {},
     }
-    (path / "chained_flow_vae_config.json").write_text(json.dumps(config), encoding="utf-8")
+    (path / "chain_flow_vae_config.json").write_text(json.dumps(config), encoding="utf-8")
     vae = build_hidden_vae(
         "mlp",
         HiddenVAEConfig(hidden_size=hidden_size, latent_size=latent_size, intermediate_size=intermediate_size),

@@ -85,7 +85,7 @@ def agg(phases: list) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default="/home/shadeform/chained-flow/logs/bench_tr")
+    ap.add_argument("--root", default="/home/shadeform/chain-flow/logs/bench_tr")
     ap.add_argument("--sizes", default="4b,9b")
     ap.add_argument("--json-out", default=None)
     ap.add_argument("--tag", default="", help="run-directory suffix, e.g. _nateos")
@@ -120,7 +120,7 @@ def main() -> None:
                       f"{sorted(missing)}. Its numbers cover fewer sets than the other arms.",
                       flush=True)
         report[size] = {}
-        for label, sets in (("SET A -- chained-flow Turkish holdouts", SET_A),
+        for label, sets in (("SET A -- chain-flow Turkish holdouts", SET_A),
                             ("SET B -- turkishdspark benchmark", SET_B)):
             cond = ("natural EOS, max 256 tok" if args.tag == "_nateos"
                     else "256 tok forced, ignore_eos")

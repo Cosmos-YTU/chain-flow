@@ -2,7 +2,7 @@
 # Waits for the 27B-v2 (q3527bx) drafter, then benches accept on the 6 domains by REUSING the existing
 # base caches (data/flow_cache/deployq3527b_*) — no re-collection. Compares vs v1; pushes -v2 if good.
 set -o pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export CUDA_VISIBLE_DEVICES=5 PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 CKD=out/flow/ckpts/tree-vae-joint-q3527bx-1024-k8-l8
@@ -18,8 +18,8 @@ $PY - <<'PYEOF'
 import json
 from dataclasses import asdict
 from transformers import HfArgumentParser, TrainingArguments
-from chained_flow.training.train_tree_flow import TreeModelArguments
-from chained_flow.training.train_chunked_flow import TeacherDataArguments, FlowLossArguments
+from chain_flow.training.train_tree_flow import TreeModelArguments
+from chain_flow.training.train_chunked_flow import TeacherDataArguments, FlowLossArguments
 p=HfArgumentParser((TreeModelArguments, TeacherDataArguments, FlowLossArguments, TrainingArguments))
 m,d,l,t=p.parse_yaml_file(yaml_file="train_configs/recovered/joint_q3527bx.yaml")
 json.dump({"model_args":asdict(m),"data_args":asdict(d),"loss_args":asdict(l)},
@@ -28,7 +28,7 @@ print("q3527bx config synthesized")
 PYEOF
 mkdir -p $ED
 cp $CKD/chained_flow_tree_config.json $ED/
-ln -sf /home/shadeform/chained-flow/$CKD/model.safetensors $ED/model.safetensors
+ln -sf /home/shadeform/chain-flow/$CKD/model.safetensors $ED/model.safetensors
 
 > logs/deploy_eval_q3527bx.log
 declare -A CACHE=( [gsm8k_heldout]=deployq3527b_gsm8k_heldout [math_reasoning]=deployq3527b_math_reasoning

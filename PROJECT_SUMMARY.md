@@ -1,6 +1,6 @@
 # Chained Flow Project Summary
 
-This document summarizes the state of the `chained-flow` project: what was built, what was tried, which results were useful, and what direction currently looks most promising.
+This document summarizes the state of the `chain-flow` project: what was built, what was tried, which results were useful, and what direction currently looks most promising.
 
 ## Objective
 
@@ -98,7 +98,7 @@ Important implementation points:
 
 Important paths:
 
-- `src/chained_flow/vae/transformer_hidden.py`
+- `src/chain_flow/vae/transformer_hidden.py`
 - `scripts/train_transformer_hidden_vae.py`
 - `scripts/eval_vae.py`
 - `train_configs/vae/transformer_hidden/`
@@ -136,8 +136,8 @@ The first drafter family was a VAE-latent flow model.
 
 Important paths:
 
-- `src/chained_flow/drafters/chunked_flow.py`
-- `src/chained_flow/training/train_chunked_flow.py`
+- `src/chain_flow/drafters/chunked_flow.py`
+- `src/chain_flow/training/train_chunked_flow.py`
 - `scripts/train_chunked_flow.py`
 - `scripts/eval_chunked_flow.py`
 

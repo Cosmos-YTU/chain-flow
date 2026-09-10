@@ -2,7 +2,7 @@
 # GPU 3 extension shards. Waits only for GPU 3's OWN wave-1 tail (multiturn, toolcall) rather
 # than for all of wave 1, so GPU 4 is free to run ahead on its own chain.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 

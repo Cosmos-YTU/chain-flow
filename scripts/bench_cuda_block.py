@@ -99,7 +99,7 @@ def batch_ladder(d, experts, D, C, L, passes, wbytes, bw, dcfg, mode, batches):
     dev = "cuda"
     S = dcfg.chunk_size * 2 if d.num_chunks > 1 else dcfg.chunk_size
     ex0 = experts[0]
-    from chained_flow import cuda_block
+    from chain_flow import cuda_block
 
     mask = _t.triu(_t.full((S, S), float("-inf"), device=dev), diagonal=1)
     print(f"\nbatch ladder, block stack in isolation (S={S}, C={C}, {L} blocks), "
@@ -180,8 +180,8 @@ def main():
 
     from safetensors.torch import load_file
 
-    from chained_flow import cuda_block
-    from chained_flow.drafters.tree_vae_flow import TreeVAEFlowConfig, TreeVAEFlowDrafter
+    from chain_flow import cuda_block
+    from chain_flow.drafters.tree_vae_flow import TreeVAEFlowConfig, TreeVAEFlowDrafter
 
     dev, dtype = "cuda", torch.float16
     cfgj = json.load(open(f"{args.ckd}/chained_flow_tree_config.json"))["model_args"]
@@ -195,7 +195,7 @@ def main():
     d.hidden_size = cfgj["expert_dim"]
     d.latent_size = dcfg.latent_size
     d.num_chunks = dcfg.draft_length // dcfg.chunk_size
-    from chained_flow.drafters.chunked_flow import HiddenKVFlowExpert
+    from chain_flow.drafters.chunked_flow import HiddenKVFlowExpert
 
     def mk():
         return HiddenKVFlowExpert(

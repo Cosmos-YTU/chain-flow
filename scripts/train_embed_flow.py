@@ -4,8 +4,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from transformers import HfArgumentParser, TrainingArguments
-from chained_flow.training.train_chunked_flow import FlowLossArguments, TeacherDataArguments
-from chained_flow.training.train_embed_flow import EmbedModelArguments, train_embed_with_trainer
+from chain_flow.training.train_chunked_flow import FlowLossArguments, TeacherDataArguments
+from chain_flow.training.train_embed_flow import EmbedModelArguments, train_embed_with_trainer
 
 def main() -> None:
     parser = HfArgumentParser((EmbedModelArguments, TeacherDataArguments, FlowLossArguments, TrainingArguments))

@@ -5,7 +5,7 @@
 # The cache build is CPU/disk bound and the BEFORE eval is GPU bound, so they run concurrently --
 # the only place in this pipeline where two things can overlap on one device.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 CACHE=data/flow_cache/stage1_4btr_mix_k4

@@ -28,7 +28,7 @@ def load(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default="/home/shadeform/chained-flow/logs/specbench")
+    ap.add_argument("--root", default="/home/shadeform/chain-flow/logs/specbench")
     ap.add_argument("--size", required=True)
     ap.add_argument("--cfg", default="fixed256_synchronous_r1")
     args = ap.parse_args()

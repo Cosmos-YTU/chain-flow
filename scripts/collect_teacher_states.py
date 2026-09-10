@@ -12,8 +12,8 @@ load_dotenv()
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from chained_flow.frozen_lm import DEFAULT_MODEL_ID
-from chained_flow.training.collect_teacher import TeacherCollectionConfig, collect_teacher_dataset
+from chain_flow.frozen_lm import DEFAULT_MODEL_ID
+from chain_flow.training.collect_teacher import TeacherCollectionConfig, collect_teacher_dataset
 
 
 def tmp_output_dir(output_dir: Path) -> Path:

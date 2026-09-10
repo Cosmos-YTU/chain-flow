@@ -24,7 +24,7 @@ import os
 import re
 import sys
 
-ROOT = "/home/shadeform/chained-flow/logs/cnd"
+ROOT = "/home/shadeform/chain-flow/logs/cnd"
 
 
 def load(path):

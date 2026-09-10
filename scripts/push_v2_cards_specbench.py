@@ -23,7 +23,7 @@ import difflib
 import json
 import pathlib
 
-ROOT = pathlib.Path("/home/shadeform/chained-flow")
+ROOT = pathlib.Path("/home/shadeform/chain-flow")
 RESULTS = ROOT / "logs/specbench_dom"
 
 # size -> (repo, base_model, card_name, v1_repo, v1_name, train_rows)
@@ -241,7 +241,7 @@ tags:
 - speculative-decoding
 - draft-model
 - flow-matching
-- chained-flow
+- chain-flow
 ---
 
 # {name}

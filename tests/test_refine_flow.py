@@ -1,8 +1,8 @@
 import torch
 
-from chained_flow.drafters.refine_flow import RefineFlowDrafter, RefineFlowConfig
-from chained_flow.training.train_chunked_flow import FlowLossArguments
-from chained_flow.training.train_refine_flow import RefineModelArguments, RefineTrainingModule, refine_config_from_args
+from chain_flow.drafters.refine_flow import RefineFlowDrafter, RefineFlowConfig
+from chain_flow.training.train_chunked_flow import FlowLossArguments
+from chain_flow.training.train_refine_flow import RefineModelArguments, RefineTrainingModule, refine_config_from_args
 
 
 def _config(K=4, steps=4, init="delta", self_cond=0.0):

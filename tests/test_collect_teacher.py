@@ -1,6 +1,6 @@
 import torch
 
-from chained_flow.training.collect_teacher import (
+from chain_flow.training.collect_teacher import (
     TeacherCollectionConfig,
     _answer_row_from_dataset_row,
     _backbone,
@@ -13,7 +13,7 @@ from chained_flow.training.collect_teacher import (
     format_gsm8k_prompt,
     teacher_dataset_features,
 )
-from chained_flow.timing import TimingStats
+from chain_flow.timing import TimingStats
 from datasets import Dataset
 
 

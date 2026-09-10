@@ -3,7 +3,7 @@ import json
 import pytest
 import torch
 
-from chained_flow.vae import HiddenVAEConfig, VAE_REGISTRY, build_hidden_vae, load_hidden_vae_from_dir
+from chain_flow.vae import HiddenVAEConfig, VAE_REGISTRY, build_hidden_vae, load_hidden_vae_from_dir
 
 
 @pytest.mark.parametrize("vae_type", sorted(VAE_REGISTRY))
@@ -38,7 +38,7 @@ def test_load_hidden_vae_from_trainer_checkpoint_uses_parent_config(tmp_path):
             "intermediate_size": 5,
         }
     }
-    (run_dir / "chained_flow_vae_config.json").write_text(json.dumps(config), encoding="utf-8")
+    (run_dir / "chain_flow_vae_config.json").write_text(json.dumps(config), encoding="utf-8")
     vae = build_hidden_vae("mlp", HiddenVAEConfig(hidden_size=8, latent_size=3, intermediate_size=5))
     torch.save({f"vae.{key}": value for key, value in vae.state_dict().items()}, checkpoint_dir / "pytorch_model.bin")
 

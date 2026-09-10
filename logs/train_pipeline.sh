@@ -5,7 +5,7 @@
 #   combine 5 sources -> drafter flow cache -> 3k VAE cache -> VAE -> joint-VAE drafter
 set -o pipefail
 TAG=$1; GPU=$2
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export CUDA_VISIBLE_DEVICES=$GPU PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0
 PY=.venv/bin/python
 CLOG=logs/collect_${TAG}.log

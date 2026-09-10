@@ -8,8 +8,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from transformers import HfArgumentParser, TrainingArguments
 
-from chained_flow.training.train_chunked_flow import FlowLossArguments, TeacherDataArguments
-from chained_flow.training.train_dflash_flow import DFlashModelArguments, train_dflash_with_trainer
+from chain_flow.training.train_chunked_flow import FlowLossArguments, TeacherDataArguments
+from chain_flow.training.train_dflash_flow import DFlashModelArguments, train_dflash_with_trainer
 
 
 def main() -> None:

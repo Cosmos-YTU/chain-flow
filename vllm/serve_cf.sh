@@ -17,16 +17,16 @@ LOG=${4:?logfile}
 export CUDA_VISIBLE_DEVICES=${CF_GPU:-5}
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 CF_PY=${CF_PY:-/home/shadeform/vllm/.venv/bin/python}
-# CF_SRC pins the chained-flow source tree. It defaults to the repo working tree, so this
+# CF_SRC pins the chain-flow source tree. It defaults to the repo working tree, so this
 # is a no-op for everyone; a benchmark sweep sets it to a frozen COPY so that concurrent
 # edits by other agents cannot change the code out from under the arms mid-run (base and
 # chain must execute identical code to be comparable).
-CF_SRC=${CF_SRC:-/home/shadeform/chained-flow/src}
+CF_SRC=${CF_SRC:-/home/shadeform/chain-flow/src}
 export PYTHONPATH=$CF_SRC
 
-# Same capability-gated default table bench_cf.sh uses (src/chained_flow/defaults.py).
+# Same capability-gated default table bench_cf.sh uses (src/chain_flow/defaults.py).
 _CF_DEF=$(PYTHONPATH=$CF_SRC "$CF_PY" \
-          "$CF_SRC/chained_flow/defaults.py" --sh)
+          "$CF_SRC/chain_flow/defaults.py" --sh)
 eval "$_CF_DEF"
 # (The `unset CF_SHORTLIST` that used to be here is gone: `defaults.py --sh` no longer exports
 #  the shortlist at all, so the packaged list resolves in-process the way a pip user gets it.
@@ -53,12 +53,12 @@ SPEC_ARGS=()
 case "$ARM" in
   base) ;;
   chain) export CF_CUDAGRAPH=1 CF_K=${CF_K:-5}
-         SPEC_ARGS=(--speculative-config "{\"method\":\"custom_class\",\"model\":\"chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer\",\"num_speculative_tokens\":${CF_K}}") ;;
+         SPEC_ARGS=(--speculative-config "{\"method\":\"custom_class\",\"model\":\"chain_flow.vllm_plugin.flow_proposer.FlowDrafterProposer\",\"num_speculative_tokens\":${CF_K}}") ;;
   tree)  export CF_CUDAGRAPH=1 VLLM_SPEC_TREE=1
          : ${CF_TREE_KEEP:=8}; : ${CF_TREE_DEPTH:=5}
          : ${CF_K:=$(( CF_TREE_KEEP * CF_TREE_DEPTH + 1 ))}
          export CF_TREE_KEEP CF_TREE_DEPTH CF_K
-         SPEC_ARGS=(--speculative-config "{\"method\":\"custom_class\",\"model\":\"chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer\",\"num_speculative_tokens\":${CF_K}}") ;;
+         SPEC_ARGS=(--speculative-config "{\"method\":\"custom_class\",\"model\":\"chain_flow.vllm_plugin.flow_proposer.FlowDrafterProposer\",\"num_speculative_tokens\":${CF_K}}") ;;
   *) echo "bad arm"; exit 1 ;;
 esac
 # Async scheduling ON for every arm. On the fork the spec arms additionally need

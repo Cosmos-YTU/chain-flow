@@ -8,7 +8,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from transformers import HfArgumentParser
 
-from chained_flow.training.eval_chunked_flow import ChunkedFlowEvalArguments, evaluate_flow
+from chain_flow.training.eval_chunked_flow import ChunkedFlowEvalArguments, evaluate_flow
 
 
 def main() -> None:

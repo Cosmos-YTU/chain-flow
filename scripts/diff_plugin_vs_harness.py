@@ -25,7 +25,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from chained_flow.vllm_plugin.flow_proposer import FlowDrafterProposer  # noqa: E402 (no vllm import)
+from chain_flow.vllm_plugin.flow_proposer import FlowDrafterProposer  # noqa: E402 (no vllm import)
 
 
 def build_proposer(ckd, embed_w, lm_w, K, width, dev, dtype, flow_steps=None):
@@ -33,7 +33,7 @@ def build_proposer(ckd, embed_w, lm_w, K, width, dev, dtype, flow_steps=None):
     import torch.nn.functional as F
     from types import SimpleNamespace
     from safetensors.torch import load_file
-    from chained_flow.drafters.tree_vae_flow import TreeVAEFlowDrafter, TreeVAEFlowConfig
+    from chain_flow.drafters.tree_vae_flow import TreeVAEFlowDrafter, TreeVAEFlowConfig
 
     class Emb:
         def __init__(s, w): s.w = w

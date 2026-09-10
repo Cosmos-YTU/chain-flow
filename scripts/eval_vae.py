@@ -8,7 +8,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from transformers import HfArgumentParser
 
-from chained_flow.training.eval_vae import VAEEvalArguments, evaluate_vae
+from chain_flow.training.eval_vae import VAEEvalArguments, evaluate_vae
 
 
 def main() -> None:

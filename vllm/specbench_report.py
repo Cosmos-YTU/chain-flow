@@ -147,7 +147,7 @@ def load_run(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default="/home/shadeform/chained-flow/logs/specbench")
+    ap.add_argument("--root", default="/home/shadeform/chain-flow/logs/specbench")
     ap.add_argument("--size", required=True)
     ap.add_argument("--year", type=int, default=2026)
     args = ap.parse_args()

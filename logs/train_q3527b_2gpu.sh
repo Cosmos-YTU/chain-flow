@@ -5,7 +5,7 @@
 #   -> train VAE (1 GPU) -> train joint-VAE drafter (DDP across 5+6; frozen backbone => light comm)
 set -o pipefail
 TAG=q3527b
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 st(){ echo "======== [$(date -u '+%m-%d %H:%M:%S')] $1 ========"; }

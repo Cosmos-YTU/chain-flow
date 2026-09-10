@@ -4,7 +4,7 @@
 import json, re, shutil, time
 from pathlib import Path
 
-ROOT = Path("/home/shadeform/chained-flow")
+ROOT = Path("/home/shadeform/chain-flow")
 CKD27 = ROOT / "out/flow/ckpts/tree-vae-joint-27b-1024-k8-l8"
 VAE27 = ROOT / "out/vae/ckpts/transformer-hidden-27b-5120-latent1024-fp16"
 STAGE = Path("/tmp/flow-drafter-27b-push")
@@ -62,7 +62,7 @@ tags:
 - speculative-decoding
 - draft-model
 - flow-matching
-- chained-flow
+- chain-flow
 ---
 
 # Flow-Drafter-{tag}
@@ -89,7 +89,7 @@ single flow pass**, expands them into a **draft tree**, and the base model verif
 - `vae/` — the base VAE checkpoint (needed to construct the VAE at load time)
 
 ## Loading
-Load with the `chained-flow` project's `load_tree_module` (set `vae_dir` to the bundled `vae/` folder).
+Load with the `chain-flow` project's `load_tree_module` (set `vae_dir` to the bundled `vae/` folder).
 This drafter is meant to be driven as a tree proposer + lossless tree-verify over the {base} backbone.
 
 Trained on a diverse mix (gsm8k, nemotron-math, nemotron-stem, alpaca-code, dolly-chat).
@@ -109,7 +109,7 @@ def main():
     shutil.copy(CKD27 / "chained_flow_tree_config.json", STAGE)
     (STAGE / "vae").mkdir()
     shutil.copy(VAE27 / "model.safetensors", STAGE / "vae")
-    shutil.copy(VAE27 / "chained_flow_vae_config.json", STAGE / "vae")
+    shutil.copy(VAE27 / "chain_flow_vae_config.json", STAGE / "vae")
     (STAGE / "README.md").write_text(card("27B"))
     log(f"staged 27B: {[p.name for p in STAGE.iterdir()]}")
 

@@ -1,6 +1,6 @@
 model_id: Qwen/Qwen3.5-9B
 dataset_name: json
-data_files: /home/shadeform/chained-flow/data/turkish_prompts/tr_instructurca.jsonl
+data_files: /home/shadeform/chain-flow/data/turkish_prompts/tr_instructurca.jsonl
 split: train
 source: tr_instructurca
 format_name: raw_prompt

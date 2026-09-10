@@ -1,8 +1,8 @@
 import torch
 
-from chained_flow.drafters.twopass_flow import TwoPassFlowDrafter, TwoPassFlowConfig
-from chained_flow.training.train_chunked_flow import FlowLossArguments
-from chained_flow.training.train_twopass_flow import TwoPassModelArguments, TwoPassTrainingModule, twopass_config_from_args
+from chain_flow.drafters.twopass_flow import TwoPassFlowDrafter, TwoPassFlowConfig
+from chain_flow.training.train_chunked_flow import FlowLossArguments
+from chain_flow.training.train_twopass_flow import TwoPassModelArguments, TwoPassTrainingModule, twopass_config_from_args
 
 
 def _cfg(K=4):

@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from chained_flow.frozen_lm import FrozenLMWrapper
+from chain_flow.frozen_lm import FrozenLMWrapper
 
 
 class FakeCache:

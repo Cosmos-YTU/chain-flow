@@ -1,6 +1,6 @@
 import torch
 
-from chained_flow.data.windows import build_token_windows, teacher_hidden_span
+from chain_flow.data.windows import build_token_windows, teacher_hidden_span
 
 
 def test_build_token_windows():

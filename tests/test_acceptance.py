@@ -1,6 +1,6 @@
 import torch
 
-from chained_flow.acceptance import greedy_acceptance
+from chain_flow.acceptance import greedy_acceptance
 
 
 def test_greedy_acceptance_full_match():

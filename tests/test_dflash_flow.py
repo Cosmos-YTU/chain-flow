@@ -1,8 +1,8 @@
 import torch
 
-from chained_flow.drafters.dflash_flow import DFlashFlowDrafter, DFlashFlowConfig
-from chained_flow.training.train_chunked_flow import FlowLossArguments
-from chained_flow.training.train_dflash_flow import DFlashModelArguments, DFlashTrainingModule, dflash_config_from_args
+from chain_flow.drafters.dflash_flow import DFlashFlowDrafter, DFlashFlowConfig
+from chain_flow.training.train_chunked_flow import FlowLossArguments
+from chain_flow.training.train_dflash_flow import DFlashModelArguments, DFlashTrainingModule, dflash_config_from_args
 
 
 def _config(K=4, cfdim=8):

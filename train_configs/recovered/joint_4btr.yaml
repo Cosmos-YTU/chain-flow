@@ -25,7 +25,7 @@ tree_top_b: 8
 tree_max_nodes: 64
 architecture: tree_flow
 device: cuda
-vae_dir: /home/shadeform/chained-flow/out/vae/ckpts/transformer-hidden-4bx-2560-latent640-fp16
+vae_dir: /home/shadeform/chain-flow/out/vae/ckpts/transformer-hidden-4bx-2560-latent640-fp16
 latent_size: 640
 vae_type: transformer_hidden
 vae_intermediate_size: 1920
@@ -42,7 +42,7 @@ lambda_vae_recon: 0.5
 #  9c3962cc7a3b5e6129053ba5da235a0296b6c795/model.safetensors). warm_start_from() re-prints that
 # digest at startup -- check the LOG, not this comment. `vae_dir` above only CONSTRUCTS the VAE
 # module; its weights are then overwritten from init_from, which carries the jointly-trained VAE.
-init_from: /home/shadeform/chained-flow/out/flow/ckpts/tree-vae-joint-4bx-640-k8-l8
+init_from: /home/shadeform/chain-flow/out/flow/ckpts/tree-vae-joint-4bx-640-k8-l8
 
 dataset_path: data/flow_cache/stage1_4btr_mix_k4
 dataset_split: train

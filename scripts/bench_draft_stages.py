@@ -119,13 +119,13 @@ def main():
         if name in d.__dict__:
             del d.__dict__[name]
 
-    from chained_flow.vllm_plugin import fused
+    from chain_flow.vllm_plugin import fused
     fused.fuse_path_head(d)
     fused.compile_flow(d, mode="max-autotune-no-cudagraphs")
 
     # CONFIRM the fused CUDA block stack actually engages (a shape gate returning None made
     # CF_CUDA_BLOCK a silent no-op at 9B/27B for hours).
-    from chained_flow import cuda_block as _cb
+    from chain_flow import cuda_block as _cb
     _ex = next(iter(d._chunk_experts()))
     _S = dcfg.chunk_size
     _x = torch.randn(1, _S, dcfg.latent_size, device=dev, dtype=dtype)
@@ -155,7 +155,7 @@ def main():
     emb_row = H * 2
     enc_b = nbytes(d.vae.encoder_in, d.vae.encoder, d.vae.encoder_norm, d.vae.mu)
     dec_b = nbytes(d.vae.decoder_in, d.vae.decoder, d.vae.decoder_norm, d.vae.decoder_out)
-    from chained_flow import cuda_block
+    from chain_flow import cuda_block
     lay = cuda_block.Layout(dcfg.latent_size, dcfg.ffn_multiplier)
     passes = d.num_chunks * dcfg.num_drafter_layers * dcfg.num_flow_steps
     flow_b = lay.wstride * 2 * passes

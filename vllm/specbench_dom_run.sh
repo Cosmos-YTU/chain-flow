@@ -13,7 +13,7 @@ ARM=${2:?arm}
 GPU=${3:?gpu}
 PORT=${4:?port}
 
-ROOT=/home/shadeform/chained-flow
+ROOT=/home/shadeform/chain-flow
 OUT=$ROOT/logs/specbench_dom/${SIZE}_${ARM}
 DATA=$ROOT/logs/specbench_dom/data
 GL=/home/shadeform/specbench-venv/bin/guidellm
@@ -37,7 +37,7 @@ if ! curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then
   exit 1
 fi
 echo "[dom] server ready"
-grep -m1 "chained-flow] drafter=" "$SERVER_LOG" | tee "$OUT/drafter_hash.txt"
+grep -m1 "chain-flow] drafter=" "$SERVER_LOG" | tee "$OUT/drafter_hash.txt"
 
 # Teardown is by PID, never pkill (a broad pkill has killed unrelated jobs here).
 SERVE_PIDS=$(pgrep -f "vllm serve .*--port ${PORT}" | tr '\n' ' ')

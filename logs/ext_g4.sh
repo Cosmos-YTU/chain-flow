@@ -3,7 +3,7 @@
 # already done, and the original single gate for the whole of wave 1 would have left this GPU
 # idle for ~1h waiting on GPU 3's multiturn+toolcall. Per-GPU gating reclaims that hour.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 

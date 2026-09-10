@@ -176,7 +176,7 @@ async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://localhost:8000")
     ap.add_argument("--model", required=True)
-    ap.add_argument("--data", default="/home/shadeform/chained-flow/logs/specbench/data/"
+    ap.add_argument("--data", default="/home/shadeform/chain-flow/logs/specbench/data/"
                                       "subset_fixed256.jsonl")
     ap.add_argument("--concurrency", default="1,2,4,8,16",
                     help="comma list; one measured phase each, in order")

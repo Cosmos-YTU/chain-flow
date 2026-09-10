@@ -1,6 +1,6 @@
 #!/bin/bash
 # Phase 3: the two arms that need re-running, plus the A/B that says the guard is inert.
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 
 # The chain arm at batch 1 with the guard OFF. Both halves of the guard are provably unreachable
 # here (padding needs a non-empty running batch; truncation needs max_model_len), so this pair

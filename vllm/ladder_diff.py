@@ -33,7 +33,7 @@ import json
 import os
 import sys
 
-ROOT = "/home/shadeform/chained-flow/logs/bench_serve"
+ROOT = "/home/shadeform/chain-flow/logs/bench_serve"
 
 
 def texts(size: str, tag: str, c: int) -> list[str] | None:

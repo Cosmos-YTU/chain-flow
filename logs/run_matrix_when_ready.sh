@@ -2,7 +2,7 @@
 # Waits for BOTH the sweep (GPU 3) and the OOD collection (GPU 4) to release their GPUs, then runs
 # the final two-finalist matrix at per_domain 400 across both cards.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 until grep -q "SWEEP DONE" logs/eval_after_train.log 2>/dev/null; do sleep 60; done
 echo "sweep released GPU 3 at $(date -u)"
 until grep -q "OOD COLLECT DONE" logs/collect_tr_ood.log 2>/dev/null; do sleep 30; done

@@ -11,9 +11,9 @@ import os, sys, torch
 os.environ.setdefault("CF_COMPILE", "0")   # math is tested compile-free; CF_COMPILE=1 also works
 torch.manual_seed(0)
 
-from chained_flow.training.train_tree_flow import TreeFlowTrainingModule
-from chained_flow.drafters.tree_vae_flow import TreeVAEFlowConfig
-from chained_flow.training.train_chunked_flow import FlowLossArguments
+from chain_flow.training.train_tree_flow import TreeFlowTrainingModule
+from chain_flow.drafters.tree_vae_flow import TreeVAEFlowConfig
+from chain_flow.training.train_chunked_flow import FlowLossArguments
 
 V, H = 131, 32
 class _Cfg:
@@ -82,7 +82,7 @@ print("  ALL COMPONENTS + GRADS MATCH" if ok else "  !! MISMATCH")
 # parameters while printing success. Compiling the bound method avoids it; this asserts that.
 os.environ["CF_COMPILE"] = "1"
 import importlib
-import chained_flow.training.train_tree_flow as T
+import chain_flow.training.train_tree_flow as T
 importlib.reload(T)
 torch.manual_seed(1234)
 m = T.TreeFlowTrainingModule(_Frozen(), dcfg, loss_cfg).float()

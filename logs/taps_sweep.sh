@@ -1,5 +1,5 @@
 #!/bin/bash
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python; ED=/tmp/eval-4b-full
 for DOM in math_reasoning writing; do

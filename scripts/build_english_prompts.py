@@ -41,7 +41,7 @@ def main() -> int:
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
-    from chained_flow.training.collect_teacher import select_formatter
+    from chain_flow.training.collect_teacher import select_formatter
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
 

@@ -91,7 +91,7 @@ def main():
     shutil.copy(CKD / "chained_flow_tree_config.json", STAGE)
     (STAGE / "vae").mkdir()
     shutil.copy(VAE / "model.safetensors", STAGE / "vae")
-    vcfg = VAE / "chained_flow_vae_config.json"
+    vcfg = VAE / "chain_flow_vae_config.json"
     if vcfg.exists():
         shutil.copy(vcfg, STAGE / "vae")
     (STAGE / "README.md").write_text(card())

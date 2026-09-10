@@ -16,12 +16,12 @@ SIZE=${1:?size}
 MAXTOK=${2:-256}
 GPU=${CF_GPU:-6}
 PY=${CF_PY:-/home/shadeform/vllm-pristine/.venv/bin/python}
-OUT=${CF_OUT:-/home/shadeform/chained-flow/logs/forkfree}
+OUT=${CF_OUT:-/home/shadeform/chain-flow/logs/forkfree}
 mkdir -p "$OUT"
 
 # CF_SHORTLIST IS DELIBERATELY NOT SET HERE ANY MORE.
 #
-# It used to be, pointing at /home/shadeform/chained-flow/out/flow/shortlist_q3527b.pt, because
+# It used to be, pointing at /home/shadeform/chain-flow/out/flow/shortlist_q3527b.pt, because
 # the published drafters did not ship a shortlist and without one the drafter scores the full
 # 248k-row lm_head at every depth. That made this script -- the one whose entire purpose is to
 # validate the FORK-FREE, INSTALLED-FROM-A-WHEEL path -- the only place the shortlist existed:
@@ -36,7 +36,7 @@ run () {
   local log="$OUT/${SIZE}_${tag}.log"
   echo "=== $SIZE $tag -> $log"
   env "$@" CF_GPU="$GPU" CF_PY="$PY" CF_MAXTOK="$MAXTOK" \
-      /home/shadeform/chained-flow/vllm/bench_cf.sh "$SIZE" "$arm" "_${SIZE}_${tag}" \
+      /home/shadeform/chain-flow/vllm/bench_cf.sh "$SIZE" "$arm" "_${SIZE}_${tag}" \
       > "$log" 2>&1 || { echo "FAILED: $tag (see $log)"; tail -30 "$log"; return 1; }
   # The two facts that decide whether the run means anything, pulled out of a 3000-line log.
   grep -hE "Asynchronous scheduling is|\[cf-plugin\]|\[cf-defaults\] ON:" "$log" | tail -3

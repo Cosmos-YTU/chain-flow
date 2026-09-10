@@ -3,7 +3,7 @@ import json
 import pytest
 import torch
 
-from chained_flow.training.eval_chunked_flow import (
+from chain_flow.training.eval_chunked_flow import (
     ChunkedFlowEvalArguments,
     checkpoint_eval_output_path,
     dataset_eval_slug,
@@ -16,8 +16,8 @@ from chained_flow.training.eval_chunked_flow import (
     summarize_metric,
     torch_dtype_from_string,
 )
-from chained_flow.training.train_chunked_flow import ChunkedFlowModelArguments, FlowLossArguments, SingleExpertFlowTrainingModule
-from chained_flow.vae import HiddenVAEConfig, build_hidden_vae
+from chain_flow.training.train_chunked_flow import ChunkedFlowModelArguments, FlowLossArguments, SingleExpertFlowTrainingModule
+from chain_flow.vae import HiddenVAEConfig, build_hidden_vae
 
 
 def write_vae_checkpoint(path, *, hidden_size=8, latent_size=3, intermediate_size=5):
@@ -33,7 +33,7 @@ def write_vae_checkpoint(path, *, hidden_size=8, latent_size=3, intermediate_siz
         "loss_args": {},
         "data_args": {},
     }
-    (path / "chained_flow_vae_config.json").write_text(json.dumps(config), encoding="utf-8")
+    (path / "chain_flow_vae_config.json").write_text(json.dumps(config), encoding="utf-8")
     vae = build_hidden_vae(
         "mlp",
         HiddenVAEConfig(hidden_size=hidden_size, latent_size=latent_size, intermediate_size=intermediate_size),
@@ -59,9 +59,9 @@ def write_flow_checkpoint(path, fake_wrapper, vae_dir):
         "data_args": {},
         "loss_args": vars(FlowLossArguments()),
     }
-    (path / "chained_flow_chunked_flow_config.json").write_text(json.dumps(config), encoding="utf-8")
+    (path / "chain_flow_chunked_flow_config.json").write_text(json.dumps(config), encoding="utf-8")
     module = SingleExpertFlowTrainingModule(fake_wrapper, __import__(
-        "chained_flow.training.train_chunked_flow",
+        "chain_flow.training.train_chunked_flow",
         fromlist=["flow_config_from_args"],
     ).flow_config_from_args(model_args), FlowLossArguments())
     torch.save(module.state_dict(), path / "pytorch_model.bin")
@@ -129,7 +129,7 @@ def test_find_flow_config_dir_uses_parent_for_trainer_checkpoint(tmp_path):
     run_dir = tmp_path / "run"
     checkpoint_dir = run_dir / "checkpoint-20"
     checkpoint_dir.mkdir(parents=True)
-    (run_dir / "chained_flow_chunked_flow_config.json").write_text("{}", encoding="utf-8")
+    (run_dir / "chain_flow_chunked_flow_config.json").write_text("{}", encoding="utf-8")
 
     assert find_flow_config_dir(checkpoint_dir) == run_dir
 

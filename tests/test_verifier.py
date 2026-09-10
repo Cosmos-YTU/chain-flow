@@ -1,6 +1,6 @@
 import torch
 
-from chained_flow.verifier import SpeculativeVerifier
+from chain_flow.verifier import SpeculativeVerifier
 
 
 def test_verifier_accepts_matching_prefix_and_crops_cache(fake_wrapper):

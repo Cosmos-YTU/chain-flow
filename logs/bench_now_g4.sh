@@ -9,7 +9,7 @@
 # Writes to logs/bench_after_ext.log because logs/train_tr27b.sh gates on the string
 # "BENCH DONE" appearing in THAT file. Keep both in sync if either moves.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 

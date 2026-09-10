@@ -24,17 +24,17 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from chained_flow.context import ChainedFlowContext
-from chained_flow.frozen_lm import DEFAULT_MODEL_ID, FrozenLMWrapper
-from chained_flow.generation import generate_with_drafter
-from chained_flow.training.eval_chunked_flow import (
+from chain_flow.context import ChainedFlowContext
+from chain_flow.frozen_lm import DEFAULT_MODEL_ID, FrozenLMWrapper
+from chain_flow.generation import generate_with_drafter
+from chain_flow.training.eval_chunked_flow import (
     collect_speedup_prompts,
     generate_greedy_baseline,
     torch_dtype_from_string,
 )
-from chained_flow.training.train_tree_flow import load_tree_module
-from chained_flow.training.train_eagle_flow import load_eagle_module
-from chained_flow.training.window_dataset import TeacherWindowDataset
+from chain_flow.training.train_tree_flow import load_tree_module
+from chain_flow.training.train_eagle_flow import load_eagle_module
+from chain_flow.training.window_dataset import TeacherWindowDataset
 
 
 def _sync(dev):
@@ -129,7 +129,7 @@ def main():
     def verify_block(n):
         vs = copy.deepcopy(state.past_key_values)
         toks = torch.zeros((1, n), dtype=torch.long, device=dev)
-        from chained_flow.frozen_lm import LMState
+        from chain_flow.frozen_lm import LMState
         s2 = LMState(input_ids=state.input_ids, past_key_values=vs, final_hidden=state.final_hidden,
                      logits=state.logits, position=state.position)
         frozen_lm.forward_with_cache(toks, s2, use_cache=True)

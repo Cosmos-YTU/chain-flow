@@ -8,7 +8,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from transformers import HfArgumentParser, TrainingArguments
 
-from chained_flow.training.train_vae import (
+from chain_flow.training.train_vae import (
     VAEDataArguments,
     VAELossArguments,
     VAEModelArguments,

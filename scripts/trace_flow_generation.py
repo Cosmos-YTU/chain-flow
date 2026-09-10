@@ -12,13 +12,13 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from chained_flow.context import ChainedFlowContext
-from chained_flow.frozen_lm import DEFAULT_MODEL_ID
-from chained_flow.training.eval_chunked_flow import load_flow_training_module, torch_dtype_from_string
-from chained_flow.training.train_chunked_flow import ChunkedFlowModelArguments
-from chained_flow.training.eval_chunked_flow import find_flow_config_dir
-from chained_flow.training.window_dataset import FlowWindowCacheDataset, TeacherWindowDataset
-from chained_flow.verifier import SpeculativeVerifier
+from chain_flow.context import ChainedFlowContext
+from chain_flow.frozen_lm import DEFAULT_MODEL_ID
+from chain_flow.training.eval_chunked_flow import load_flow_training_module, torch_dtype_from_string
+from chain_flow.training.train_chunked_flow import ChunkedFlowModelArguments
+from chain_flow.training.eval_chunked_flow import find_flow_config_dir
+from chain_flow.training.window_dataset import FlowWindowCacheDataset, TeacherWindowDataset
+from chain_flow.verifier import SpeculativeVerifier
 
 
 def parse_args() -> argparse.Namespace:
@@ -102,7 +102,7 @@ def render_prompt(frozen_lm, prompt: str, *, chat_template: bool) -> str:
 
 def load_model_args(flow_dir: str | Path) -> ChunkedFlowModelArguments:
     config_dir = find_flow_config_dir(flow_dir)
-    with (config_dir / "chained_flow_chunked_flow_config.json").open("r", encoding="utf-8") as f:
+    with (config_dir / "chain_flow_chunked_flow_config.json").open("r", encoding="utf-8") as f:
         config = json.load(f)
     return ChunkedFlowModelArguments(**config["model_args"])
 

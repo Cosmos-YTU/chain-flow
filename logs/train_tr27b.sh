@@ -9,7 +9,7 @@
 # The intermediate `teacher_states/stage1-tr27b-mix` merge is also gone: it was a full 136 GB
 # copy of data that the per-shard caches already represent, and nothing downstream reads it.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 

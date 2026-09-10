@@ -2,7 +2,7 @@
 # Per-window (row, accepted_len) dumps for the plugin arm on the TRO corpora, one per ladder
 # candidate. Feeds the PAIRED bootstrap that derives the selection floor.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 CK=out/flow/ckpts/tree-vae-joint-tr27b-1024-k8-l8

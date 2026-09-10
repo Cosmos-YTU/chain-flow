@@ -5,7 +5,7 @@ End-to-end from a clean clone. Assumes CUDA 13 and, for the batch shapes below, 
 ## 1. Environment
 
 ```bash
-git clone https://github.com/Zeuss5/chained-flow && cd chained-flow
+git clone https://github.com/Zeuss5/chain-flow && cd chain-flow
 uv venv --python 3.12
 uv pip install -r requirements.txt
 export PYTHONPATH=src
@@ -15,7 +15,7 @@ export PYTHONPATH=src
 accept numbers measured under one environment, and a torch or transformers minor bump moves accept
 by more than the effects we routinely act on. **vLLM is not in it**: training imports it nowhere,
 and installing it drags in a second torch pin. Serve from a separate venv (`uv pip install
-chained-flow`, see README).
+chain-flow`, see README).
 
 ## 2. Data
 

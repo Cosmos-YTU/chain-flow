@@ -15,7 +15,7 @@ import argparse
 import torch
 import torch.nn.functional as F
 
-from chained_flow.training.fused_head import (accept_from, ce_from, coverage_from, head_reductions)
+from chain_flow.training.fused_head import (accept_from, ce_from, coverage_from, head_reductions)
 
 
 def reference(hidden, W, bias, emb, w2, tok, cov_b, margin, gamma, eps):

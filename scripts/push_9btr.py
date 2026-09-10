@@ -84,7 +84,7 @@ The English cost is bought with a 25%-of-tokens English replay slice in the trai
 ## The shortlist is half the result -- do not drop it
 
 The drafter's candidate head scores a **shortlist** of the 248,320-token vocabulary rather than the
-full `lm_head`. The list that ships inside `chained-flow` was built from English-weighted corpora and
+full `lm_head`. The list that ships inside `chain-flow` was built from English-weighted corpora and
 covers only **{sl['tr_coverage_shipped_list']:.1f}%** of held-out Turkish tokens against
 **{sl['en_coverage']:.0f}%** of English -- the most frequent Turkish morphemes (`'ın'`, `' için'`,
 `' veya'`, `'ş'`) are simply **not in it**, so the drafter cannot propose them however well it is trained.
@@ -106,7 +106,7 @@ Turkish is not being clipped by the shortlist yet.
 head, {sl['reduction']:.2f}x less head traffic), covering {sl['tr_coverage_this_list']:.2f}% of Turkish and
 {sl['en_coverage']:.0f}% of English -- it costs English nothing
 ({sl['english_plugin_tree']['turkish_list']:.2f} with it vs {sl['english_plugin_tree']['full_head']:.2f} on the
-full head). `chained-flow` picks up a `shortlist.pt` next to the checkpoint automatically, no env var.
+full head). `chain-flow` picks up a `shortlist.pt` next to the checkpoint automatically, no env var.
 
 ## Training
 
@@ -161,7 +161,7 @@ def main() -> None:
     shutil.copy(SHORTLIST, STAGE / "shortlist.pt")
     (STAGE / "vae").mkdir()
     shutil.copy(VAE / "model.safetensors", STAGE / "vae")
-    vcfg = VAE / "chained_flow_vae_config.json"
+    vcfg = VAE / "chain_flow_vae_config.json"
     if vcfg.exists():
         shutil.copy(vcfg, STAGE / "vae")
     (STAGE / "README.md").write_text(card(r))

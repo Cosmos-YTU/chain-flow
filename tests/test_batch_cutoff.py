@@ -10,7 +10,7 @@ The boundary tests need no vLLM.  The patch test does, and skips without it.
 """
 import pytest
 
-from chained_flow.vllm_plugin import batch_cutoff
+from chain_flow.vllm_plugin import batch_cutoff
 
 
 @pytest.mark.parametrize("n,nreq,cut", [
@@ -26,7 +26,7 @@ def test_boundary(monkeypatch, n, nreq, cut):
 
 
 def test_bad_value_does_not_take_the_engine_down(monkeypatch):
-    """This is read in every vLLM process that merely has chained-flow installed."""
+    """This is read in every vLLM process that merely has chain-flow installed."""
     monkeypatch.setenv("CF_SPEC_MAX_BATCH", "not-a-number")
     assert batch_cutoff.max_batch() == 0
     assert batch_cutoff.should_cut(1000) is False
@@ -420,7 +420,7 @@ def test_the_token_budget_half_errs_towards_dropping_spec(monkeypatch):
 
 
 def test_a_non_speculative_engine_is_untouched(monkeypatch):
-    """This runs in every vLLM process that merely has chained-flow installed."""
+    """This runs in every vLLM process that merely has chain-flow installed."""
     spec = [-1] * 40
     r = _FakeRequest(num_tokens=9999, spec=spec, computed=9999)
     cls = _guarded(monkeypatch, num_spec_tokens=0)

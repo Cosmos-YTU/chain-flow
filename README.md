@@ -1,4 +1,4 @@
-# chained-flow
+# chain-flow
 
 A flow-matching **hidden-state drafter** for lossless speculative decoding in vLLM.
 Instead of a second transformer, the drafter integrates a small conditional flow
@@ -16,12 +16,12 @@ two environments separate avoids a second torch pin.
 ## Install
 
 ```bash
-pip install chained-flow          # pulls vllm==0.25.*
+pip install chain-flow          # pulls vllm==0.25.*
 ```
 
 That is the **default build: fork-free**. It runs the *chain* path on unmodified
 vLLM and needs no patching. The install registers a `vllm.general_plugins` entry
-point ([`chained_flow/vllm_plugin/async_guard.py`](https://github.com/Zeuss5/chained-flow/blob/main/src/chained_flow/vllm_plugin/async_guard.py))
+point ([`chain_flow/vllm_plugin/async_guard.py`](https://github.com/Zeuss5/chain-flow/blob/main/src/chain_flow/vllm_plugin/async_guard.py))
 that relaxes one guard so a `custom_class` proposer is allowed to keep vLLM's
 async scheduling, which vLLM otherwise hands to the baseline and denies to us.
 Measured worth on the chain arm: **+6.1% at 4B**. That is why the install has to
@@ -40,13 +40,13 @@ How that number was taken, and the two baseline mistakes that have corrupted it
 before, are in the benchmarking protocol. It ships in the wheel:
 
 ```bash
-chained-flow docs        # docs/BENCHMARKING.md — read it before quoting any speedup
+chain-flow docs        # docs/BENCHMARKING.md — read it before quoting any speedup
 ```
 
 Check what you got:
 
 ```bash
-chained-flow info
+chain-flow info
 ```
 
 It prints the vLLM build in use, whether the async guard was relaxed, whether the
@@ -80,7 +80,7 @@ def main():
         dtype="float16",
         speculative_config={
             "method": "custom_class",
-            "model": "chained_flow.vllm_plugin.flow_proposer.FlowDrafterProposer",
+            "model": "chain_flow.vllm_plugin.flow_proposer.FlowDrafterProposer",
             "num_speculative_tokens": 5,
         },
     )
@@ -107,7 +107,7 @@ are proposed, each gate is evaluated against the real process (does the CUDA
 extension build? does the drafter's shape fit the kernel? was the shortlist built
 for this vocabulary? did the engine actually enable async scheduling?), and the
 resolved state of all of them is printed on one `[cf-defaults]` line at startup.
-See [`defaults.py`](https://github.com/Zeuss5/chained-flow/blob/main/src/chained_flow/defaults.py).
+See [`defaults.py`](https://github.com/Zeuss5/chain-flow/blob/main/src/chain_flow/defaults.py).
 A flag that could not engage says so; nothing here fails silently.
 
 ### First run is slow, and only some of that is ours
@@ -121,12 +121,12 @@ A flag that could not engage says so; nothing here fails silently.
   pip install flashinfer-jit-cache --extra-index-url https://flashinfer.ai/whl/cu130/   # match your CUDA
   ```
 
-* **our fused CUDA kernel** JIT-compiles once (~60 s) — `chained-flow build-kernel`
+* **our fused CUDA kernel** JIT-compiles once (~60 s) — `chain-flow build-kernel`
   precompiles it, see [CUDA kernel](#cuda-kernel).
 * **`CF_COMPILE`** (default on) `torch.compile`s the drafter's flow net on the
   first draft; worth 9.79 → 5.26 ms per draft at 27B.
 
-`chained-flow info` tells you which of these are still pending.
+`chain-flow info` tells you which of these are still pending.
 
 ### The shortlist
 
@@ -145,7 +145,7 @@ You only touch this for a vocabulary we do not ship one for:
 
 * the packaged list is **refused, loudly, on a vocab-size mismatch** — it falls
   back to the full head rather than silently indexing the wrong tokens;
-* `chained-flow build-shortlist --tokenizer <model> --vocab-size <lm_head rows> --ids '<glob>.pt' --jsonl '<glob>.jsonl'`
+* `chain-flow build-shortlist --tokenizer <model> --vocab-size <lm_head rows> --ids '<glob>.pt' --jsonl '<glob>.jsonl'`
   builds one. Pass `--vocab-size` explicitly: the guard compares it against the
   model's `lm_head`, and a tokenizer under-reports whenever that head is padded
   (Qwen3.5: 248,044 vs 248,320);
@@ -176,10 +176,10 @@ and attention, and a KV/state hand-off none of which upstream exposes). One
 command, on the vLLM of the interpreter you run it with:
 
 ```bash
-chained-flow tree-patch                # what it would touch, and the current state
-chained-flow tree-patch --apply        # patch this environment's vLLM
-chained-flow tree-patch --status       # is it applied? is every other file still stock?
-chained-flow tree-patch --revert       # restore it byte-identically
+chain-flow tree-patch                # what it would touch, and the current state
+chain-flow tree-patch --apply        # patch this environment's vLLM
+chain-flow tree-patch --status       # is it applied? is every other file still stock?
+chain-flow tree-patch --revert       # restore it byte-identically
 ```
 
 `--apply` and `--revert` both take `--dry-run`, which stages and verifies the
@@ -206,12 +206,12 @@ not raise — it drafts wrongly, at full speed**:
 * re-running `--apply` on an already-patched install says so and exits 0.
 
 `--status` exits 0 applied / 1 not applied / 3 inconsistent, so it is usable in
-a script. `chained-flow tree-patch --show` prints the patch file's path and the
+a script. `chain-flow tree-patch --show` prints the patch file's path and the
 manual `patch -p1` route, for patching a *different* interpreter's vLLM.
 
 Then run with `VLLM_SPEC_TREE=1`, `CF_TREE_KEEP` × `CF_TREE_DEPTH` nodes, and
 `num_speculative_tokens = CF_TREE_KEEP*CF_TREE_DEPTH + 1` (the extra column is a
-spare mamba-state slot, never an emitted token). `chained-flow info` reports
+spare mamba-state slot, never an emitted token). `chain-flow info` reports
 `vLLM build : FORKED` once the patch is in, and the `[cf-defaults]` line lists
 `gdn_defer gdn_bv tree_fused_attn tree_fullcg` under **ON**; without the patch
 those flags report `fork_missing` and are **not offered** rather than silently
@@ -230,7 +230,7 @@ takes ~60 s once per machine, and is then cached in
 not want that stall inside your first engine start:
 
 ```bash
-chained-flow build-kernel
+chain-flow build-kernel
 ```
 
 If the toolchain is missing or the drafter's shape is not one the kernel is
@@ -239,8 +239,8 @@ instantiated for, it falls back to the **bit-identical** PyTorch block stack
 
 ## Benchmarking
 
-**Before quoting any speedup, read the benchmarking protocol** — `chained-flow docs`,
-or [docs/BENCHMARKING.md](https://github.com/Zeuss5/chained-flow/blob/main/docs/BENCHMARKING.md).
+**Before quoting any speedup, read the benchmarking protocol** — `chain-flow docs`,
+or [docs/BENCHMARKING.md](https://github.com/Zeuss5/chain-flow/blob/main/docs/BENCHMARKING.md).
 The baseline is where this project has been wrong before.
 
 **`vllm serve` is the measurement path**; the offline harness is the regression gate.

@@ -8,7 +8,7 @@
 # costs nothing extra and cannot drift from the number it is reported next to.
 set -uo pipefail
 GPU=${1:?gpu}; SIZE=${2:?size}; ARM=${3:?arm}; REP=${4:?repeat}; EXTRA=${5:-}
-ROOT=/home/shadeform/chained-flow
+ROOT=/home/shadeform/chain-flow
 TAG="_cnd${EXTRA}_${SIZE}_${ARM}_r${REP}"
 LOG=$ROOT/logs/cnd/${SIZE}_${ARM}${EXTRA}_r${REP}.log
 mkdir -p "$ROOT/logs/cnd"

@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from chained_flow.training.vae_losses import HiddenVAELossConfig, compute_hidden_vae_loss, latent_kl_loss
+from chain_flow.training.vae_losses import HiddenVAELossConfig, compute_hidden_vae_loss, latent_kl_loss
 
 
 def test_hidden_vae_loss_zero_reconstruction_has_only_kl():

@@ -12,7 +12,7 @@
 # Holdout first (301 rows, ~8 min): it is the accept gate for everything downstream, so it is
 # cheapest to de-risk it before committing hours to the training mix.
 set -uo pipefail
-cd /home/shadeform/chained-flow
+cd /home/shadeform/chain-flow
 export PYTHONPATH=src HF_HUB_ENABLE_HF_TRANSFER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=.venv/bin/python
 say(){ echo "[$(date -u +%H:%M:%S)] $* df=$(df -h / | awk 'NR==2{print $4}')"; }
