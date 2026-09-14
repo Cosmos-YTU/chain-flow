@@ -5,7 +5,7 @@ End-to-end from a clean clone. Assumes CUDA 13 and, for the batch shapes below, 
 ## 1. Environment
 
 ```bash
-git clone https://github.com/Zeuss5/chain-flow && cd chain-flow
+git clone https://github.com/Cosmos-YTU/chain-flow && cd chain-flow
 uv venv --python 3.12
 uv pip install -r requirements.txt
 export PYTHONPATH=src

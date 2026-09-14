@@ -21,7 +21,7 @@ pip install chain-flow          # pulls vllm==0.25.*
 
 That is the **default build: fork-free**. It runs the *chain* path on unmodified
 vLLM and needs no patching. The install registers a `vllm.general_plugins` entry
-point ([`chain_flow/vllm_plugin/async_guard.py`](https://github.com/Zeuss5/chain-flow/blob/main/src/chain_flow/vllm_plugin/async_guard.py))
+point ([`chain_flow/vllm_plugin/async_guard.py`](https://github.com/Cosmos-YTU/chain-flow/blob/main/src/chain_flow/vllm_plugin/async_guard.py))
 that relaxes one guard so a `custom_class` proposer is allowed to keep vLLM's
 async scheduling, which vLLM otherwise hands to the baseline and denies to us.
 Measured worth on the chain arm: **+6.1% at 4B**. That is why the install has to
@@ -107,7 +107,7 @@ are proposed, each gate is evaluated against the real process (does the CUDA
 extension build? does the drafter's shape fit the kernel? was the shortlist built
 for this vocabulary? did the engine actually enable async scheduling?), and the
 resolved state of all of them is printed on one `[cf-defaults]` line at startup.
-See [`defaults.py`](https://github.com/Zeuss5/chain-flow/blob/main/src/chain_flow/defaults.py).
+See [`defaults.py`](https://github.com/Cosmos-YTU/chain-flow/blob/main/src/chain_flow/defaults.py).
 A flag that could not engage says so; nothing here fails silently.
 
 ### First run is slow, and only some of that is ours
@@ -240,7 +240,7 @@ instantiated for, it falls back to the **bit-identical** PyTorch block stack
 ## Benchmarking
 
 **Before quoting any speedup, read the benchmarking protocol** — `chain-flow docs`,
-or [docs/BENCHMARKING.md](https://github.com/Zeuss5/chain-flow/blob/main/docs/BENCHMARKING.md).
+or [docs/BENCHMARKING.md](https://github.com/Cosmos-YTU/chain-flow/blob/main/docs/BENCHMARKING.md).
 The baseline is where this project has been wrong before.
 
 **`vllm serve` is the measurement path**; the offline harness is the regression gate.

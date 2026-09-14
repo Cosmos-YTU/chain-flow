@@ -63,8 +63,8 @@ train = [
 dev = ["pytest>=8.0.0"]
 
 [project.urls]
-Homepage = "https://github.com/Zeuss5/chain-flow"
-Repository = "https://github.com/Zeuss5/chain-flow"
+Homepage = "https://github.com/Cosmos-YTU/chain-flow"
+Repository = "https://github.com/Cosmos-YTU/chain-flow"
 
 [project.scripts]
 # `chain-flow info` prints the resolved flag table, the vLLM build in use, whether the async
