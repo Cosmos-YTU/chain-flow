@@ -39,7 +39,10 @@ GITHUB = "Cosmos-YTU/chain-flow"   # the public code repo the cards should point
 # path. EXCEPT for one token: `chained_flow_tree_config.json` is a REAL FILE inside every
 # published checkpoint (the loader opens it by that name), so it survives the rename. Every card
 # names it in its Files section -- rewriting it would document a file that does not exist.
-_KEEP = ["chained_flow_tree_config"]
+# Immutable identifiers that must survive the chained-flow -> chain-flow rename:
+#   chained_flow_tree_config  - a REAL FILE inside every checkpoint; the loader opens it by name
+#   chained-flow-drafters-... - the Hugging Face COLLECTION slug; renaming it 404s the link
+_KEEP = ["chained_flow_tree_config", "chained-flow-drafters"]
 _PKG_RENAMES = [("chained_flow", "chain_flow"), ("chained-flow", "chain-flow")]
 
 # (source repo on selimaktas/, published name, repo_type)
@@ -105,7 +108,12 @@ def rewrite_cards(root: str, verbose: bool = True) -> int:
     dangling: set[str] = set()
     for dirpath, _, files in os.walk(root):
         for f in files:
-            if not f.endswith((".md", ".json", ".yaml", ".yml")):
+            # MARKDOWN ONLY. Rewriting is a DOCUMENTATION edit, and the config/JSON files in a
+            # checkpoint are DATA. A previous version also walked .json and rewrote
+            # chained_flow_tree_config.json's `vae_dir` / `init_from` -- local training paths
+            # that record where the weights actually came from. Editing those does not help a
+            # user (the paths are on our box either way) and falsifies the provenance.
+            if not f.endswith(".md"):
                 continue
             p = os.path.join(dirpath, f)
             try:
