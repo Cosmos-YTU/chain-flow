@@ -31,7 +31,16 @@ import re
 import sys
 import tempfile
 
-ORG = "ytu-ce-cosmos"
+ORG = "ytu-ce-cosmos"          # the Hugging Face org (NOT a GitHub org)
+GITHUB = "Cosmos-YTU/chain-flow"   # the public code repo the cards should point at
+
+# The project renamed chained-flow -> chain-flow, and the public GitHub is the chain-flow one, so
+# a card published from here must tell users `pip install chain-flow` and the chain_flow module
+# path. EXCEPT for one token: `chained_flow_tree_config.json` is a REAL FILE inside every
+# published checkpoint (the loader opens it by that name), so it survives the rename. Every card
+# names it in its Files section -- rewriting it would document a file that does not exist.
+_KEEP = ["chained_flow_tree_config"]
+_PKG_RENAMES = [("chained_flow", "chain_flow"), ("chained-flow", "chain-flow")]
 
 # (source repo on selimaktas/, published name, repo_type)
 PLAN: list[tuple[str, str, str]] = [
@@ -67,6 +76,30 @@ def dangling_refs(text: str) -> set[str]:
     return set(re.findall(r"selimaktas/[A-Za-z0-9._-]+", text))
 
 
+def rewrite_text(text: str) -> str:
+    """Repo renames + the project rename, with the checkpoint config filename protected."""
+    for i, k in enumerate(_KEEP):
+        text = text.replace(k, f"\x00KEEP{i}\x00")
+    for src, dst in _rewrites():
+        text = text.replace(src, dst)
+    # Bare model names in LINK TEXT and prose, e.g. "warm-started from Flow-Drafter-4B-v2".
+    # Without this the URL says .../Flow-Drafter-Qwen3.5-4B while the visible text still reads
+    # "-v2", naming a repo that does not exist under this org. Longest-first for the same
+    # prefix reason as _rewrites(); only names we actually publish are rewritten, so the
+    # unpublished v1 drafters keep their real names.
+    for src, dst, _k in sorted(PLAN, key=lambda t: -len(t[0])):
+        bare = src.split("/", 1)[1]
+        if bare != dst:
+            text = text.replace(bare, dst)
+    for src, dst in _PKG_RENAMES:
+        text = text.replace(src, dst)
+    # Point cards at the public code repo rather than whatever private/renamed remote they cite.
+    text = re.sub(r"github\.com/[A-Za-z0-9._-]+/chain-flow", f"github.com/{GITHUB}", text)
+    for i, k in enumerate(_KEEP):
+        text = text.replace(f"\x00KEEP{i}\x00", k)
+    return text
+
+
 def rewrite_cards(root: str, verbose: bool = True) -> int:
     n = 0
     dangling: set[str] = set()
@@ -79,9 +112,7 @@ def rewrite_cards(root: str, verbose: bool = True) -> int:
                 s = open(p, encoding="utf-8").read()
             except (UnicodeDecodeError, OSError):
                 continue
-            out = s
-            for src, dst in _rewrites():
-                out = out.replace(src, dst)
+            out = rewrite_text(s)
             if out != s:
                 open(p, "w", encoding="utf-8").write(out)
                 n += 1
@@ -124,6 +155,9 @@ def main() -> int:
               f"{', '.join(t[1] for t in PLAN)}")
         return 2
 
+    print(f"\n  cards will be rewritten to say:  pip install chain-flow  |  "
+          f"chain_flow.vllm_plugin...  |  github.com/{GITHUB}")
+    print(f"  preserved verbatim (real file in every checkpoint): chained_flow_tree_config.json")
     print(f"\n  {'source':<44}{'->':^4}{ORG + '/...':<32}{'type':>8}")
     for src, dst, kind in plan:
         exists = ""
