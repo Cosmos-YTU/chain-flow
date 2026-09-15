@@ -1,3 +1,1 @@
-from chain_flow.data.windows import TokenWindow, build_token_windows, teacher_hidden_span
-
-__all__ = ["TokenWindow", "build_token_windows", "teacher_hidden_span"]
+"""Packaged data assets (the vocabulary shortlist that ships in the wheel)."""

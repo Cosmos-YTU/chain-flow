@@ -96,8 +96,8 @@ where = ["src"]
 # has no checkout to find it in, and `chain-flow tree-patch` printing a path that does not
 # exist is the sort of documentation that is worse than none.
 #
-# `docs/BENCHMARKING.md` is a symlink to the repo's copy, so there is one source of truth and
-# the wheel gets the content. The README tells you to read it before quoting a speedup; a
+# `docs/BENCHMARKING.md` is a REAL FILE here, not a symlink to a repo-root copy: this package
+# ships without the research tree, so a symlink out of it would dangle in the wheel.
 # relative link in a PyPI long description goes nowhere, so `chain-flow docs` prints it.
 "chain_flow" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "patches/*.patch", "docs/*.md"]
 # THE SHORTLIST (250 KB, int32). It is keyed by TOKEN ID, so it is a property of the Qwen3.5

@@ -40,7 +40,7 @@ How that number was taken, and the two baseline mistakes that have corrupted it
 before, are in the benchmarking protocol. It ships in the wheel:
 
 ```bash
-chain-flow docs        # docs/BENCHMARKING.md — read it before quoting any speedup
+chain-flow docs        # BENCHMARKING.md — read it before quoting any speedup
 ```
 
 Check what you got:
@@ -239,69 +239,12 @@ instantiated for, it falls back to the **bit-identical** PyTorch block stack
 
 ## Benchmarking
 
-**Before quoting any speedup, read the benchmarking protocol** — `chain-flow docs`,
-or [docs/BENCHMARKING.md](https://github.com/Cosmos-YTU/chain-flow/blob/main/docs/BENCHMARKING.md).
-The baseline is where this project has been wrong before.
+Every speedup number for these drafters, with the exact conditions it was measured under, is in
+`BENCHMARKING.md` (shipped in the wheel -- run `chain-flow docs` for its path). Read it before
+quoting a figure: it records which are pooled, which are single-domain, and which are modelled.
 
-**`vllm serve` is the measurement path**; the offline harness is the regression gate.
-Wins in this repo are gated on a decode batch of 1 and disengage under continuous
-batching, so a batch-1 number is not a deployment number — see section 0 of the doc.
-
-```bash
-./vllm/bench_serve.sh 4b base 3 8601   # <size> <arm> <gpu> <port>; concurrency 1..16
-./vllm/bench_serve.sh 4b chain 3 8602  # over a real HTTP server, engine core in its own process
-./vllm/bench_serve_report.py           # the table
-./vllm/bench_serve_diff.py logs/bench_serve/4b_{base,chain}/serve_bench.json
-```
-
-```bash
-./vllm/bench_cf.sh 4b base            # batch-1 regression gate: baseline
-./vllm/bench_cf.sh 4b chain           # fork-free arm
-./vllm/bench_cf.sh 4b tree            # needs the patch
-./vllm/bench_forkfree.sh 4b 256       # all arms, both baselines, one run
-```
-
-`CF_PY=<venv>/bin/python` selects which vLLM to run against.
-`CF_BATCH_AUDIT=1` makes the proposer report the decode batch it is *actually* running
-at, which is the only way to tell whether the batch-1-gated flags engaged.
-`vllm/serve_ladder.sh` is `bench_serve.sh` for ladders past concurrency 16: per-level
-request counts, and it refuses to run on a GPU that has not finished draining (an engine
-that profiles against a busy GPU gets a silently tiny KV cache and then benchmarks its own
-admission queue).
-
-**Serving under concurrency: `CF_SPEC_MAX_BATCH` (default ON where the threshold is measured).**
-Speculation is a batch-1 win. Above a decode batch of N it is a loss — the target verifies
-`(K+1) x B` positions for an acceptance that cannot pay for them, while the drafter's batch-1
-kernels have already disengaged. Measured at 4B, chain vs no speculation: 1.19x at concurrency 1,
-1.00x at 4, 0.90x at 8, **0.44x at 64**. With the cutoff the same ladder reads 1.19x / 1.00x /
-0.95x / 0.95x — and the batch-1 number is bit-identical to the uncut arm.
-
-The flag works in two halves that must both be on: the scheduler stops allocating speculative
-slots (so the target stops verifying) and the proposer stops drafting. **N is per model size AND
-per arm** — the scheduler hands the target `K+1` query positions per request, so an 8×5 tree
-saturates it seven times sooner than a chain. `_AUTO` is keyed on `(hidden_size, K+1)` and every
-size × arm this project publishes a number for is now laddered against its own no-speculation
-baseline on the same GPU.
-
-**The default resolves that table and nothing else.** A combination that was never laddered
-resolves to *no cutoff at all*, with the reason printed — a derived N that is too low silently
-costs speedup, and that is not something to acquire by accident. `CF_SPEC_MAX_BATCH=auto` opts
-back into the derived guess for an unmeasured target, `=<n>` sets one directly, and `=0` (or
-`off`) disables it. `CF_WARM_BUCKETS=1` pairs with it to move the drafter's per-batch-shape
-`torch.compile` out of live traffic.
-
-Two baseline hazards have corrupted results here before:
-
-1. **async scheduling.** Without the entry point above, vLLM gives the base arm a
-   feature it force-disables for `custom_class` speculative decoding, understating
-   every speedup by **+10.5% / +5.5% / +1.6%** at 4B / 9B / 27B. `bench_cf.sh`'s
-   base arm defaults to `CF_ASYNC_SCHED=0` (like-for-like); pass
-   `CF_ASYNC_SCHED=1` for the deployment number. **Quote both, labelled.**
-2. **pooled vs mean-of-domain.** The harness prints both and they differ a lot —
-   one 27B run reads 1.47x pooled and 1.68x mean-of-domain. Always say which.
-
-Greedy decoding of an fp16-logit model is ill-posed at ~0.3-0.9% of tokens, so a
-single-run token diff is never a signal; see the doc for the verification protocol.
+The serving harness that produced those numbers lives in the research repo, not here. This
+package is the drafter and its training pipeline.
 
 ## Current components
 
@@ -404,7 +347,7 @@ future_tokens  = input_ids[t+1 : t+K+1]
 Hidden MLP training example:
 
 ```bash
-UV_CACHE_DIR=.uv-cache uv run python scripts/train_hidden_mlp.py \
+UV_CACHE_DIR=.uv-cache uv run python scripts/train_tree_flow.py \
   --dataset_path teacher_states/gsm8k-qwen35-08b-smoke \
   --output_dir checkpoints/hidden-mlp-smoke \
   --per_device_train_batch_size 8 \
@@ -432,13 +375,13 @@ single YAML config file.
 Smoke YAML config example:
 
 ```bash
-UV_CACHE_DIR=.uv-cache uv run python scripts/train_hidden_mlp.py train_configs/smoke_mlp.yaml
+UV_CACHE_DIR=.uv-cache uv run python scripts/train_tree_flow.py train_configs/chunked_flow/smoke_chunked_flow.yaml
 ```
 
 Hidden VAE smoke training:
 
 ```bash
-UV_CACHE_DIR=.uv-cache uv run python scripts/train_vae.py train_configs/vae/smoke_vae.yaml
+UV_CACHE_DIR=.uv-cache uv run python scripts/train_transformer_hidden_vae.py train_configs/vae/smoke_vae.yaml
 ```
 
 GSM8K collection is prompt-only: the script asks the frozen model to generate
